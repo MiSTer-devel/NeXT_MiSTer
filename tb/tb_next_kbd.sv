@@ -23,6 +23,7 @@ always #5 clk = ~clk;
 reg reset = 1;
 
 reg  [10:0] ps2 = 0;
+reg  [24:0] ps2m = 0;
 
 reg         sel_kms = 0;
 reg   [3:0] addr = 0;
@@ -36,13 +37,15 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 (
 	.clk(clk), .reset(reset),
 	.ps2_key(ps2),
+	.ps2_mouse(ps2m),
 	.sel_kms(sel_kms),
 	.sel_csr(1'b0), .sel_sptr(1'b0), .sel_ptr(1'b0), .sel_ini(1'b0),
 	.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 	.m_req(), .m_we(), .m_addr(), .m_be(), .m_din(),
 	.m_dout(32'd0), .m_ack(1'b0), .m_err(1'b0),
 	.int_snd_ovrun(), .int_snd_out_dma(),
-	.int_keymouse(int_keymouse)
+	.int_keymouse(int_keymouse),
+	.audio_l(), .audio_r()
 );
 
 task kms_wr8;
@@ -100,6 +103,21 @@ task key;
 	begin
 		@(posedge clk);
 		ps2 <= {~ps2[10], make, ext, code};
+		repeat (4) @(posedge clk);
+	end
+endtask
+
+// one MiSTer mouse packet.  dx/dy are 9-bit signed; dy uses the PS/2
+// convention (positive = up), which the device negates to NeXT down.
+task mouse;
+	input signed [8:0] dx;
+	input signed [8:0] dy;
+	input left;
+	input right;
+	begin
+		@(posedge clk);
+		ps2m <= {~ps2m[24], dy[7:0], dx[7:0],
+		         {2'b00, dy[8], dx[8], 1'b1, 1'b0, right, left}};
 		repeat (4) @(posedge clk);
 	end
 endtask
@@ -194,6 +212,48 @@ initial begin
 	rd_km_data(d);
 	check(d[30] && d[29] && d[28], "kms_response: no-response/invalid");
 	check(d[27:24] == 4'h2, "response carries the new address");
+
+	//----------------------------------------------------------------
+	// Mouse: the KMS second device.  Reset the address to 0 so the
+	// keyboard is device 0 and the mouse device 1.
+	//----------------------------------------------------------------
+	kms_cmd(8'hC5, 32'hEF000000);   // address 0
+	rd_km_data(d);                   // consume the probe response
+
+	// poll only the keyboard (device 0): a mouse packet is dropped
+	kms_cmd(8'hC6, 32'h0FFFFFF2);
+	mouse(9'd5, 9'd0, 1'b0, 1'b0);
+	check(!int_keymouse, "mouse dropped while the mouse is not polled");
+
+	// poll the mouse too (device 1 in the second nibble)
+	kms_cmd(8'hC6, 32'h01FFFFF2);
+	mouse(9'd5, 9'd0, 1'b0, 1'b0);   // move right 5
+	check(int_keymouse, "INT_KEYMOUSE raised on mouse move");
+	rd_km_data(d);
+	check(d == 32'h010001F7,
+	      "mouse right 5: device 1, x field 0x7B, both buttons up");
+	check(!int_keymouse, "mouse interrupt released by the data read");
+
+	mouse(-9'sd3, 9'd0, 1'b0, 1'b0); // move left 3
+	rd_km_data(d);
+	check(d == 32'h01000107, "mouse left 3: x field 0x03 (bare magnitude)");
+
+	mouse(9'd0, 9'sd4, 1'b0, 1'b0);  // PS/2 dy +4 = up -> NeXT y field 4
+	rd_km_data(d);
+	check(d == 32'h01000901, "mouse up 4: y field 0x04");
+
+	mouse(9'd0, 9'd0, 1'b1, 1'b0);   // left button down, no motion
+	rd_km_data(d);
+	check(d == 32'h01000100, "mouse left button down clears the left-up bit");
+
+	mouse(9'd0, 9'd0, 1'b1, 1'b1);   // both buttons down
+	rd_km_data(d);
+	check(d == 32'h01000000, "mouse both buttons down clears both up bits");
+
+	mouse(9'sd200, 9'd0, 1'b0, 1'b0); // large right delta clamps to 0x3F
+	rd_km_data(d);
+	check(d[7:1] == 7'h41,
+	      "mouse right clamps to 0x3F: x field (0x40-0x3F)|0x40 = 0x41");
 
 	if (errors == 0) $display("ALL PASS");
 	else             $display("%0d FAILURES", errors);

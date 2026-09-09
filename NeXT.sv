@@ -43,9 +43,10 @@ assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
-assign AUDIO_S = 0;
-assign AUDIO_L = 0;
-assign AUDIO_R = 0;
+wire signed [15:0] audio_l, audio_r;   // from the KMS sound-out engine
+assign AUDIO_S = 1;                    // signed samples
+assign AUDIO_L = audio_l;
+assign AUDIO_R = audio_r;
 assign AUDIO_MIX = 0;
 
 assign LED_POWER = 0;
@@ -73,7 +74,7 @@ localparam CONF_STR = {
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
 	"O[58],Ethernet cable,Connected,Disconnected;",
-	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default,Optical;",
+	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default,Optical,CD-ROM;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -85,6 +86,7 @@ wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
 wire  [10:0] ps2_key;
+wire  [24:0] ps2_mouse;
 wire        enet_connected = |status[54:52] && !status[58];
 
 wire        ioctl_download;
@@ -168,7 +170,8 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 	               fsd_buff_din, osd_buff_din}),
 	.sd_buff_wr(sd_buff_wr),
 
-	.ps2_key(ps2_key)
+	.ps2_key(ps2_key),
+	.ps2_mouse(ps2_mouse)
 );
 
 ///////////////////////   CLOCKS   ///////////////////////////////
@@ -230,6 +233,7 @@ next_system #(
 	.reset(reset),
 
 	.ps2_key(ps2_key),
+	.ps2_mouse(ps2_mouse),
 	.boot_sel(status[57:55]),
 	.enet_connected(enet_connected),
 
@@ -288,6 +292,8 @@ next_system #(
 	.ram_ack(ram_ack),
 
 	.led(led),
+	.audio_l(audio_l),
+	.audio_r(audio_r),
 
 	.btx_req(btx_req),
 	.btx_len(btx_len),

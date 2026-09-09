@@ -40,14 +40,17 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 	(
 		.clk(clk), .reset(reset),
 		.ps2_key(11'd0),
+		.ps2_mouse(25'd0),
 		.sel_kms(sel_kms), .sel_csr(sel_csr), .sel_sptr(sel_sptr),
 		.sel_ptr(sel_ptr), .sel_ini(sel_ini),
 		.addr(addr), .we(we), .be(be), .wdata(wdata), .rdata(rdata),
 		.m_req(m_req), .m_we(m_we), .m_addr(m_addr), .m_be(m_be),
 		.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
 	.int_snd_ovrun(int_snd_ovrun), .int_snd_out_dma(int_snd_out_dma),
-	.int_keymouse()
+	.int_keymouse(),
+	.audio_l(audio_l), .audio_r(audio_r)
 );
+wire signed [15:0] audio_l, audio_r;
 
 // simple RAM ack
 reg ack_r;
@@ -165,9 +168,14 @@ initial begin
 	kms_wr8(4'h0, 8'h80);        // SNDOUT_DMA_ENABLE
 	kms_cmd(8'h0F, 32'h0);       // KMSCMD_SND_OUT | SIO_ENABLE
 
-	// buffer consumption plus the pace delay (64 us) plus polling
-	repeat (3000) @(posedge clk);
+	// the DMA fills the audio FIFO and the 44.1 kHz drain pushes the stereo
+	// frame (the model returns 0x55aa1234) out to audio_l/r while it plays
+	repeat (500) @(posedge clk);
+	check(audio_l == 16'h55aa && audio_r == 16'h1234,
+	      "audio out: the stereo frame reaches audio_l/r as the FIFO drains");
 
+	// the buffer is consumed and the channel completes
+	repeat (2500) @(posedge clk);
 	check(int_snd_out_dma, "channel complete raised INT_SND_OUT_DMA");
 	@(posedge clk);
 	csr_cmd(8'h08);              // DMA_CLRCOMPLETE

@@ -58,14 +58,15 @@ next_system #(
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
 		.ps2_key(ps2),
-	.boot_sel(bootfd ? 3'd2 : bootsd ? 3'd1 : 3'd0),
+		.ps2_mouse(25'd0),
+	.boot_sel(bootfd ? 3'd2 : bootcd ? 3'd6 : bootsd ? 3'd1 : 3'd0),
 	.enet_connected(net_enable),
 	.fimg_mounted({1'b0, fimg_mounted}), .fsd_unit(), .fimg_readonly(1'b0),
 	.fimg_size(bootfd ? 64'd1474560 : 64'd0),
 	.fsd_lba(fsd_lba), .fsd_rd(fsd_rd), .fsd_wr(fsd_wr), .fsd_ack(fsd_ack),
 	.fsd_buff_addr(fsd_buff_addr), .fsd_buff_dout(fsd_buff_dout),
 	.fsd_buff_din(fsd_buff_din), .fsd_buff_wr(fsd_buff_wr),
-	.img_mounted({5'b00000, img_mounted}),
+	.img_mounted({2'b00, cimg_mounted, 2'b00, img_mounted}),   // bit 3 = CD-ROM slot (target 3)
 	.sd_unit(),
 	.img_readonly(1'b0),
 	.img_size(img_bytes),
@@ -94,6 +95,7 @@ next_system #(
 	.ram_ack(ram_ack),
 
 	.led(led),
+	.audio_l(), .audio_r(),
 
 	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr), .btx_rd(btx_rd),
 	.btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),
@@ -722,7 +724,7 @@ end
 
 // The disk bootloader also executes at 0x04xxxxxx (e.g. 0x04381930).
 // Only the kernel's actual entry point establishes a completed kernel load.
-always @(posedge clk) if (!reset && bootsd && dbg_pc == kernel_entry && !saw_kernel) begin
+always @(posedge clk) if (!reset && (bootsd || bootcd) && dbg_pc == kernel_entry && !saw_kernel) begin
 	$display("[%0t] BOOT: kernel entry %08x", $time, kernel_entry);
 	saw_kernel <= 1;
 	if (stop_at_kernel) halt_run <= 1;
@@ -750,6 +752,18 @@ endtask
 
 
 reg        bootsd = 0;
+
+//----------------------------------------------------------------------------
+// +bootcd: the block image on BOTH the disk slot (target 0) and the
+// CD-ROM slot (target 3) with the boot device menu at CD-ROM.  The
+// ROM's "sd(unit,lun,part)" numbers disks in scan order, so the CD-ROM
+// behind a disk is unit 1 and the NVRAM must carry "sd(1,0,0)" (what
+// NeXTSTEP itself calls it).  The pass criterion is that the boot
+// sector is read from target 3, not from the disk a bare "sd" picks.
+//----------------------------------------------------------------------------
+
+reg        bootcd = 0;
+reg        cimg_mounted = 0;
 
 //----------------------------------------------------------------------------
 // +bootfd: a 1.44 MB floppy on the second image slot with the boot
@@ -1041,21 +1055,72 @@ end
 
 // ESP activity trace: selection commands and DMA writes to memory
 reg saw_esp_sel = 0;
+reg [2:0] esp_sel_target = 3'd7;   // target of the ROM's first selection
 integer scsi_dma_writes = 0;
+integer scsi_cmds = 0;             // SCSI commands traced after the boot selection
 reg [7:0] esp_cmd_d = 0;
-always @(posedge clk) if (!reset && bootsd) begin
+always @(posedge clk) if (!reset && (bootsd || bootcd)) begin
 	if (dut.scsi.command0 != esp_cmd_d) begin
 		esp_cmd_d <= dut.scsi.command0;
 		if ((dut.scsi.command0 & 8'h7F) == 8'h41 ||
 		    (dut.scsi.command0 & 8'h7F) == 8'h42) begin
-			if (!saw_esp_sel)
-				$display("[%0t] BOOT: ESP select command %02x, target %0d",
-				         $time, dut.scsi.command0, dut.scsi.selectbusid[2:0]);
+			if (!saw_esp_sel) begin
+				$display("[%0t] BOOT: ESP select command %02x, target %0d (present %0d)",
+				         $time, dut.scsi.command0, dut.scsi.selectbusid[2:0],
+				         dut.scsi.disk_present_v[dut.scsi.selectbusid[2:0]]);
+				esp_sel_target <= dut.scsi.selectbusid[2:0];
+			end
+			else if (scsi_cmds <= 24)
+				$display("[%0t] SCSI: select target %0d (present %0d)", $time,
+				         dut.scsi.selectbusid[2:0],
+				         dut.scsi.disk_present_v[dut.scsi.selectbusid[2:0]]);
 			saw_esp_sel <= 1;
 		end
 	end
 	if (dut.sc_m_req && dut.sc_m_we && dut.sc_m_ack)
 		scsi_dma_writes = scsi_dma_writes + 1;
+end
+
+// the SCSI unit that served the first sector read after the boot selection:
+// for +bootsd this is the disk on target 0.
+reg [2:0] cd_rd_unit = 3'd7;
+always @(posedge clk) if (!reset && (bootsd || bootcd) && saw_esp_sel &&
+                          sd_rd && cd_rd_unit == 3'd7)
+	cd_rd_unit <= dut.scsi.t_unit;
+
+// +bootcd verifies the NVRAM boot command: sd(1,0,0) must steer the ROM to
+// SELECT and QUERY SCSI target 3 (unit 1 in scan order, behind the disk on
+// target 0).  It does not assert a completed boot: the Rev 2.5 v66 ROM's
+// sd() blk0-boot path drives a direct-access (type 0) device, and re-issues
+// INQUIRY without reading a sector when the target reports the CD-ROM type
+// (0x05) - which the CD must report so the floppy installer's "Searching
+// for CD-ROM drives" scan finds it.  Booting the install medium therefore
+// runs the documented way: boot the floppy, root on the CD (sd1a).
+reg saw_t3_cmd = 0;
+always @(posedge clk) if (!reset && bootcd && saw_esp_sel &&
+                          dut.scsi.phase == 3'd3 && dut.scsi.t_unit == 3'd3)
+	saw_t3_cmd <= 1;
+
+// SCSI conversation trace after the ROM's boot selection: one line per
+// command as the target enters its status phase (opcode + status), and
+// every ESP interrupt-status change (a selection timeout shows up as the
+// disconnect bit with no command behind it).  POST's own SCSI tests run
+// before saw_esp_sel and are excluded.
+reg [2:0] scsi_phase_d = 0;
+reg [7:0] scsi_ist_d = 0;
+always @(posedge clk) if (!reset && (bootsd || bootcd) && saw_esp_sel) begin
+	scsi_phase_d <= dut.scsi.phase;
+	if (dut.scsi.phase == 3'd3 && scsi_phase_d != 3'd3) begin
+		scsi_cmds = scsi_cmds + 1;
+		if (scsi_cmds <= 24)
+			$display("[%0t] SCSI: target %0d cmd %02x %02x %02x %02x %02x %02x -> status %02x",
+			         $time, dut.scsi.t_unit,
+			         dut.scsi.cdb0, dut.scsi.cdb1, dut.scsi.cdb2,
+			         dut.scsi.cdb3, dut.scsi.cdb4, dut.scsi.cdb5, dut.scsi.t_status);
+	end
+	scsi_ist_d <= dut.scsi.intstatus;
+	if (dut.scsi.intstatus != scsi_ist_d && dut.scsi.intstatus != 0 && scsi_cmds <= 24)
+		$display("[%0t] SCSI: ESP intstatus %02x", $time, dut.scsi.intstatus);
 end
 
 // 1120x832 2bpp NeXT gray to PGM: 0 = white, 3 = black, line pitch
@@ -1096,6 +1161,20 @@ initial begin
 		img_mounted <= 1;
 		@(posedge clk);
 		img_mounted <= 0;
+	end
+
+	if ($test$plusargs("bootcd")) begin
+		bootcd = 1;
+		// a disk on target 0 as well, so the CD-ROM is the SECOND disk in
+		// the ROM's scan order and the NVRAM command must be sd(1,0,0)
+		@(posedge clk);
+		img_mounted <= 1;
+		@(posedge clk);
+		img_mounted <= 0;
+		@(posedge clk);
+		cimg_mounted <= 1;
+		@(posedge clk);
+		cimg_mounted <= 0;
 	end
 
 
@@ -1192,7 +1271,7 @@ initial begin
 		fb_dump;
 	end
 
-	if (bootsd) begin : scdma_dump
+	if (bootsd || bootcd) begin : scdma_dump
 		integer kk;
 		check(!wildpc_seen, "supervisor PC did not reach the panic target");
 		$display("=== SCSI DMA channel writes to memory (frozen at berr) ===");
@@ -1200,7 +1279,15 @@ initial begin
 			$display("  [%0d] addr=%08x data=%08x", kk, scdma_addr[kk], scdma_data[kk]);
 		$display("SD reads: %0d, SCSI DMA words to memory: %0d",
 		         sd_reads, scsi_dma_writes);
-		check(saw_esp_sel, "boot: ROM selected the SCSI disk");
+		// sd(1,0,0) must steer the ROM to target 3 (unit 1, behind the disk
+		// on target 0) - selecting and querying it, not the disk a bare "sd"
+		// or a wrong unit would pick.  (The v66 ROM does not blk0-boot a
+		// type-05 CD-ROM; see saw_t3_cmd above.)
+		if (bootcd)
+			check(saw_t3_cmd,
+			      "boot: sd(1,0,0) steered the ROM to select and query SCSI target 3, the CD-ROM");
+		else
+			check(saw_esp_sel, "boot: ROM selected the SCSI disk");
 		check(sd_lba0, "boot: sector 0 fetched from the SD image");
 		check(scsi_dma_writes >= 128, "boot: a full sector reached memory by DMA");
 		if (img_fd != 0)

@@ -16,10 +16,12 @@
 //    (KMSCMD_SND_OUT with SIO_ENABLE), the volume/control accesses as
 //    no-ops, and reset
 //  - the sound out engine: while enabled, a pending DMA buffer is
-//    consumed from memory (the samples go nowhere yet, there is no
-//    audio path), then the channel completes (COMPLETE, chain reload or
-//    disable, INT_SND_OUT_DMA) after roughly len/4 microseconds, the
-//    pacing snd.c uses; with no buffer pending, the underrun status
+//    consumed from memory one 16-bit-stereo frame at a time (the frame
+//    is {L,R}, big-endian, as snd.c reads it) into an audio FIFO that a
+//    44.1 kHz sample tick drains to audio_l/r; the full FIFO stalls the
+//    DMA so the whole channel runs at the playback rate, and the channel
+//    completes (COMPLETE, chain reload or disable, INT_SND_OUT_DMA) when
+//    the buffer is consumed; with no buffer pending, the underrun status
 //    bits are raised with INT_SOUND_OVRUN, as kms_sndout_underrun()
 //
 //  - keyboard input: MiSTer ps2_key events are translated to NeXT
@@ -31,17 +33,27 @@
 //    register protocol (KMSCMD_KMREG: reset, set address, register
 //    reads) answers with kms_response() exactly as kms.c
 //
-//  Mouse input and the real audio output path are TODO
-//  (docs/PORTING.md).
+//    - mouse input: the MiSTer ps2_mouse packet is decoded to a NeXT
+//      mouse report (7-bit clamped x/y deltas in the kms_mouse_move
+//      encoding, plus the two button states) and posted at the mouse
+//      device address, gated by the poll mask like the keyboard.
 //============================================================================
 
-module next_kms_snd #(parameter CLK_HZ = 100000000)
+module next_kms_snd #(
+	parameter CLK_HZ = 100000000,
+	// The real clk frequency, for the 44.1 kHz audio sample rate (which is
+	// real time, unlike the virtual CLK_HZ microsecond used for pacing).
+	parameter CLK_REAL_HZ = CLK_HZ
+)
 (
 	input         clk,
 	input         reset,
 
 	// register access
 	input  [10:0] ps2_key,       // MiSTer keyboard event stream
+	input  [24:0] ps2_mouse,     // MiSTer mouse packet: [24] toggle strobe,
+	                             // [23:16] dy, [15:8] dx, [7:0] PS/2 status
+	                             // (bit0 L, bit1 R, bit4 Xsign, bit5 Ysign)
 
 	input         sel_kms,       // 0x0E000-0x0E00F
 	input         sel_csr,       // 0x00040-0x00043
@@ -66,7 +78,11 @@ module next_kms_snd #(parameter CLK_HZ = 100000000)
 
 	output        int_snd_ovrun,   // INT_SOUND_OVRUN level
 	output        int_snd_out_dma, // channel complete level
-	output        int_keymouse     // INT_KEYMOUSE level
+	output        int_keymouse,    // INT_KEYMOUSE level
+
+	// signed 16-bit stereo audio out, driven at the NeXT's 44.1 kHz rate
+	output reg signed [15:0] audio_l,
+	output reg signed [15:0] audio_r
 );
 
 localparam SNDOUT_DMA_ENABLE   = 8'h80, SNDOUT_DMA_REQUEST = 8'h40,
@@ -104,6 +120,18 @@ wire kbd_enabled =
 	((km_dev_msk[19:16] == dev_addr) && (km_dev_msk[19:16] != 4'hF)) ||
 	((km_dev_msk[15:12] == dev_addr) && (km_dev_msk[15:12] != 4'hF)) ||
 	((km_dev_msk[11:8]  == dev_addr) && (km_dev_msk[11:8]  != 4'hF));
+
+// The mouse is the keyboard's device address with the KM_MOUSE bit set
+// (kms.c: addr = km_addr | KM_MOUSE); device 1 alongside the keyboard's 0
+// when the address is the reset default.  Enabled the same way.
+wire [3:0] dev_addr_mouse = dev_addr | 4'h1;
+wire mouse_enabled =
+	((km_dev_msk[31:28] == dev_addr_mouse) && (km_dev_msk[31:28] != 4'hF)) ||
+	((km_dev_msk[27:24] == dev_addr_mouse) && (km_dev_msk[27:24] != 4'hF)) ||
+	((km_dev_msk[23:20] == dev_addr_mouse) && (km_dev_msk[23:20] != 4'hF)) ||
+	((km_dev_msk[19:16] == dev_addr_mouse) && (km_dev_msk[19:16] != 4'hF)) ||
+	((km_dev_msk[15:12] == dev_addr_mouse) && (km_dev_msk[15:12] != 4'hF)) ||
+	((km_dev_msk[11:8]  == dev_addr_mouse) && (km_dev_msk[11:8]  != 4'hF));
 
 reg       sndout_active;
 reg       snd_underrun;
@@ -159,10 +187,27 @@ localparam US_DIV = CLK_HZ / 1000000;
 reg [$clog2(US_DIV)-1:0] uspresc;
 wire us_tick = (uspresc == US_DIV-1);
 
-localparam E_IDLE = 3'd0, E_RD = 3'd1, E_ACK = 3'd2, E_PACE = 3'd3;
+localparam E_IDLE = 3'd0, E_RD = 3'd1, E_ACK = 3'd2;
 reg  [2:0] est;
-reg [17:0] pace;                 // microseconds until the completion intr
 reg [15:0] poll;                 // polling interval while idle
+
+// audio sample-rate tick (44.1 kHz) from the real clock, a fractional
+// divider (add SR each clock, tick and subtract when it reaches the clock).
+localparam AUDIO_SR = 44100;
+reg  [31:0] sr_acc;
+wire [32:0] sr_sum = {1'b0, sr_acc} + AUDIO_SR;
+wire        sample_tick = (sr_sum >= CLK_REAL_HZ);
+
+// stereo audio FIFO: the sound-out DMA fills it, the sample tick drains it
+// into audio_l/r.  A full FIFO stalls the DMA, pacing it to 44.1 kHz.
+localparam AF_DEPTH = 256, AF_AW = 8;
+reg [31:0]      afifo [0:AF_DEPTH-1];   // {L[15:0], R[15:0]} per frame
+reg [AF_AW-1:0] af_wr, af_rd;
+reg [AF_AW:0]   af_cnt;
+wire af_full  = (af_cnt == AF_DEPTH);
+wire af_empty = (af_cnt == 0);
+wire af_push  = (est == E_ACK) && m_ack && !m_err;   // one frame per accepted read
+wire af_pop   = sample_tick && !af_empty;
 
 wire [7:0] csr_or = (be[1] ? wdata[15:8] : 8'h00) | (be[0] ? wdata[7:0] : 8'h00);
 
@@ -284,6 +329,19 @@ wire ps2_make = ps2_key[9];
 wire ps2_ext = ps2_key[8];
 wire [7:0] ps2_code = ps2_key[7:0];
 
+// mouse: decode the MiSTer PS/2 packet.  dx/dy are 9-bit two's complement
+// (byte plus its sign bit from the status byte).  PS/2 dy is up-positive;
+// the NeXT wants down-positive, so dy is negated.
+reg         ps2_mouse_tgl_d;
+wire        mouse_event = (ps2_mouse[24] != ps2_mouse_tgl_d);
+wire signed [8:0] mouse_dx =  $signed({ps2_mouse[4], ps2_mouse[15:8]});
+wire signed [8:0] mouse_dy = -$signed({ps2_mouse[5], ps2_mouse[23:16]});
+wire        m_left  = ps2_mouse[0];
+wire        m_right = ps2_mouse[1];
+// NeXT mouse word: [15:9] y, [8] right-up, [7:1] x, [0] left-up
+wire [15:0] mouse16 = {mouse_field(mouse_dy), ~m_right,
+                       mouse_field(mouse_dx), ~m_left};
+
 // modifier bit affected by this scancode, 0 if none
 // (bit0 control, 1 lshift, 2 rshift, 3 lcmd, 4 rcmd, 5 lalt, 6 ralt;
 // PC: windows keys = command, alt = alt, as in keymap.c unswapped)
@@ -299,6 +357,22 @@ function automatic [6:0] mod_bit;
 		else if (ext && c == 8'h27) mod_bit = 7'h10;  // right win -> rcmd
 		else if (!ext && c == 8'h11) mod_bit = 7'h20; // left alt
 		else if (ext && c == 8'h11) mod_bit = 7'h40;  // right alt
+	end
+endfunction
+
+// One 7-bit NeXT mouse axis field from a signed delta, matching
+// kms_mouse_move() in kms.c: magnitude is clamped to 0x3F; a negative
+// delta (left / up) is the bare magnitude, a positive delta (right /
+// down) is (0x40 - magnitude) | 0x40, and zero is zero.
+function automatic [6:0] mouse_field;
+	input signed [8:0] d;
+	reg [8:0] absd;
+	reg [6:0] mag;
+	begin
+		absd = d[8] ? (-d) : d;
+		mag  = (absd > 9'd63) ? 7'h3F : absd[6:0];
+		if (!d[8] && mag != 0) mouse_field = (7'h40 - mag) | 7'h40; // right/down
+		else                   mouse_field = mag;                    // left/up/zero
 	end
 endfunction
 
@@ -372,19 +446,47 @@ always @(posedge clk) begin
 		mods <= 0;
 		capslock <= 0;
 		ps2_toggle_d <= 0;
+		ps2_mouse_tgl_d <= 0;
 		sndout_active <= 0;
 		snd_underrun <= 0;
 		s_csr <= 0;
 		s_next <= 0; s_limit <= 0; s_start <= 0; s_stop <= 0;
 		s_snext <= 0; s_slimit <= 0; s_sstart <= 0; s_sstop <= 0;
 		est <= E_IDLE;
-		pace <= 0;
 		poll <= 0;
 		uspresc <= 0;
 		m_req <= 0;
+		sr_acc <= 0;
+		af_wr <= 0; af_rd <= 0; af_cnt <= 0;
+		audio_l <= 0; audio_r <= 0;
 	end
 	else begin
 		uspresc <= us_tick ? 1'd0 : uspresc + 1'd1;
+
+		//------------------------------------------------------------
+		// audio: run the 44.1 kHz divider, drain one FIFO frame per tick
+		// to audio_l/r (silence when the FIFO is empty), and accept the
+		// DMA's pushed frame.  m_dout carries {L[15:0], R[15:0]}.
+		//------------------------------------------------------------
+		sr_acc <= sample_tick ? (sr_sum[31:0] - CLK_REAL_HZ) : sr_sum[31:0];
+		if (af_pop) begin
+			audio_l <= afifo[af_rd][31:16];
+			audio_r <= afifo[af_rd][15:0];
+			af_rd   <= af_rd + 1'd1;
+		end
+		else if (sample_tick) begin
+			audio_l <= 16'sd0;
+			audio_r <= 16'sd0;
+		end
+		if (af_push) begin
+			afifo[af_wr] <= m_dout;
+			af_wr <= af_wr + 1'd1;
+		end
+		case ({af_push, af_pop})
+			2'b10: af_cnt <= af_cnt + 1'd1;
+			2'b01: af_cnt <= af_cnt - 1'd1;
+			default: ;
+		endcase
 
 		//------------------------------------------------------------
 		// keyboard events
@@ -404,6 +506,18 @@ always @(posedge clk) begin
 				km_data <= {4'b0001, km_address, 8'd0,
 				            1'b1, nmods | (capslock ? 7'h02 : 7'h00),
 				            !ps2_make, kc};
+				kms_interrupt;
+			end
+		end
+		//------------------------------------------------------------
+		// mouse events (kms_mouse_move / kms_mouse_button).  Deferred a
+		// cycle behind a keyboard event so they never share km_data; the
+		// toggle is consumed only when processed, so nothing is dropped.
+		//------------------------------------------------------------
+		else if (mouse_event) begin
+			ps2_mouse_tgl_d <= ps2_mouse[24];
+			if (mouse_enabled) begin
+				km_data <= {4'b0000, km_address[3:1], 1'b1, 8'd0, mouse16};
 				kms_interrupt;
 			end
 		end
@@ -496,68 +610,59 @@ always @(posedge clk) begin
 		// sound out engine, SND_Out_Handler() in snd.c
 		//------------------------------------------------------------
 		case (est)
+		// The DMA fetches one stereo frame at a time and hands it to the
+		// audio FIFO.  A full FIFO holds it off, so the whole channel runs
+		// at the 44.1 kHz drain rate; the completion interrupt therefore
+		// lands at the real playback time instead of a fixed pace.  With no
+		// buffer to play the channel underruns, exactly as before.
 		E_IDLE: begin
-			if (sndout_active && us_tick) begin
-				if (poll != 0) poll <= poll - 1'd1;
-				else if (s_csr[0]) begin
-					if (s_next < s_limit) begin
-						pace <= {2'd0, (s_limit[17:0] - s_next[17:0])} >> 2;
-						est <= E_RD;
-					end
+			if (sndout_active) begin
+				if (s_csr[0] && s_next < s_limit) begin
+					if (!af_full) est <= E_RD;   // read when the FIFO has room
+				end
+				else if (us_tick) begin
+					if (poll != 0) poll <= poll - 1'd1;
 					else begin
-						// nothing to play: underrun
 						st_snd <= st_snd | SNDOUT_DMA_UNDERRUN | SNDOUT_DMA_REQUEST;
 						snd_underrun <= 1;
 						poll <= 16'd100;
 					end
 				end
-				else begin
-					st_snd <= st_snd | SNDOUT_DMA_UNDERRUN | SNDOUT_DMA_REQUEST;
-					snd_underrun <= 1;
-					poll <= 16'd100;
-				end
 			end
 		end
 
-			E_RD: begin
-				if (s_next >= s_limit) est <= E_PACE;
+		E_RD: begin
+			if (s_next >= s_limit) est <= E_IDLE;
+			else begin
+				m_req <= 1;
+				m_we <= 0;
+				m_be <= 4'hF;
+				m_addr <= s_next[31:2];
+				est <= E_ACK;
+			end
+		end
+
+		E_ACK: if (m_err) begin
+			dma_bus_exception;
+		end
+		else if (m_ack) begin
+			m_req <= 0;
+			// m_dout = {L,R} is captured into the FIFO by af_push this cycle
+			if ((s_next | 32'd3) + 32'd1 >= s_limit) begin
+				// last frame: dma_sndout_intr -> dma_interrupt(CHANNEL_SOUNDOUT)
+				s_csr[3] <= 1;
+				if (s_csr[1]) begin
+					s_next <= s_start;
+					s_limit <= s_stop;
+					s_csr[1] <= 0;
+				end
 				else begin
-					m_req <= 1;
-					m_we <= 0;
-					m_be <= 4'hF;
-					m_addr <= s_next[31:2];
-					est <= E_ACK;
+					s_next <= (s_next | 32'd3) + 32'd1;
+					s_csr[0] <= 0;
 				end
 			end
-
-			E_ACK: if (m_err) begin
-				dma_bus_exception;
-			end
-			else if (m_ack) begin
-				m_req <= 0;
-				// samples are consumed; no audio output path yet
-				s_next <= (s_next | 32'd3) + 32'd1;   // whole words
-				est <= E_RD;
-			end
-
-		E_PACE: begin
-			// interrupt after roughly len/4 microseconds
-			if (us_tick) begin
-				if (pace != 0) pace <= pace - 1'd1;
-				else begin
-					// dma_sndout_intr -> dma_interrupt(CHANNEL_SOUNDOUT)
-					if (s_csr[0] && s_next == s_limit) begin
-						s_csr[3] <= 1;
-						if (s_csr[1]) begin
-							s_next <= s_start;
-							s_limit <= s_stop;
-							s_csr[1] <= 0;
-						end
-						else s_csr[0] <= 0;
-					end
-					est <= E_IDLE;
-				end
-			end
+			else s_next <= (s_next | 32'd3) + 32'd1;
+			est <= E_IDLE;
 		end
 
 		default: est <= E_IDLE;

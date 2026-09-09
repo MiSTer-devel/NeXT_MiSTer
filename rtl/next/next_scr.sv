@@ -55,6 +55,7 @@ module next_scr #(
 	input   [2:0] boot_sel,
 	input         disk_mounted,
 	input         floppy_mounted,
+	input   [2:0] sd_lower_mounted,   // SCSI disks at targets 0-2, below the CD-ROM
 
 	output        timer_ipl7,    // SCR2 byte 2 bit 7
 	output        led,           // SCR2 byte 3 bit 0
@@ -156,11 +157,26 @@ reg [2:0] bootdev_d = 3'd7;   // no real selection: forces the first load
 // 3 = empty boot command (the ROM walks its device table, network
 // first).  Auto picks the disk exactly when an image is mounted.
 // 0 = Auto, 1 = Disk, 2 = Floppy, 3 = Network, 4 = ROM Default,
-// 5 = Optical.  The numbering is append-only so a saved setting
-// keeps its meaning.  nvram_init() in the reference spells the
+// 5 = Optical, 6 = CD-ROM.  The numbering is append-only so a saved
+// setting keeps its meaning.  nvram_init() in the reference spells the
 // devices sd, fd, en and od, with an empty command for the ROM.  Auto
 // prefers a mounted SCSI disk, then a mounted floppy, and otherwise
 // leaves the command empty for the ROM's own device order.
+//
+// A bare "sd" boots the first SCSI disk the ROM finds, which with a
+// disk on target 0 and the CD-ROM on target 3 is always the disk.  The
+// ROM's qualified form, "sd(unit,lun,part)" in its usage text, numbers
+// disks in SCAN ORDER, not by SCSI target: the first disk found is unit
+// 0, the next unit 1, and the second field is the LUN.  (Booting
+// "sd(0,3,0)" therefore selects the FIRST disk and asks it for LUN 3,
+// which a real single-LUN drive - and this model - answers with "LUN
+// not supported"; NeXTSTEP itself reports a CD-ROM behind one disk as
+// sd(1,0,0).)  So the CD-ROM entry spells "sd(N,0,0)" with N the number
+// of SCSI disks mounted below target 3: sd(0,0,0) for a CD-ROM alone,
+// sd(1,0,0) beside a disk on target 0, and so on.
+wire [1:0] cd_unit = {1'b0, sd_lower_mounted[0]} + {1'b0, sd_lower_mounted[1]} +
+                     {1'b0, sd_lower_mounted[2]};
+reg  [1:0] cd_unit_d = 2'd0;
 wire [2:0] bootdev = (boot_sel == 3'd0)
                      ? (disk_mounted   ? 3'd1 :
                         floppy_mounted ? 3'd2 : 3'd4)
@@ -172,6 +188,7 @@ wire [2:0] bootdev = (boot_sel == 3'd0)
 function automatic [7:0] nv_init;
 	input [4:0] i;
 	input [2:0] dev;
+	input [1:0] cdu;      // CD-ROM scan-order unit, the N of "sd(N,0,0)"
 	begin
 		case (i)
 			5'd0:  nv_init = 8'h94;
@@ -181,19 +198,32 @@ function automatic [7:0] nv_init;
 			5'd18: nv_init = (dev == 3'd1) ? "s" :
 			                 (dev == 3'd2) ? "f" :
 			                 (dev == 3'd3) ? "e" :
-			                 (dev == 3'd5) ? "o" : 8'h00;
+			                 (dev == 3'd5) ? "o" :
+			                 (dev == 3'd6) ? "s" : 8'h00;
 			5'd19: nv_init = (dev == 3'd1) ? "d" :
 			                 (dev == 3'd2) ? "d" :
 			                 (dev == 3'd3) ? "n" :
-			                 (dev == 3'd5) ? "d" : 8'h00;
+			                 (dev == 3'd5) ? "d" :
+			                 (dev == 3'd6) ? "d" : 8'h00;
+			// CD-ROM: the rest of "sd(N,0,0)", bytes 20-26; N is the digit
+			// at byte 21 (0-3), and the LUN at byte 23 is always 0
+			5'd20: nv_init = (dev == 3'd6) ? "(" : 8'h00;
+			5'd21: nv_init = (dev == 3'd6) ? ("0" + {6'd0, cdu}) : 8'h00;
+			5'd22: nv_init = (dev == 3'd6) ? "," : 8'h00;
+			5'd23: nv_init = (dev == 3'd6) ? "0" : 8'h00;
+			5'd24: nv_init = (dev == 3'd6) ? "," : 8'h00;
+			5'd25: nv_init = (dev == 3'd6) ? "0" : 8'h00;
+			5'd26: nv_init = (dev == 3'd6) ? ")" : 8'h00;
 			5'd30: nv_init = (dev == 3'd1) ? 8'h6D :
 			                 (dev == 3'd2) ? 8'h7A :
 			                 (dev == 3'd3) ? 8'h7B :
-			                 (dev == 3'd5) ? 8'h71 : 8'hE0;
+			                 (dev == 3'd5) ? 8'h71 :
+			                 (dev == 3'd6) ? 8'hC3 : 8'hE0;
 			5'd31: nv_init = (dev == 3'd1) ? 8'h8B :
 			                 (dev == 3'd2) ? 8'h8B :
 			                 (dev == 3'd3) ? 8'h81 :
-			                 (dev == 3'd5) ? 8'h8B : 8'hEF;
+			                 (dev == 3'd5) ? 8'h8B :
+			                 (dev == 3'd6) ? (8'hFA - {6'd0, cdu}) : 8'hEF;   // sd(N,0,0): FA-N
 			default: nv_init = 8'h00;
 		endcase
 	end
@@ -209,8 +239,11 @@ always @(posedge clk) begin
 	// device selection changes, and let guest writes below stand.
 	//------------------------------------------------------------
 	bootdev_d <= bootdev;
-	if (bootdev != bootdev_d)
-		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev);
+	cd_unit_d <= cd_unit;
+	// reload on a boot device change, and on a mount that moves the
+	// CD-ROM's scan-order unit while CD-ROM boot is selected
+	if (bootdev != bootdev_d || (bootdev == 3'd6 && cd_unit != cd_unit_d))
+		for (i = 0; i < 32; i = i + 1) nvram[i] <= nv_init(i[4:0], bootdev, cd_unit);
 
 	// The time of day keeps counting across a reset.  dev_reset carries
 	// the CPU's RESET instruction, and the ROM's clock test waits up to

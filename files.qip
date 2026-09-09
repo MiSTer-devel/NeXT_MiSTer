@@ -16,6 +16,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_enet_dma.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_mo.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_rs.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_kms_snd.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_printer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram_arb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_enet_bridge.sv

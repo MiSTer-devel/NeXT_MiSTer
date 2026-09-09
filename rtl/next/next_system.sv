@@ -50,6 +50,7 @@ module next_system #(
 (
 	input         clk,            // system clock: CPU, devices, RAM
 	input  [10:0] ps2_key,       // MiSTer keyboard events (to the KMS)
+	input  [24:0] ps2_mouse,     // MiSTer mouse packet (to the KMS)
 
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [2:0] boot_sel,
@@ -124,6 +125,10 @@ module next_system #(
 	input             ram_ack,
 
 	output        led,
+
+	// signed 16-bit stereo audio out (44.1 kHz sample rate)
+	output signed [15:0] audio_l,
+	output signed [15:0] audio_r,
 
 	// ethernet frame bridge (next_enet_bridge in the emu top)
 	output        btx_req,
@@ -202,6 +207,15 @@ wire  [3:0] sn_m_be;
 wire [31:0] sn_m_din;
 wire        sn_m_ack, sn_m_err;
 wire        int_snd_ovrun, int_snd_out_dma, int_keymouse;
+
+// Printer DMA master port (driven by next_printer below)
+wire        pr_m_req, pr_m_we;
+wire [29:0] pr_m_addr;
+wire  [3:0] pr_m_be;
+wire [31:0] pr_m_din;
+wire        pr_m_ack, pr_m_err;
+wire        int_printer, int_printer_dma;
+wire [15:0] pr_rdata;
 
 wire  [2:0] ipl_level;
 
@@ -314,8 +328,8 @@ wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
 localparam S_IDLE = 2'd0, S_INT = 2'd1, S_RAM = 2'd2, S_RAM_E = 2'd3;
 
 reg  [1:0] state;
-localparam G_ENET = 2'd0, G_MO = 2'd1, G_SND = 2'd2, G_SCSI = 2'd3;
-reg  [1:0] dma_grant;
+localparam G_ENET = 3'd0, G_MO = 3'd1, G_SND = 3'd2, G_SCSI = 3'd3, G_PRINT = 3'd4;
+reg  [2:0] dma_grant;
 reg        sel_rom, sel_vram, sel_io, sel_bmap;
 reg [15:0] cyc_rdata;
 
@@ -337,6 +351,7 @@ assign en_m_ack = (state == S_RAM_E) && (dma_grant == G_ENET) && ram_ack;
 assign mo_m_ack = (state == S_RAM_E) && (dma_grant == G_MO) && ram_ack;
 assign sn_m_ack = (state == S_RAM_E) && (dma_grant == G_SND) && ram_ack;
 assign sc_m_ack = (state == S_RAM_E) && (dma_grant == G_SCSI) && ram_ack;
+assign pr_m_ack = (state == S_RAM_E) && (dma_grant == G_PRINT) && ram_ack;
 
 // DMA can reach physical main RAM only.  Keep the six high address
 // bits emitted by the controller until here; otherwise any invalid pointer
@@ -345,10 +360,12 @@ wire en_m_is_ram = en_m_addr[29:24] == 6'b000001;
 wire mo_m_is_ram = mo_m_addr[29:24] == 6'b000001;
 wire sn_m_is_ram = sn_m_addr[29:24] == 6'b000001;
 wire sc_m_is_ram = sc_m_addr[29:24] == 6'b000001;
+wire pr_m_is_ram = pr_m_addr[29:24] == 6'b000001;
 assign en_m_err = en_m_req && !en_m_is_ram;
 assign mo_m_err = mo_m_req && !mo_m_is_ram;
 assign sn_m_err = sn_m_req && !sn_m_is_ram;
 assign sc_m_err = sc_m_req && !sc_m_is_ram;
+assign pr_m_err = pr_m_req && !pr_m_is_ram;
 
 always @(posedge clk) begin
 	mem_ready  <= 0;
@@ -425,6 +442,17 @@ always @(posedge clk) begin
 					ram_addr <= sc_m_addr[23:0];
 					ram_din  <= sc_m_din;
 					dma_grant <= G_SCSI;
+					state    <= S_RAM_E;
+				end
+			end
+			else if (pr_m_req && !cpu_req && !berr_hold) begin
+				if (pr_m_is_ram) begin
+					ram_req  <= 1;
+					ram_we   <= pr_m_we;
+					ram_be   <= pr_m_be;
+					ram_addr <= pr_m_addr[23:0];
+					ram_din  <= pr_m_din;
+					dma_grant <= G_PRINT;
 					state    <= S_RAM_E;
 				end
 			end
@@ -571,7 +599,12 @@ wire io_sc_sptr= sel_io && (io_off[16:4] == 13'h400);           // 0x04000-0x040
 wire io_sc_ptr = sel_io && (io_off[16:4] == 13'h401);           // 0x04010-0x0401f
 wire io_sc_ini = sel_io && (io_off[16:2] == 15'h1084);          // 0x04210-0x04213
 wire io_scsi   = io_sc_csr | io_sc_sptr | io_sc_ptr | io_sc_ini;
-wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd && !io_scsi; // 0x00000-0x04FFF
+wire io_lp     = sel_io && (io_off[16:4] == 13'hF00);           // 0x0f000-0x0f00f LP CSR
+wire io_pr_csr = sel_io && (io_off[16:2] == 15'h0024);          // 0x00090-0x00093
+wire io_pr_ptr = sel_io && (io_off[16:4] == 13'h409);           // 0x04090-0x0409f
+wire io_pr_ini = sel_io && (io_off[16:2] == 15'h10A4);          // 0x04290-0x04293
+wire io_printer= io_lp | io_pr_csr | io_pr_ptr | io_pr_ini;
+wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd && !io_scsi && !io_printer; // 0x00000-0x04FFF
 wire io_intc  = sel_io && (io_off[16:12] == 5'h07);             // 0x07000-0x07FFF
 wire io_scr1  = sel_io && (io_off[16:11] == 6'h18);             // 0x0c000-0x0c7ff
 wire io_sid   = sel_io && (io_off[16:11] == 6'h19);             // 0x0c800-0x0cfff
@@ -614,6 +647,7 @@ wire [15:0] evt_rdata = cpu_addr[1] ? evt_latch[15:0] : {12'd0, us_counter[19:16
 assign io_rdata = io_enet  ? enet_rdata :
                   io_mo    ? mo_rdata :
                   io_snd   ? snd_rdata :
+                  io_printer ? pr_rdata :
                   io_scsi  ? esp_rdata :
                   io_dma   ? dma_rdata :
                   io_intc  ? intc_rdata :
@@ -635,6 +669,16 @@ always @(posedge clk) if (|img_mounted) disk_mounted <= (img_size != 0);
 reg floppy_mounted = 0;
 always @(posedge clk) if (|fimg_mounted) floppy_mounted <= (fimg_size != 0);
 
+// SCSI disks mounted below the CD-ROM's target 3 (OSD slots S0-S2 are
+// targets 0-2).  The ROM's "sd(unit,lun,part)" numbers disks in scan
+// order, so the CD-ROM's unit is the count of these; next_scr uses it
+// to spell the CD-ROM boot command.
+reg [2:0] sd_lower_mounted = 3'b000;
+integer smk;
+always @(posedge clk)
+	for (smk = 0; smk < 3; smk = smk + 1)
+		if (img_mounted[smk]) sd_lower_mounted[smk] <= (img_size != 0);
+
 next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 (
 	.clk(clk),
@@ -650,6 +694,7 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.boot_sel(boot_sel),
 	.disk_mounted(disk_mounted),
 	.floppy_mounted(floppy_mounted),
+	.sd_lower_mounted(sd_lower_mounted),
 	.timer_ipl7(timer_ipl7),
 	.led(led),
 	.rom_overlay(),
@@ -772,11 +817,12 @@ next_mo #(.CLK_HZ(CLK_HZ), .DRIVE_CONNECTED(2'b01)) mo
 );
 
 // KMS and sound out DMA (a RAM bus master)
-next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
+next_kms_snd #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) kms_snd
 (
 	.clk(clk),
 	.reset(dev_reset),
 	.ps2_key(ps2_key),
+	.ps2_mouse(ps2_mouse),
 	.sel_kms(io_kms),
 	.sel_csr(io_sn_csr),
 	.sel_sptr(io_sn_sptr),
@@ -797,7 +843,35 @@ next_kms_snd #(.CLK_HZ(CLK_HZ)) kms_snd
 	.m_err(sn_m_err),
 	.int_snd_ovrun(int_snd_ovrun),
 	.int_snd_out_dma(int_snd_out_dma),
-	.int_keymouse(int_keymouse)
+	.int_keymouse(int_keymouse),
+	.audio_l(audio_l),
+	.audio_r(audio_r)
+);
+
+// Laser printer interface and its memory-to-device DMA channel
+next_printer #(.CLK_HZ(CLK_HZ)) printer
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel_lp(io_lp),
+	.sel_csr(io_pr_csr),
+	.sel_ptr(io_pr_ptr),
+	.sel_ini(io_pr_ini),
+	.addr(io_off[15:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(pr_rdata),
+	.m_req(pr_m_req),
+	.m_we(pr_m_we),
+	.m_addr(pr_m_addr),
+	.m_be(pr_m_be),
+	.m_din(pr_m_din),
+	.m_dout(ram_dout),
+	.m_ack(pr_m_ack),
+	.m_err(pr_m_err),
+	.int_printer(int_printer),
+	.int_printer_dma(int_printer_dma)
 );
 
 // Floppy drive: an 82077 whose sector data rides the SCSI DMA channel
@@ -926,6 +1000,7 @@ next_bmap bmap
 reg soft1_d, soft2_d, scsi_d, flp_d;
 reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d, km_d;
 reg scsid_d;
+reg pr_d, prd_d;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
@@ -941,6 +1016,8 @@ always @(posedge clk) begin
 	sndo_d  <= int_snd_ovrun;
 	sndd_d  <= int_snd_out_dma;
 	km_d    <= int_keymouse;
+	pr_d    <= int_printer;
+	prd_d   <= int_printer_dma;
 end
 
 wire [31:0] int_set =
@@ -952,9 +1029,11 @@ wire [31:0] int_set =
 	({31'd0, int_snd_ovrun & ~sndo_d} << 8) |
 	({31'd0, int_en_rx & ~enrx_d} << 9) |
 	({31'd0, int_en_tx & ~entx_d} << 10) |
+	({31'd0, int_printer & ~pr_d} << 11) |
 	({31'd0, esp_int_scsi & ~scsi_d} << 12) |
 	({31'd0, int_disk & ~disk_d} << 13) |
 	({31'd0, int_snd_out_dma & ~sndd_d} << 23) |
+	({31'd0, int_printer_dma & ~prd_d} << 24) |
 	({31'd0, int_disk_dma & ~diskd_d} << 25) |
 	({31'd0, int_scsi_dma & ~scsid_d} << 26) |
 	({31'd0, int_en_rx_dma & ~enrxd_d} << 27) |
@@ -970,9 +1049,11 @@ wire [31:0] int_clr =
 	({31'd0, ~int_snd_ovrun & sndo_d} << 8) |
 	({31'd0, ~int_en_rx & enrx_d} << 9) |
 	({31'd0, ~int_en_tx & entx_d} << 10) |
+	({31'd0, ~int_printer & pr_d} << 11) |
 	({31'd0, ~esp_int_scsi & scsi_d} << 12) |
 	({31'd0, ~int_disk & disk_d} << 13) |
 	({31'd0, ~int_snd_out_dma & sndd_d} << 23) |
+	({31'd0, ~int_printer_dma & prd_d} << 24) |
 	({31'd0, ~int_disk_dma & diskd_d} << 25) |
 	({31'd0, ~int_scsi_dma & scsid_d} << 26) |
 	({31'd0, ~int_en_rx_dma & enrxd_d} << 27) |

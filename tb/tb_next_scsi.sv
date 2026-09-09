@@ -140,7 +140,7 @@ endfunction
 // SD-card model: an 8 block disk with a recognizable pattern
 //----------------------------------------------------------------------------
 
-localparam DISK_BLOCKS = 8;
+localparam DISK_BLOCKS = 32;
 
 reg [7:0] disk  [0:DISK_BLOCKS*512-1];
 reg [7:0] disk2 [0:DISK_BLOCKS*512-1];   // SCSI target 1
@@ -181,8 +181,8 @@ always @(posedge clk) begin
 			sd_buff_dout <= (dut.sd_unit == 3'd3)
 			              ? cd   [{sd_lba[3:0], 9'd0} + {23'd0, sd_buff_addr}]
 			              : (dut.sd_unit == 3'd1)
-			              ? disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}]
-			              : disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}];
+			              ? disk2[{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}]
+			              : disk [{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}];
 			sd_buff_wr <= 1;
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
@@ -197,9 +197,9 @@ always @(posedge clk) begin
 		// read a byte every other cycle (registered buffer read)
 		if (rd_phase) begin
 			if (dut.sd_unit == 3'd1)
-				disk2[{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+				disk2[{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			else
-				disk [{sd_lba[2:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+				disk [{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			rd_phase <= 0;
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
@@ -492,6 +492,152 @@ task check;
 	begin
 		if (cond) $display("PASS: %0s", name);
 		else begin $display("FAIL: %0s", name); errors = errors + 1; end
+	end
+endtask
+
+//----------------------------------------------------------------------------
+// NeXTSTEP 3.3 (sdmach) sc driver model for a raw-device write, from the
+// install CD kernel's disassembly (dma_start/dma_intr/dma_abort and the
+// 53C90 chip-state handlers), on a board whose DMA chip reads 0x139 -
+// which is what SCR1 board type 2, the NeXTcube, makes the kernel choose.
+//----------------------------------------------------------------------------
+
+reg [31:0] k_seg_start [0:3];
+reg [31:0] k_seg_end   [0:3];
+integer    k_nseg = 0;        // segments in the list
+integer    k_armed = 0;       // segments handed to the channel so far
+integer    k_dma_irqs = 0;    // DMA completion interrupts serviced
+integer    k_final = 0;       // completions that reset the channel
+reg [31:0] k_csr, k_nxt;
+
+task csr_rd32;
+	output [31:0] v;
+	begin
+		@(posedge clk);
+		sel_csr <= 1; addr <= 6'h00; we <= 0; be <= 2'b11;
+		@(posedge clk);
+		#1 v[31:16] = rdata;
+		addr <= 6'h02;
+		@(posedge clk);
+		#1 v[15:0] = rdata;
+		sel_csr <= 0;
+		@(posedge clk);
+	end
+endtask
+
+task ini_rd32;
+	output [31:0] v;
+	begin
+		@(posedge clk);
+		sel_ini <= 1; addr <= 6'h00; we <= 0; be <= 2'b11;
+		@(posedge clk);
+		#1 v[31:16] = rdata;
+		addr <= 6'h02;
+		@(posedge clk);
+		#1 v[15:0] = rdata;
+		sel_ini <= 0;
+		@(posedge clk);
+	end
+endtask
+
+task ram_put;
+	input [31:0] a;
+	input [7:0] b;
+	begin
+		case (a[1:0])
+			2'd0: ram[a[15:2]][31:24] = b;
+			2'd1: ram[a[15:2]][23:16] = b;
+			2'd2: ram[a[15:2]][15:8]  = b;
+			2'd3: ram[a[15:2]][7:0]   = b;
+		endcase
+	end
+endtask
+
+// dma_start(): RESET, the first segment through the INIT register, LIMIT,
+// the saved next/limit copies, the second segment into START/STOP and its
+// saved copies, SETENABLE|SETSUPDATE.  On a 0x139 chip every pointer
+// register is read back and rewritten until it matches - a register that
+// never reads back what was written keeps the kernel in that loop with
+// interrupts masked, so a mismatch here is a machine freeze.
+task k_dma_start;
+	reg [31:0] rb;
+	begin
+		csr_cmd(8'h10);
+		ini_wr32(k_seg_start[0]);
+		ini_rd32(rb);
+		check(rb == k_seg_start[0], "sdmach write: INIT reads back what was written");
+		ptr_wr32(6'h14, k_seg_end[0]);
+		rd_ptr32(6'h14, rb);
+		check(rb == k_seg_end[0], "sdmach write: LIMIT reads back what was written");
+		sptr_wr32(6'h00, k_seg_start[0]);
+		sptr_wr32(6'h04, k_seg_end[0]);
+		sptr_rd32(6'h00, rb);
+		check(rb == k_seg_start[0], "sdmach write: saved NEXT reads back what was written");
+		sptr_rd32(6'h04, rb);
+		check(rb == k_seg_end[0], "sdmach write: saved LIMIT reads back what was written");
+		k_armed = 1;
+		if (k_nseg > 1) begin
+			ptr_wr32(6'h18, k_seg_start[1]);
+			ptr_wr32(6'h1C, k_seg_end[1]);
+			rd_ptr32(6'h18, rb);
+			check(rb == k_seg_start[1], "sdmach write: START reads back what was written");
+			rd_ptr32(6'h1C, rb);
+			check(rb == k_seg_end[1], "sdmach write: STOP reads back what was written");
+			sptr_wr32(6'h08, k_seg_start[1]);
+			sptr_wr32(6'h0C, k_seg_end[1]);
+			k_armed = 2;
+			csr_cmd(8'h03);
+		end
+		else csr_cmd(8'h01);
+	end
+endtask
+
+// dma_intr(): ENABLE|COMPLETE is a chained segment done with the channel
+// already on the next one - hand it the one after that (SETSUPDATE|
+// CLRCOMPLETE) or just CLRCOMPLETE; anything else is the last completion,
+// which reads NEXT and RESETs the channel at once, before the ESP's own
+// transfer-complete interrupt has been raised.
+task k_dma_intr;
+	begin
+		k_dma_irqs = k_dma_irqs + 1;
+		csr_rd32(k_csr);
+		if ((k_csr & 32'h0b000000) == 32'h09000000) begin
+			if (k_armed < k_nseg) begin
+				ptr_wr32(6'h18, k_seg_start[k_armed]);
+				ptr_wr32(6'h1C, k_seg_end[k_armed]);
+				sptr_wr32(6'h08, k_seg_start[k_armed]);
+				sptr_wr32(6'h0C, k_seg_end[k_armed]);
+				k_armed = k_armed + 1;
+				csr_cmd(8'h0A);
+			end
+			else csr_cmd(8'h08);
+		end
+		else begin
+			rd_ptr32(6'h10, k_nxt);
+			csr_cmd(8'h10);
+			k_final = k_final + 1;
+		end
+	end
+endtask
+
+// the driver sleeps until the ESP interrupts; dma_intr runs from the
+// channel's own interrupt meanwhile, after a realistic dispatch latency
+task k_wait_esp;
+	integer n;
+	begin
+		n = 0;
+		while (!int_scsi && n < 4000000) begin
+			@(posedge clk);
+			n = n + 1;
+			if (int_scsi_dma) begin
+				repeat (25) @(posedge clk);
+				k_dma_intr;
+			end
+		end
+		if (!int_scsi) begin
+			$display("FAIL: sdmach write: ESP never interrupted (scsi_timer would fire)");
+			errors = errors + 1;
+		end
 	end
 endtask
 
@@ -1094,8 +1240,8 @@ initial begin
 	read_intr(intr);
 	flush_dma_in_words(2);
 	check(ram_byte(BUF+0) == 8'h00 && ram_byte(BUF+1) == 8'h00 &&
-	      ram_byte(BUF+2) == 8'h00 && ram_byte(BUF+3) == 8'd7,
-	      "read capacity: last lba 7");
+	      ram_byte(BUF+2) == 8'h00 && ram_byte(BUF+3) == DISK_BLOCKS - 1,
+	      "read capacity: last lba is the block count less one");
 	check(ram_byte(BUF+6) == 8'h02 && ram_byte(BUF+7) == 8'h00,
 	      "read capacity: blocksize 512");
 	finish_command(sts);
@@ -1155,6 +1301,73 @@ initial begin
 	check(ok, "write: 512 bytes landed in the disk image");
 	finish_command(sts);
 	check(sts == 8'h00, "write: good status");
+
+	//------------------------------------------------------------
+	// The install-time hang (NeXTSTEP 3.3 newfs onto the disk, seen on
+	// hardware 2026-09-07).  A DMA write whose channel window runs past
+	// the ESP transfer count leaves part of a burst in the internal
+	// buffer at terminal count (dma_irq_resume = 2).  The kernel's ESP
+	// interrupt handler, for the DMA chip it identifies as revision
+	// 0x139, writes the SCSI control register (0x3c, 0x38, then 0x20 -
+	// which clears MODE_DMA) and only THEN reads status, seqstep and
+	// INTSTATUS, back to back.  The engine must not re-raise the
+	// completion while the first interrupt is unacknowledged: the RAM
+	// dump of the hung machine held status 0x90 (INT|TC) with INTSTATUS
+	// 0 - an interrupt whose cause the acknowledge had already erased -
+	// and the driver parked in its completion state with no timeout.
+	//------------------------------------------------------------
+	begin : hang_race
+		integer n;
+		for (i = 0; i < 528; i = i + 1) begin
+			case (i[1:0])
+				0: ram[(BUF2[15:2]) + i/4][31:24] = pat(6, i);
+				1: ram[(BUF2[15:2]) + i/4][23:16] = pat(6, i);
+				2: ram[(BUF2[15:2]) + i/4][15:8]  = pat(6, i);
+				3: ram[(BUF2[15:2]) + i/4][7:0]   = pat(6, i);
+			endcase
+		end
+		select_atn6(8'h0A, 8'h00, 8'h00, 8'h06, 8'h01, 8'h00);   // WRITE(6) LBA 6
+		wait_irq;
+		read_intr(intr);
+		esp_rd8(6'h04, v);
+		check(v[2:0] == 3'd0, "hang: data out phase");
+		ptr_wr32(6'h10, BUF2);
+		ptr_wr32(6'h14, BUF2 + 32'd528);   // window 16 bytes past the count
+		csr_cmd(8'h11);
+		esp_wr8(6'h00, 8'h00);
+		esp_wr8(6'h01, 8'h02);             // 512 bytes
+		esp_wr8(6'h03, 8'h90);             // transfer info, DMA
+		wait_irq;                          // terminal count, partial tail buffered
+		// the driver's handler: control register first, with its delays ...
+		esp_wr8(6'h20, 8'h3C); repeat (5) @(posedge clk);
+		esp_wr8(6'h20, 8'h38); repeat (5) @(posedge clk);
+		esp_wr8(6'h20, 8'h20);             // MODE_DMA off
+		// ... then the register snapshot, INTSTATUS last: the acknowledge
+		esp_rd8(6'h04, v);
+		check(v[7] && v[4], "hang: status shows interrupt and terminal count");
+		esp_rd8(6'h06, v);
+		read_intr(intr);
+		check(intr == 8'h10, "hang: the completion interrupt carries bus service");
+		// The acknowledge lands on the next clock edge; a further interrupt
+		// after it is only legitimate with a cause.  (This sequence does not
+		// reproduce the hardware hang: the engine idles here.  It pins the
+		// completion, the control register dance and the acknowledge.)
+		@(posedge clk);
+		n = 0;
+		while (!int_scsi && n < 2000) begin @(posedge clk); n = n + 1; end
+		if (int_scsi) begin
+			read_intr(intr);
+			check(intr != 8'h00,
+			      "hang: no interrupt is raised whose cause the acknowledge erased");
+		end
+		esp_wr8(6'h20, 8'h30);             // ENABLE_INT | MODE_DMA back
+		finish_command(sts);
+		check(sts == 8'h00, "hang: the write completes with good status");
+		ok = 1;
+		for (i = 0; i < 512; i = i + 1)
+			if (disk[6*512 + i] !== pat(6, i)) ok = 0;
+		check(ok, "hang: 512 bytes landed in the disk image");
+	end
 
 	//------------------------------------------------------------
 	// chained READ(6), the way the NeXTSTEP driver runs the channel:
@@ -1581,14 +1794,14 @@ initial begin
 	// The reference checks the following block while delivering the
 	// current sector's final byte.  Crossing the image end must therefore
 	// finish with CHECK CONDITION without one extra PIO command.
-	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h07, 8'h02, 0);
+	select_atn6_target(3'd0, 8'h08, 0, 0, DISK_BLOCKS - 1, 8'h02, 0);
 	wait_irq; read_intr(intr);
 	ok = 1;
 	for (i = 0; i < 512; i = i + 1) begin
 		esp_wr8(6'h03, 8'h10);
 		wait_irq; read_intr(intr);
 		esp_rd8(6'h02, v);
-		if (v !== pat(7, i)) ok = 0;
+		if (v !== pat(DISK_BLOCKS - 1, i)) ok = 0;
 	end
 	check(ok, "pio end crossing: final valid sector is byte exact");
 	esp_rd8(6'h04, v);
@@ -1596,27 +1809,27 @@ initial begin
 	      "pio end crossing: last valid byte discovers invalid next LBA");
 	finish_command(sts);
 	check(sts == 8'h02 && dut.sense_code[0] == 8'h21 &&
-	      dut.sense_valid[0] && dut.sense_info[0] == 8,
-	      "pio end crossing: check condition identifies LBA 8");
+	      dut.sense_valid[0] && dut.sense_info[0] == DISK_BLOCKS,
+	      "pio end crossing: check condition identifies the LBA past the end");
 
 	// A transfer-count boundary exactly at byte 512 must not hide the
 	// target's synchronous attempt to refill the requested second block.
 	for (i = 0; i < 256; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
-	select_atn6_target(3'd0, 8'h08, 0, 0, 8'h07, 8'h02, 0);
+	select_atn6_target(3'd0, 8'h08, 0, 0, DISK_BLOCKS - 1, 8'h02, 0);
 	wait_irq; read_intr(intr);
 	ti_dma_in(17'd512, BUF, BUF + 32'd512);
 	read_intr(intr);
 	ok = 1;
 	for (i = 0; i < 512; i = i + 1)
-		if (ram_byte(BUF + i) !== pat(7, i)) ok = 0;
+		if (ram_byte(BUF + i) !== pat(DISK_BLOCKS - 1, i)) ok = 0;
 	check(ok, "dma end crossing: final valid sector is byte exact");
 	esp_rd8(6'h04, v);
 	check(v[2:0] == 3'd3,
 	      "dma end crossing: 512-byte TI discovers invalid next LBA");
 	finish_command(sts);
 	check(sts == 8'h02 && dut.sense_code[0] == 8'h21 &&
-	      dut.sense_valid[0] && dut.sense_info[0] == 8,
-	      "dma end crossing: check condition identifies LBA 8");
+	      dut.sense_valid[0] && dut.sense_info[0] == DISK_BLOCKS,
+	      "dma end crossing: check condition identifies the LBA past the end");
 
 	// esp_message_accepted() raises the disconnected interrupt in Previous.
 	// The ROM boot path waits for this final completion indication after it
@@ -1752,7 +1965,7 @@ initial begin
 	         ram_byte(32'h00007904), ram_byte(32'h00007905),
 	         ram_byte(32'h00007906), ram_byte(32'h00007907));
 	ok = (ram_byte(32'h00007900) == 8'h00) && (ram_byte(32'h00007901) == 8'h00) &&
-	     (ram_byte(32'h00007902) == 8'h00) && (ram_byte(32'h00007903) == 8'h07) &&
+	     (ram_byte(32'h00007902) == 8'h00) && (ram_byte(32'h00007903) == DISK_BLOCKS - 1) &&
 	     (ram_byte(32'h00007904) == 8'h00) && (ram_byte(32'h00007905) == 8'h00) &&
 	     (ram_byte(32'h00007906) == 8'h02) && (ram_byte(32'h00007907) == 8'h00);
 	check(ok, "capacity flush: the 8 byte response lands intact");
@@ -1848,6 +2061,183 @@ initial begin
 	check(ok, "cd read(10): four 512-byte blocks reach memory (disk-style)");
 	check(dut.d_next == BUF + 32'd2048, "cd read(10): 2048-byte read reaches limit");
 	finish_command(sts);
+
+	//------------------------------------------------------------
+	// NeXTSTEP 3.3 raw-device WRITE(10), driven exactly as sdmach's
+	// sc driver does it (disassembled from the install CD kernel):
+	// newfs writes from an unaligned static buffer, so dma_list shifts
+	// the data up to 16-byte alignment, splits it at the 8 KB page
+	// boundary and puts the last 16 bytes in a kernel bounce buffer -
+	// three chained segments for one 8192 byte transfer.  The ESP gets
+	// NOP and TI|DMA before ESPCTRL turns MODE_DMA on; each DMA
+	// completion is serviced from its own interrupt (the last one
+	// RESETs the channel before the ESP has finished); the TC handler
+	// clears MODE_DMA before reading the interrupt status.  This is
+	// the transfer that timed out on hardware during disk
+	// initialisation ("scsi_timer: timeout op:0x2a", 2026-09-08).
+	//------------------------------------------------------------
+	// user buffer at 0x1804: bytes 0..8175 shifted to 0x1810..0x37FF,
+	// bytes 8176..8191 in the bounce buffer at 0x4000; blocks 8..23
+	for (i = 0; i < 8176; i = i + 1)
+		ram_put(32'h1810 + i, ~pat(8 + i/512, i%512));
+	for (i = 8176; i < 8192; i = i + 1)
+		ram_put(32'h4000 + (i - 8176), ~pat(8 + i/512, i%512));
+	k_seg_start[0] = 32'h1810; k_seg_end[0] = 32'h2000;
+	k_seg_start[1] = 32'h2000; k_seg_end[1] = 32'h3800;
+	k_seg_start[2] = 32'h4000; k_seg_end[2] = 32'h4010;
+	k_nseg = 3; k_armed = 0; k_dma_irqs = 0; k_final = 0;
+
+	esp_wr8(6'h20, 8'h20);       // as the last TC handler left it: INT on, no DMA mode
+	esp_wr8(6'h03, 8'h01);       // flush FIFO
+	esp_wr8(6'h04, 8'h00);       // target 0
+	esp_wr8(6'h02, 8'hC0);       // identify, lun 0, disconnect privilege
+	esp_wr8(6'h02, 8'h2A); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h08);      // lba 8
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h10); esp_wr8(6'h02, 8'h00);      // 16 blocks
+	esp_wr8(6'h03, 8'h42);
+	wait_irq;
+	esp_rd8(6'h04, v);
+	esp_rd8(6'h06, sts);
+	read_intr(intr);
+	check(intr == 8'h18 && sts == 8'h04,
+	      "sdmach write: select completes with bus service and function complete at step 4");
+	check(v[2:0] == 3'd0, "sdmach write: data out phase");
+	esp_wr8(6'h03, 8'h01);       // phase handler: flush FIFO first
+	k_dma_start;
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h20);       // 8192 bytes
+	esp_wr8(6'h03, 8'h00);       // NOP
+	esp_wr8(6'h03, 8'h90);       // transfer info, DMA - MODE_DMA still off
+	esp_wr8(6'h20, 8'h30);       // now ENABLE_INT | MODE_DMA
+	k_wait_esp;
+
+	// the TC handler
+	repeat (20) @(posedge clk);
+	esp_wr8(6'h20, 8'h20);       // MODE_DMA off before the status is read
+	esp_rd8(6'h04, v);
+	esp_rd8(6'h06, sts);
+	read_intr(intr);
+	check(intr == 8'h10 && v[4], "sdmach write: transfer complete with bus service");
+	esp_rd8(6'h00, v);
+	esp_rd8(6'h01, sts);
+	check({sts, v} == 16'd0, "sdmach write: residual transfer count zero");
+	esp_rd8(6'h07, v);
+	check(v[4:0] == 5'd0, "sdmach write: nothing left in the FIFO");
+	check(k_dma_irqs == 3, "sdmach write: three segment completions serviced");
+	check(k_final == 1, "sdmach write: the last completion found the channel disabled");
+	check(k_nxt == 32'h4010, "sdmach write: NEXT rests at the end of the bounce segment");
+	// dma_cleanup -> dma_abort: CSR and NEXT snapshot, RESET
+	csr_rd32(k_csr);
+	rd_ptr32(6'h10, k_nxt);
+	csr_cmd(8'h10);
+	esp_wr8(6'h03, 8'h01);       // flush FIFO
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3, "sdmach write: status phase");
+	esp_wr8(6'h03, 8'h11);
+	wait_irq;
+	read_intr(intr);
+	check(intr == 8'h08, "sdmach write: initiator command complete");
+	esp_rd8(6'h07, v);
+	check(v[4:0] == 5'd2, "sdmach write: status and message in the FIFO");
+	esp_rd8(6'h02, sts);
+	esp_rd8(6'h02, v);
+	check(sts == 8'h00 && v == 8'h00, "sdmach write: good status, command complete");
+	esp_wr8(6'h03, 8'h12);
+	wait_irq;
+	read_intr(intr);
+	check(intr == 8'h20, "sdmach write: disconnected after message accepted");
+	esp_wr8(6'h03, 8'h44);       // enable selection, chip idle
+
+	ok = 1;
+	for (i = 0; i < 8192; i = i + 1)
+		if (disk[8*512 + i] !== (~pat(8 + i/512, i%512) & 8'hFF)) begin
+			if (ok) $display("  byte %0d: got %02x want %02x", i,
+			                 disk[8*512 + i], ~pat(8 + i/512, i%512) & 8'hFF);
+			ok = 0;
+		end
+	check(ok, "sdmach write: all 8192 bytes landed byte exact across the three segments");
+	ok = 1;
+	for (i = 0; i < 512; i = i + 1) begin
+		if (disk[7*512 + i] !== pat(7, i)) ok = 0;
+		if (disk[24*512 + i] !== pat(24, i)) ok = 0;
+	end
+	check(ok, "sdmach write: neighbouring blocks untouched");
+
+	// The other shape sdmach produces: an already aligned buffer (a
+	// kernel page, or a lucky user buffer).  The SCSI channel carries
+	// dma flag bit 1, so dma_list still rounds the last segment's end
+	// up to 16 and appends a 48-byte bounce segment the ESP count never
+	// reaches: the transfer count expires with the channel still
+	// enabled and chained into the bounce.  dma_intr sees a chained
+	// completion, the TC handler's dma_abort reads a non-zero CSR (a
+	// zero would spin the 0x139 driver forever) and RESETs.
+	for (i = 0; i < 4096; i = i + 1)
+		ram_put(32'h2000 + i, pat(24 + i/512, i%512) ^ 8'h5A);
+	k_seg_start[0] = 32'h2000; k_seg_end[0] = 32'h3000;
+	k_seg_start[1] = 32'h5000; k_seg_end[1] = 32'h5030;
+	k_nseg = 2; k_armed = 0; k_dma_irqs = 0; k_final = 0;
+	esp_wr8(6'h03, 8'h01);
+	esp_wr8(6'h04, 8'h00);
+	esp_wr8(6'h02, 8'hC0);
+	esp_wr8(6'h02, 8'h2A); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h18);      // lba 24
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h08); esp_wr8(6'h02, 8'h00);      // 8 blocks: 24..31
+	esp_wr8(6'h03, 8'h42);
+	wait_irq;
+	esp_rd8(6'h04, v);
+	read_intr(intr);
+	check(intr == 8'h18 && v[2:0] == 3'd0, "sdmach aligned write: selected, data out");
+	esp_wr8(6'h03, 8'h01);
+	k_dma_start;
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h10);       // 4096 bytes
+	esp_wr8(6'h03, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	esp_wr8(6'h20, 8'h30);
+	k_wait_esp;
+	repeat (20) @(posedge clk);
+	esp_wr8(6'h20, 8'h20);
+	esp_rd8(6'h04, v);
+	read_intr(intr);
+	check(intr == 8'h10 && v[4], "sdmach aligned write: transfer complete");
+	esp_rd8(6'h00, v);
+	esp_rd8(6'h01, sts);
+	check({sts, v} == 16'd0, "sdmach aligned write: residual count zero");
+	if (k_dma_irqs != 1 || k_final != 0)
+		$display("  dma irqs %0d, final resets %0d", k_dma_irqs, k_final);
+	check(k_dma_irqs == 1 && k_final == 0,
+	      "sdmach aligned write: one chained completion, channel left running into the bounce");
+	csr_rd32(k_csr);
+	check(k_csr[24] && !k_csr[27],
+	      "sdmach aligned write: dma_abort finds the channel enabled, not a zero CSR");
+	rd_ptr32(6'h10, k_nxt);
+	if (k_nxt != 32'h5000) $display("  NEXT = %08x", k_nxt);
+	check(k_nxt == 32'h5000, "sdmach aligned write: NEXT chained to the bounce segment untouched");
+	csr_cmd(8'h10);
+	esp_wr8(6'h03, 8'h01);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3, "sdmach aligned write: status phase");
+	esp_wr8(6'h03, 8'h11);
+	wait_irq;
+	read_intr(intr);
+	esp_rd8(6'h02, sts);
+	esp_rd8(6'h02, v);
+	check(intr == 8'h08 && sts == 8'h00 && v == 8'h00,
+	      "sdmach aligned write: good status, command complete");
+	esp_wr8(6'h03, 8'h12);
+	wait_irq;
+	read_intr(intr);
+	check(intr == 8'h20, "sdmach aligned write: disconnected");
+	esp_wr8(6'h03, 8'h44);
+	ok = 1;
+	for (i = 0; i < 4096; i = i + 1)
+		if (disk[24*512 + i] !== (pat(24 + i/512, i%512) ^ 8'h5A)) ok = 0;
+	check(ok, "sdmach aligned write: 4096 bytes landed byte exact");
+	check(dut.xst == 0, "sdmach aligned write: engine idle afterwards");
 
 
 	if (errors == 0) $display("ALL PASS");

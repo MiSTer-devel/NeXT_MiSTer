@@ -33,13 +33,12 @@ Rev 2.5 v66 (`reference/previous/src/Rev_2.5_v66.BIN`).
 | `src/esp.c`, `src/scsi.c`  | `rtl/next/next_scsi.sv`    | ESP (53C90) with the initiator command set (select with/without ATN, transfer info PIO+DMA, pad, ICCS, message accepted, bus reset, selection timeout), the SCSI disk target (TEST UNIT READY, INQUIRY, REQUEST SENSE, READ CAPACITY, READ/WRITE 6+10, MODE SENSE, START/STOP, FORMAT), the NeXT SCSI DMA channel, and the disk image on the MiSTer SD card (hps_io block access, OSD slot "SCSI Disk") |
 | `src/ethernet.c` (MB8795)  | `rtl/next/next_enet_dma.sv`| registers, both DMA channels with chaining, the local loopback path (TXMODE_DIS_LOOP clear) with EN_EOP framing, minimum-size padding and place-holder CRC, the receive address filter, and the frame streaming interface to the bridge |
 | real network               | `rtl/next/next_enet_bridge.sv`, `next_ddram_arb.sv` | when the guest disables loopback, frames cross a DDR3 shared-memory mailbox (rings at 0x1FF00000, the A2065 window) to an ARM daemon in Main_MiSTer (`support/next/next_enet.cpp`, branch `next-ethernet` of the Main fork) that bridges to eth0 (BPF filtered), eth1, a macvlan child, or tap0 -- the architecture of the Minimig A2065 support, with the NIC kept in the fabric and only frames crossing. The OSD "Network" option (status bits [54:52]) selects the interface |
-| `src/mo.c` optical drive   | `rtl/next/next_mo.sv`      | OSP registers, disk DMA channel, ECC buffer engine in the standalone MOCSR2_ECC_DIS mode (fill from and drain to memory). Reed-Solomon parity and disk operations are TODO |
-| `src/floppy.c`             | `rtl/next/next_floppy.sv`  | Intel 82077AA: command and result phases through the FIFO, specify, configure, recalibrate, seek, sense interrupt status, drive status, read id, read and write with the sector data on the shared SCSI DMA channel, geometry derived from the image size (720K, 1440K, 2880K), image from the MiSTer SD card (OSD slot "Floppy"). Format and the scan commands report invalid |
-| `src/kms.c`, `src/snd.c`   | `rtl/next/next_kms_snd.sv` | KMS status/control bytes, command/data pairs, keyboard input (PS/2 to NeXT keycodes, modifiers, device poll mask, set-address protocol, overrun), sound out enable/disable, and the sound out DMA channel engine with completion interrupt and underrun status. Mouse input and a real audio path are TODO |
-| `src/floppy.c` (82077AA)   | -                          | TODO (reads return 0) |
+| `src/mo.c` optical drive   | `rtl/next/next_mo.sv`      | OSP registers, disk DMA channel, ECC buffer engine in the standalone MOCSR2_ECC_DIS mode (fill from and drain to memory), the shared Reed-Solomon codec (next_rs.sv: reads decode, writes encode the 1296-byte sectors), and disk read/write of the SD image |
+| `src/floppy.c`             | `rtl/next/next_floppy.sv`  | Intel 82077AA: command and result phases through the FIFO, specify, configure, recalibrate, seek, sense interrupt status, drive status, read id, read and write with the sector data on the shared SCSI DMA channel, geometry derived from the image size (720K, 1440K, 2880K), format (consumes C/H/R/N descriptors and zero-fills the sectors), image from the MiSTer SD card (OSD slot "Floppy"). Scan is reported invalid, as in Previous (which does not implement it) |
+| `src/kms.c`, `src/snd.c`   | `rtl/next/next_kms_snd.sv` | KMS status/control bytes, command/data pairs, keyboard input (PS/2 to NeXT keycodes, modifiers, device poll mask, set-address protocol, overrun), sound out enable/disable, and the sound out DMA channel engine with completion interrupt and underrun status. Mouse input (PS/2 packet to NeXT mouse report), and a 44.1 kHz stereo audio-out path (sound-out DMA frames to a FIFO drained to audio_l/r) |
 | `src/dsp/` DSP56001        | -                          | TODO (reads return 0) |
 | `src/nbic.c` NeXTbus       | -                          | TODO (bus error, equivalent to a machine without NBIC) |
-| `src/printer.c`            | -                          | TODO |
+| `src/printer.c`            | `rtl/next/next_printer.sv` | partial: LP CSR (0x0200F000) has writable power/interface controls and is decoded separately from LP data (0x0200F004); no printer responses, so the driver probe times out. The DMA-out channel (0x02000090) consumes raster data with COMPLETE/INT_PRINTER_DMA and SUPDATE chain reload; the physical printer protocol is not implemented |
 
 ## What provably works
 
@@ -137,7 +136,9 @@ passed path, about 5 minutes):
    "Loading from network").  The ROM's SCSI boot path (select, sector
    reads by DMA) runs in simulation with "./run_tests.sh bootsd"; a
    real NeXTSTEP image is needed for an actual boot.
-4. KMS mouse input.
-5. SCC serial data path, sound output path, DSP as stretch goals.
+4. (done) KMS mouse input: PS/2 packets become NeXT mouse reports.
+5. (done) Sound output path, mouse input, and the printer DMA channel
+   (next_printer.sv). The printer command/response protocol, SCC serial
+   data path, and DSP56001 remain stretch goals.
 6. CPU caches on (cacheable windows for RAM/ROM/VRAM), snoop from DMA
    writes.

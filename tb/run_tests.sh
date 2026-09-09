@@ -12,6 +12,10 @@
 #   ./run_tests.sh         device suites plus a 3 ms boot smoke test
 #   ./run_tests.sh bootsd  additionally boots with a mounted disk image
 #                          and checks the ROM's SCSI boot path
+#   ./run_tests.sh bootcd  additionally mounts a disk on target 0 and the
+#                          image on the CD-ROM slot (target 3), boot device
+#                          at CD-ROM, and checks the NVRAM "sd(1,0,0)" steers
+#                          the ROM to select and query target 3
 #   ./run_tests.sh post    additionally runs the full power-on system
 #                          test to the "System test passed" path
 #                          (about 5 seconds of machine time)
@@ -36,7 +40,8 @@ NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
          $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv \
-         $RTL/next_floppy.sv $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
+         $RTL/next_floppy.sv $RTL/next_printer.sv \
+         $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
          $RTL/next_enet_bridge.sv $RTL/dpram.v"
 
 echo "== converting boot ROM =="
@@ -65,6 +70,7 @@ vbuild tb_next_ddram_arb tb_next_ddram_arb.sv $RTL/next_ddram_arb.sv
 vbuild tb_next_rs        tb_next_rs.sv $RTL/next_rs.sv
 vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $RTL/next_rs.sv
 vbuild tb_next_snd       tb_next_snd.sv $RTL/next_kms_snd.sv
+vbuild tb_next_printer   tb_next_printer.sv $RTL/next_printer.sv
 vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
@@ -111,6 +117,7 @@ run tb_ddram_arb "$WORK/vl_tb_next_ddram_arb/tb_next_ddram_arb"
 run tb_rs        "$WORK/vl_tb_next_rs/tb_next_rs"
 run tb_mo        "$WORK/vl_tb_next_mo/tb_next_mo"
 run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
+run tb_printer   "$WORK/vl_tb_next_printer/tb_next_printer"
 run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
@@ -129,6 +136,26 @@ if [ "${1:-}" = "post" ]; then
 		fail=1
 	else
 		grep -E "measured|passed path" "$WORK/tb_post.log" | tail -2
+	fi
+fi
+
+if [ "${1:-}" = "bootcd" ]; then
+	echo "--- CD-ROM boot device: NVRAM sd(1,0,0) steers the ROM to target 3 (about 7 minutes) ---"
+	# The boot device menu at CD-ROM puts the ROM's "sd(N,0,0)" command in
+	# NVRAM, N being the CD-ROM's scan-order unit (the ROM numbers disks
+	# in the order it finds them, not by target).  The bench mounts a disk
+	# on target 0 too, so N is 1, and asserts that sd(1,0,0) steers the ROM
+	# to select and query target 3.  (The v66 ROM does not blk0-boot a
+	# type-05 CD-ROM; the install medium boots via the floppy, root on the
+	# CD - so this checks the NVRAM steering, not a completed CD boot.)
+	"$WORK/vl_tb_next_boot/tb_next_boot" +bootcd +mcycles=1600 \
+		| tee "$WORK/tb_bootcd.log" > /dev/null
+	if grep -q "ALL PASS" "$WORK/tb_bootcd.log"; then
+		grep -E "passed path|BOOT:|boot:|SD reads" "$WORK/tb_bootcd.log" | head -12
+	else
+		echo "*** CD-ROM boot path FAILED (see tb/$WORK/tb_bootcd.log)"
+		grep -E "FAIL:|berr_events|SD reads|target" "$WORK/tb_bootcd.log" | head -8
+		fail=1
 	fi
 fi
 
