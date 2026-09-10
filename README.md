@@ -1,4 +1,4 @@
-# before
+# NeXT_MiSTer
 
 NeXT core for MiSTer: a NeXTcube 68040 in FPGA.
 
@@ -8,13 +8,13 @@ as the hardware reference (submodule at `reference/previous`), the
 core (submodule at `rtl/AP68040`), and the
 [MiSTer core template](https://github.com/MiSTer-devel/Template_MiSTer).
 
-Status: early bring-up.  The real Rev 2.5 v66 boot ROM executes on the
+Status: working.  The real Rev 2.5 v66 boot ROM executes on the
 real CPU core through the NeXT memory map, system registers, RTC/NVRAM,
 interrupt controller, hardclock, and the 1120x832 monochrome video
-pipeline, and passes the complete power-on system test.  Keyboard input
-and a SCSI disk (image mounted from the OSD "SCSI Disk" slot) are
-wired.  See [docs/PORTING.md](docs/PORTING.md) for the module map
-and roadmap.
+pipeline, and passes the complete power-on system test.  Keyboard input, mouse,
+and a peripherials (image mounted from the OSD "SCSI Disk" slot) are
+wired. Boots NeXTSTEP 3.3 disk from Previous emulator.  See [docs/PORTING.md](docs/PORTING.md) for the module map
+and roadmap. 
 
 ## Building
 
