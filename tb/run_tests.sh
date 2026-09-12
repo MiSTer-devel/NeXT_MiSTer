@@ -39,7 +39,7 @@ NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
-         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_rs.sv \
+         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_snd_in.sv $RTL/next_audio_adc.sv $RTL/next_rs.sv \
          $RTL/next_floppy.sv $RTL/next_printer.sv \
          $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
          $RTL/next_enet_bridge.sv $RTL/dpram.v"
@@ -70,11 +70,14 @@ vbuild tb_next_ddram_arb tb_next_ddram_arb.sv $RTL/next_ddram_arb.sv
 vbuild tb_next_rs        tb_next_rs.sv $RTL/next_rs.sv
 vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $RTL/next_rs.sv
 vbuild tb_next_snd       tb_next_snd.sv $RTL/next_kms_snd.sv
+vbuild tb_next_snd_in    tb_next_snd_in.sv $RTL/next_snd_in.sv $RTL/next_kms_snd.sv
+vbuild tb_next_audio_adc tb_next_audio_adc.sv $RTL/next_audio_adc.sv ../sys/ltc2308.sv
 vbuild tb_next_printer   tb_next_printer.sv $RTL/next_printer.sv
 vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
 vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC
+vbuild tb_next_recording -I"$CPU" tb_next_recording.sv $NEXTSRC $CPUSRC
 
 # The emu top is only ever compiled by Quartus, so a duplicate
 # declaration or a mistyped port there costs a forty minute build to
@@ -117,12 +120,16 @@ run tb_ddram_arb "$WORK/vl_tb_next_ddram_arb/tb_next_ddram_arb"
 run tb_rs        "$WORK/vl_tb_next_rs/tb_next_rs"
 run tb_mo        "$WORK/vl_tb_next_mo/tb_next_mo"
 run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
+run tb_snd_in    "$WORK/vl_tb_next_snd_in/tb_next_snd_in"
+run tb_audio_adc "$WORK/vl_tb_next_audio_adc/tb_next_audio_adc"
 run tb_printer   "$WORK/vl_tb_next_printer/tb_next_printer"
 run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"
 run tb_boot      "$WORK/vl_tb_next_boot/tb_next_boot"
 run tb_boot_noet "$WORK/vl_tb_next_boot/tb_next_boot" +netoff
+run tb_recording "$WORK/vl_tb_next_recording/tb_next_recording"
+run tb_recording_abort "$WORK/vl_tb_next_recording/tb_next_recording" +abortonly
 
 if [ "${1:-}" = "post" ]; then
 	echo "--- full power-on system test (about 5 minutes) ---"

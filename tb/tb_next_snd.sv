@@ -48,6 +48,7 @@ next_kms_snd #(.CLK_HZ(1000000)) dut
 		.m_din(m_din), .m_dout(m_dout), .m_ack(m_ack), .m_err(m_err),
 	.int_snd_ovrun(int_snd_ovrun), .int_snd_out_dma(int_snd_out_dma),
 	.int_keymouse(),
+	.sndin_active(), .sndin_clear(), .sndin_request(1'b0), .sndin_overrun(1'b0),
 	.audio_l(audio_l), .audio_r(audio_r)
 );
 wire signed [15:0] audio_l, audio_r;

@@ -96,6 +96,7 @@ next_system #(
 
 	.led(led),
 	.audio_l(), .audio_r(),
+	.audio_in(16'sd0),
 
 	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr), .btx_rd(btx_rd),
 	.btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),

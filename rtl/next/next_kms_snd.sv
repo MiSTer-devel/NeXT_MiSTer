@@ -80,6 +80,12 @@ module next_kms_snd #(
 	output        int_snd_out_dma, // channel complete level
 	output        int_keymouse,    // INT_KEYMOUSE level
 
+	// Codec input DMA lives in next_snd_in; share the KMS control/status.
+	output reg    sndin_active,
+	output reg    sndin_clear,
+	input         sndin_request,
+	input         sndin_overrun,
+
 	// signed 16-bit stereo audio out, driven at the NeXT's 44.1 kHz rate
 	output reg signed [15:0] audio_l,
 	output reg signed [15:0] audio_r
@@ -136,7 +142,7 @@ wire mouse_enabled =
 reg       sndout_active;
 reg       snd_underrun;
 
-assign int_snd_ovrun = snd_underrun;
+assign int_snd_ovrun = snd_underrun | sndin_overrun;
 
 //----------------------------------------------------------------------------
 // sound out DMA channel
@@ -152,8 +158,9 @@ assign int_snd_out_dma = s_csr[3];
 // read mux
 //----------------------------------------------------------------------------
 
+wire [7:0] sound_status = (st_snd & 8'hf9) | {5'd0, sndin_request, sndin_overrun, 1'b0};
 `define KMS_READ(a) ( \
-	((a) == 4'h0) ? st_snd : \
+	((a) == 4'h0) ? sound_status : \
 	((a) == 4'h1) ? st_km : \
 	((a) == 4'h2) ? st_tx : \
 	((a) == 4'h3) ? st_cmd : \
@@ -431,12 +438,17 @@ task automatic kms_command;
 				snd_underrun <= 0;
 			end
 		end
+		else if ((cmd & 8'hC7) == 8'h03) begin
+			sndin_active <= cmd[3];
+			if (!cmd[3]) sndin_clear <= 1;
+		end
 		// 0xC4/0xC2 volume control, 0xC7 analog sound out, 0xFF reset:
 		// nothing to do yet
 	end
 endtask
 
 always @(posedge clk) begin
+	sndin_clear <= 0;
 	if (reset) begin
 		st_snd <= 0; st_km <= 0; st_tx <= 0; st_cmd <= 0;
 		kms_data <= 0;
@@ -448,6 +460,7 @@ always @(posedge clk) begin
 		ps2_toggle_d <= 0;
 		ps2_mouse_tgl_d <= 0;
 		sndout_active <= 0;
+		sndin_active <= 0;
 		snd_underrun <= 0;
 		s_csr <= 0;
 		s_next <= 0; s_limit <= 0; s_start <= 0; s_stop <= 0;
@@ -545,6 +558,7 @@ always @(posedge clk) begin
 					case (a)
 						4'h0: begin
 							// KMS_Ctrl_Snd_Write
+							if (v[1] && !sndin_active) sndin_clear <= 1;
 							st_snd <= (st_snd & ~(SNDOUT_DMA_ENABLE|SNDIN_DMA_ENABLE))
 							        | (v & (SNDOUT_DMA_ENABLE|SNDIN_DMA_ENABLE));
 							if ((v & SNDOUT_DMA_UNDERRUN) && !sndout_active) begin

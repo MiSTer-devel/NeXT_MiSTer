@@ -29,7 +29,6 @@ module emu
 
 ///////// Default values for ports not used in this core /////////
 
-assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
@@ -74,6 +73,7 @@ localparam CONF_STR = {
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"O[54:52],Network,Off,eth0,eth1,macvlan,tap0;",
 	"O[58],Ethernet cable,Connected,Disconnected;",
+	"O[59],Audio input,Silence,ADC;",
 	"O[57:55],Boot device,Auto,Disk,Floppy,Network,ROM Default,Optical,CD-ROM;",
 	"-;",
 	"T[0],Reset;",
@@ -196,6 +196,12 @@ always @(posedge clk_sys) if (rom_download) rom_loaded <= 1;
 
 wire reset = RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
 
+wire signed [15:0] adc_audio_in;
+next_audio_adc #(.CLK_REAL_HZ(28000000)) adc_input
+(
+	.clk(clk_sys), .reset(reset), .ADC_BUS(ADC_BUS), .audio_in(adc_audio_in)
+);
+
 ///////////////////////   SYSTEM    //////////////////////////////
 
 wire        hsync, vsync, hblank, vblank;
@@ -292,6 +298,7 @@ next_system #(
 	.ram_ack(ram_ack),
 
 	.led(led),
+	.audio_in(status[59] ? adc_audio_in : 16'sd0),
 	.audio_l(audio_l),
 	.audio_r(audio_r),
 

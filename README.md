@@ -43,6 +43,14 @@ support.  It needs the matching Main_MiSTer build from the
 `next-ethernet` branch (releases/MiSTer_20260828 there); with stock
 Main the machine sees an empty network.
 
+## Audio recording
+
+Select **Audio input → ADC** in the OSD to record from ADC-IN (built into
+Digital IO, or supplied by the separate input adapter). The default
+**Silence** option allows recording without an external audio source.
+Recording uses the NeXT mono codec at 8,012 Hz. See
+[audio input](docs/AUDIO_INPUT.md) for the DMA fix and validation.
+
 ## Boot ROM
 
 Copy `reference/previous/src/Rev_2.5_v66.BIN` to the MiSTer as

@@ -69,6 +69,7 @@ always @(posedge clk) begin
 		sck    <= 0;
 		cfg    <= 0;
 		dout   <= 0;
+		dout_sync <= 0;
 		pin    <= NUM_CH[2:0]-1'd1;
 	end
 	else begin
