@@ -100,6 +100,30 @@ next_scsi #(.CLK_HZ(1000000), .CD_UNITS(6'b001000)) dut   // target 3 is a CD-RO
 );
 
 //----------------------------------------------------------------------------
+// Invariant: the ESP must never present an interrupt with no cause.
+//
+// The driver's handler snapshots status, seqstep and then interrupt
+// status, and that last read is the acknowledge.  A raised interrupt
+// whose cause reads back as zero leaves the handler with nothing to
+// dispatch on. PIO status and data input reproduced this defect, including
+// status 0x90 / seqstep 4 / INTSTATUS 0. Matching those register values
+// alone does not establish the cause of a particular hardware freeze.
+//----------------------------------------------------------------------------
+integer zero_cause = 0;
+reg     int_scsi_d = 0;
+always @(posedge clk) begin
+	if (reset) int_scsi_d <= 0;
+	else begin
+		int_scsi_d <= int_scsi;
+		if (int_scsi && !int_scsi_d && dut.intstatus == 8'h00) begin
+			zero_cause = zero_cause + 1;
+			$display("FAIL: interrupt raised with no cause (status=%02x seqstep=%02x) at %0t",
+			         dut.status, dut.seqstep, $time);
+		end
+	end
+end
+
+//----------------------------------------------------------------------------
 // RAM model
 //----------------------------------------------------------------------------
 
@@ -507,8 +531,12 @@ reg [31:0] k_seg_end   [0:3];
 integer    k_nseg = 0;        // segments in the list
 integer    k_armed = 0;       // segments handed to the channel so far
 integer    k_dma_irqs = 0;    // DMA completion interrupts serviced
+integer    k_late = 25;       // clocks before the DMA interrupt is serviced
+integer    k_after_run_out = 0;  // 1 = service only once the channel is disabled
+integer    k_restarts = 0;    // chains restarted through dma_start
 integer    k_final = 0;       // completions that reset the channel
 reg [31:0] k_csr, k_nxt;
+integer    ki;
 
 task csr_rd32;
 	output [31:0] v;
@@ -612,6 +640,22 @@ task k_dma_intr;
 			end
 			else csr_cmd(8'h08);
 		end
+		else if (k_armed < k_nseg) begin
+			// COMPLETE without ENABLE and segments still queued: the
+			// channel ran out before the driver could arm the next one.
+			// The SCSI channel's dma flags carry bit 2, so dma_intr
+			// recovers by calling dma_start again from the remaining
+			// segment rather than finishing the transfer.
+			k_restarts = k_restarts + 1;
+			k_seg_start[0] = k_seg_start[k_armed];
+			k_seg_end[0]   = k_seg_end[k_armed];
+			k_nseg = k_nseg - k_armed;
+			for (ki = 1; ki < k_nseg; ki = ki + 1) begin
+				k_seg_start[ki] = k_seg_start[k_armed + ki];
+				k_seg_end[ki]   = k_seg_end[k_armed + ki];
+			end
+			k_dma_start;
+		end
 		else begin
 			rd_ptr32(6'h10, k_nxt);
 			csr_cmd(8'h10);
@@ -624,13 +668,26 @@ endtask
 // channel's own interrupt meanwhile, after a realistic dispatch latency
 task k_wait_esp;
 	integer n;
+	integer nn;
 	begin
 		n = 0;
 		while (!int_scsi && n < 4000000) begin
 			@(posedge clk);
 			n = n + 1;
 			if (int_scsi_dma) begin
-				repeat (25) @(posedge clk);
+				if (k_after_run_out) begin
+					// Let the channel drain whatever it was chained
+					// into, so the driver arms the next segment only
+					// after the channel has already run out - the race
+					// the driver's dma-flag bit 2 exists to recover.
+					nn = 0;
+					while (int_scsi_dma && dut.d_csr[0] &&
+					       !int_scsi && nn < 400000) begin
+						@(posedge clk);
+						nn = nn + 1;
+					end
+				end
+				repeat (k_late) @(posedge clk);
 				k_dma_intr;
 			end
 		end
@@ -650,6 +707,8 @@ reg [31:0] d;
 reg [7:0] intr;
 reg ok;
 reg [9:0] fifo_race_pos;
+integer ti_i, ti_j;
+reg ti_ok;
 reg [16:0] fifo_race_count;
 
 initial begin
@@ -1139,14 +1198,21 @@ initial begin
 	check(v == 8'h00, "select completion clears the ESP command register");
 	esp_rd8(6'h04, v);
 	check(v[2:0] == 3'd3, "test unit ready: status phase");
-	// esp_transfer_info() schedules an interrupt even for the reference's
-	// otherwise-unimplemented PIO transfer in status phase.
+	// PIO status and message input each deliver one byte and their own
+	// cause. Reading a status byte advances to message-in.
 	esp_wr8(6'h03, 8'h10);
-	repeat (100) @(posedge clk);
-	check(int_scsi, "PIO transfer information in status phase interrupts");
-	if (int_scsi) read_intr(intr);
-	finish_command(sts);
-	check(sts == 8'h00, "test unit ready: good status");
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h02, sts);
+	esp_rd8(6'h04, v);
+	check(intr == 8'h10 && sts == 0 && v[2:0] == 7,
+	      "PIO status returns GOOD with BS and advances to message in");
+	esp_wr8(6'h03, 8'h10);
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h02, v);
+	check(intr == 8'h08 && v == 0, "PIO command-complete message returns FC");
+	esp_wr8(6'h03, 8'h12);
+	wait_irq; read_intr(intr);
+	check(intr == 8'h20, "accepting the PIO completion message disconnects");
 
 	//------------------------------------------------------------
 	// INQUIRY, 54 bytes via DMA
@@ -1262,7 +1328,10 @@ initial begin
 	check(int_scsi_dma, "read: dma channel complete interrupt");
 	csr_cmd(8'h08);              // CLRCOMPLETE
 	@(posedge clk);
-	check(!int_scsi_dma, "read: dma interrupt cleared");
+	check(int_scsi_dma, "read: CLRCOMPLETE retains a stopped channel completion");
+	csr_cmd(8'h10);              // RESET acknowledges the stopped channel
+	@(posedge clk);
+	check(!int_scsi_dma, "read: RESET clears the stopped DMA interrupt");
 	ok = 1;
 	for (i = 0; i < 1024; i = i + 1)
 		if (ram_byte(BUF + i) != pat(2 + i/512, i % 512)) ok = 0;
@@ -2033,7 +2102,7 @@ initial begin
 	finish_command(sts);
 
 	// READ CAPACITY: 512-byte blocks like a disk
-	select_atn6_target(3'd3, 8'h25, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	select_atn10_target(3'd3, 8'h25, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	wait_irq; read_intr(intr);
 	for (i = 0; i < 4; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
 	ti_dma_in(17'd8, BUF, BUF + 32'd16);
@@ -2239,9 +2308,95 @@ initial begin
 	check(ok, "sdmach aligned write: 4096 bytes landed byte exact");
 	check(dut.xst == 0, "sdmach aligned write: engine idle afterwards");
 
+	//------------------------------------------------------------
+	// The same chained write with the DMA interrupt serviced far too
+	// late - after the channel has already drained the segment it was
+	// chained into.  The driver arms a segment only from the previous
+	// segment's completion interrupt, so under load it always loses
+	// this race eventually; its recovery is the dma flags' bit 2 path,
+	// which calls dma_start again instead of finishing the transfer.
+	// The controller must still finish the command and interrupt: a
+	// channel that goes quiet here is what "scsi_timer: timeout
+	// op:0x2a" reports, because the ESP then never interrupts at all.
+	//------------------------------------------------------------
+	for (i = 0; i < 8176; i = i + 1)
+		ram_put(32'h1810 + i, pat(8 + i/512, i%512) ^ 8'h3C);
+	for (i = 8176; i < 8192; i = i + 1)
+		ram_put(32'h4000 + (i - 8176), pat(8 + i/512, i%512) ^ 8'h3C);
+	k_seg_start[0] = 32'h1810; k_seg_end[0] = 32'h2000;
+	k_seg_start[1] = 32'h2000; k_seg_end[1] = 32'h3800;
+	k_seg_start[2] = 32'h4000; k_seg_end[2] = 32'h4010;
+	k_nseg = 3; k_armed = 0; k_dma_irqs = 0; k_final = 0; k_restarts = 0;
+	k_after_run_out = 1;
+
+	esp_wr8(6'h03, 8'h01);
+	esp_wr8(6'h04, 8'h00);
+	esp_wr8(6'h02, 8'hC0);
+	esp_wr8(6'h02, 8'h2A); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h08);      // lba 8
+	esp_wr8(6'h02, 8'h00); esp_wr8(6'h02, 8'h00);
+	esp_wr8(6'h02, 8'h10); esp_wr8(6'h02, 8'h00);      // 16 blocks
+	esp_wr8(6'h03, 8'h42);
+	wait_irq;
+	esp_rd8(6'h04, v);
+	read_intr(intr);
+	check(intr == 8'h18 && v[2:0] == 3'd0, "late chain: selected, data out");
+	esp_wr8(6'h03, 8'h01);
+	k_dma_start;
+	esp_wr8(6'h00, 8'h00);
+	esp_wr8(6'h01, 8'h20);       // 8192 bytes
+	esp_wr8(6'h03, 8'h00);
+	esp_wr8(6'h03, 8'h90);
+	esp_wr8(6'h20, 8'h30);
+	k_wait_esp;
+	repeat (20) @(posedge clk);
+	esp_wr8(6'h20, 8'h20);
+	esp_rd8(6'h04, v);
+	read_intr(intr);
+	check(intr == 8'h10 && v[4],
+	      "late chain: the transfer still completes and interrupts");
+	esp_rd8(6'h00, v);
+	esp_rd8(6'h01, sts);
+	check({sts, v} == 16'd0, "late chain: residual transfer count zero");
+	csr_rd32(k_csr);
+	rd_ptr32(6'h10, k_nxt);
+	csr_cmd(8'h10);
+	esp_wr8(6'h03, 8'h01);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3, "late chain: status phase");
+	esp_wr8(6'h03, 8'h11);
+	wait_irq;
+	read_intr(intr);
+	esp_rd8(6'h02, sts);
+	esp_rd8(6'h02, v);
+	check(intr == 8'h08 && sts == 8'h00,
+	      "late chain: good status, command complete");
+	esp_wr8(6'h03, 8'h12);
+	wait_irq;
+	read_intr(intr);
+	esp_wr8(6'h03, 8'h44);
+	$display("  late chain: %0d dma interrupts, %0d restarts", k_dma_irqs, k_restarts);
+	ok = 1;
+	for (i = 0; i < 8192; i = i + 1)
+		if (disk[8*512 + i] !== ((pat(8 + i/512, i%512) ^ 8'h3C) & 8'hFF)) begin
+			if (ok) $display("  late chain byte %0d: got %02x want %02x", i,
+			                 disk[8*512 + i], (pat(8 + i/512, i%512) ^ 8'h3C) & 8'hFF);
+			ok = 0;
+		end
+	check(ok, "late chain: all 8192 bytes still landed byte exact");
+	k_after_run_out = 0;
+
+
+	`include "tb_next_scsi_ti.svh"
+	`include "tb_next_scsi_irq.svh"
+	`include "tb_next_scsi_dma_csr.svh"
+
+	check(zero_cause == 0,
+	      "the ESP never raised an interrupt whose cause reads back as zero");
 
 	if (errors == 0) $display("ALL PASS");
-	else             $display("%0d FAILURES", errors);
+	else             $fatal(1, "%0d FAILURES", errors);
 	$finish;
 end
 
