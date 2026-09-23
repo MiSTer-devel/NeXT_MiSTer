@@ -32,12 +32,41 @@ module dpram #(parameter AW = 8, parameter DW = 8) (
 
 	reg [DW-1:0] mem [0:(1<<AW)-1];
 	reg [DW-1:0] q_a_r, q_b_r;
+`ifdef NEXT_RAM_PESSIMISTIC
+	// M10K semantics as the silicon has them: same-port read-during-write
+	// returns NEW data, a mixed-port collision (the other port writes the
+	// address this port reads) returns garbage, and two writes to one
+	// address leave garbage.  Collisions are counted and the first few
+	// announced so a boot run shows whether the RTL ever relies on them.
+	integer coll_ab = 0, coll_ba = 0, coll_ww = 0;
+	reg [DW-1:0] junk;
+	always @(posedge clock) begin
+		junk = {6{$random}};
+		if (wren_a) mem[address_a] <= data_a;
+		if (wren_b) mem[address_b] <= data_b;
+		if (wren_a && wren_b && address_a == address_b) begin
+			mem[address_a] <= junk; coll_ww = coll_ww + 1;
+			if (coll_ww <= 8) $display("[%0t] dpram(%0d,%0d) WRITE/WRITE collision at %0h", $time, AW, DW, address_a);
+		end
+		q_a_r <= (wren_b && !wren_a && address_b == address_a) ? junk : (wren_a ? data_a : mem[address_a]);
+		q_b_r <= (wren_a && !wren_b && address_a == address_b) ? junk : (wren_b ? data_b : mem[address_b]);
+		if (wren_b && !wren_a && address_b == address_a) begin
+			coll_ba = coll_ba + 1;
+			if (coll_ba <= 8) $display("[%0t] dpram(%0d,%0d) port A reads row %0h while port B writes it", $time, AW, DW, address_a);
+		end
+		if (wren_a && !wren_b && address_a == address_b) begin
+			coll_ab = coll_ab + 1;
+			if (coll_ab <= 8) $display("[%0t] dpram(%0d,%0d) port B reads row %0h while port A writes it", $time, AW, DW, address_b);
+		end
+	end
+`else
 	always @(posedge clock) begin
 		if (wren_a) mem[address_a] <= data_a;
 		if (wren_b) mem[address_b] <= data_b;
 		q_a_r <= mem[address_a];
 		q_b_r <= mem[address_b];
 	end
+`endif
 	assign q_a = q_a_r;
 	assign q_b = q_b_r;
 

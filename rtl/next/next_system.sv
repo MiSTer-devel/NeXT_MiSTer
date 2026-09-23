@@ -242,7 +242,6 @@ always @(posedge clk)
 wire clkena = ((busstate == 2'b01) & pace) | mem_ready | berr_hold;
 
 wire [255:0] debug_status;
-wire [2047:0] debug_cache;  // HARDWARE TRACE window at 0x0201F000 (below): 4 x 16 longwords
 assign dbg_pc  = debug_status[31:0];
 assign dbg_ipl = ipl_level;
 
@@ -323,7 +322,6 @@ ap040_tg68k_compat #(
 	.debug_halted(dbg_halted),
 	.debug_status(debug_status),
 	.debug_status2(),
-	.debug_cache(debug_cache),
 	.debug_exception_valid(dbg_exception_valid),
 	.debug_exception(dbg_exception)
 );
@@ -673,11 +671,6 @@ wire io_scc   = sel_io && (io_off[16:3]  == 14'h3000);          // 0x18000-0x180
 wire io_esp   = sel_io && (io_off[16:6]  == 11'h500);           // 0x14000-0x1403f
 wire io_flp   = sel_io && (io_off[16:4]  == 13'h1410);          // 0x14100-0x1410f
 wire io_evt   = sel_io && (io_off[16:12] == 5'h1a);             // 0x1a000-0x1afff
-// HARDWARE TRACE (2026-09-23): 16 longwords of the cache's last line-crossing
-// read, readable from the ROM monitor (el 201f000 ...).  Unmapped before.
-wire io_dbg   = sel_io && (io_off[16:8] == 9'h1f0);             // 0x1f000-0x1f0ff: entry n at 0x1f000 + 0x40*n
-wire [31:0] dbg_long = debug_cache[cpu_addr[7:2]*32 +: 32];
-wire [15:0] dbg_rdata = cpu_addr[1] ? dbg_long[15:0] : dbg_long[31:16];
 wire io_scr   = io_scr1 | io_sid | io_scr2;
 
 wire [15:0] scr_rdata, intc_rdata, timer_rdata, dma_rdata, scc_rdata, esp_rdata, enet_rdata, mo_rdata, snd_rdata;
@@ -722,7 +715,7 @@ assign io_rdata = io_enet  ? enet_rdata :
                   io_esp   ? esp_rdata :
                   io_flp   ? flp_rdata :
                   io_evt   ? evt_rdata :
-                  io_dbg   ? dbg_rdata : 16'h0000;
+                  16'h0000;
 
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;

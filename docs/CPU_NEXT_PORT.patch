@@ -1,8 +1,22 @@
 diff --git a/rtl/ap040_cache.v b/rtl/ap040_cache.v
-index 0db5994..48245ea 100644
---- rtl/ap040_cache.v
-+++ rtl/ap040_cache.v
-@@ -448,6 +448,7 @@ always @(posedge clk) begin
+index 0db5994..b8d0562 100644
+--- a/rtl/ap040_cache.v
++++ b/rtl/ap040_cache.v
+@@ -190,6 +190,13 @@ always @(posedge clk) begin
+ 		data_q1 <= cdata1[cd_ridx1];
+ 		data_q2 <= cdata2[cd_ridx2];
+ 		data_q3 <= cdata3[cd_ridx3];
++`ifdef NEXT_RAM_PESSIMISTIC
++		// no_rw_check: a read of the index being written this clock is garbage
++		if (cd_we[0] && cd_widx == cd_ridx0) begin data_q0 <= $random; $display("[%0t] cdata0 read/write collision at %0h", $time, cd_widx); end
++		if (cd_we[1] && cd_widx == cd_ridx1) begin data_q1 <= $random; $display("[%0t] cdata1 read/write collision at %0h", $time, cd_widx); end
++		if (cd_we[2] && cd_widx == cd_ridx2) begin data_q2 <= $random; $display("[%0t] cdata2 read/write collision at %0h", $time, cd_widx); end
++		if (cd_we[3] && cd_widx == cd_ridx3) begin data_q3 <= $random; $display("[%0t] cdata3 read/write collision at %0h", $time, cd_widx); end
++`endif
+ 	end
+ end
+ 
+@@ -448,6 +455,7 @@ always @(posedge clk) begin
  	if (!nreset) begin
  		fill_snooped <= 0;
  		look_snooped <= 0;
@@ -10,7 +24,7 @@ index 0db5994..48245ea 100644
  	end
  	else begin
  		if (ce && cst == C_LOOK && !look_hit) fill_snooped <= 0;
-@@ -456,6 +457,15 @@ always @(posedge clk) begin
+@@ -456,6 +464,15 @@ always @(posedge clk) begin
  		if (ce && rd_accept) look_snooped <= 0;
  		if ((rd_accept || cst == C_LOOK) && snoop_look_row)
  			look_snooped <= 1;
@@ -26,7 +40,7 @@ index 0db5994..48245ea 100644
  	end
  end
  //---------------------------------------------------------------------------
-@@ -568,8 +578,16 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
+@@ -568,8 +585,26 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
  // alike) while the first lookup's hit is being decided
  wire xlook_read = (cst == C_LOOK) && r_xline && !xlook && look_hit &&
                    !look_snooped && !snoop_look_row && !inv_wren;
@@ -38,13 +52,23 @@ index 0db5994..48245ea 100644
 +// false hit on the wrong way, read as 0 by NeXTSTEP's bucket walk).
 +// idle_tag_idx records what was actually read, so the idle paths stay
 +// correct while the address is held.
++// The switch to the second row happens only on the clock the FSM takes the
++// xlook_read step (ce high).  xlook_read is combinational in look_hit, so on
++// a gated ce it is already true on the un-enabled clock after the accept;
++// unqualified, it moved the tag RAM to the next row one clock early and the
++// first lookup was then compared against the NEXT set's tags (a line in the
++// adjacent set with the same tag is a false hit with that row's way, and
++// word 3 comes from the wrong way of the request row: NeXTSTEP's bucket
++// walk read 0 at 040efe2e from a correct cache).  Whether that clock is
++// enabled depends on the pace phase left by the previous bus cycle, which
++// is why the boot bench passed and the hardware failed deterministically.
  assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active) ? r_row :
 -                   xlook_read ? {1'b0, r_setB} : x_row;
-+                   (xlook_read || xlook) ? {1'b0, r_setB} : x_row;
++                   ((ce && xlook_read) || xlook) ? {1'b0, r_setB} : x_row;
  wire [4*TAGW-1:0] tags_next = (r_way == 2'd0) ? {tag_q[4*TAGW-1:TAGW], r_tag} :
                          (r_way == 2'd1) ? {tag_q[4*TAGW-1:2*TAGW], r_tag, tag_q[TAGW-1:0]} :
                          (r_way == 2'd2) ? {tag_q[4*TAGW-1:3*TAGW], r_tag, tag_q[2*TAGW-1:0]} :
-@@ -834,7 +852,7 @@ always @(posedge clk) begin
+@@ -834,7 +869,7 @@ always @(posedge clk) begin
  		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
  		fill_hold <= 0; r_wdata <= 0; pass_store_chk <= 0;
  		fill_hold2 <= 0; r_span2 <= 0; look2 <= 0; r_hway <= 0;
@@ -53,7 +77,7 @@ index 0db5994..48245ea 100644
  		fill_cnt <= 0; fill_acked <= 0; r_fc <= 0; sline_ready <= 0;
  		post_active <= 0; p_addr <= 0; p_wdata <= 0; p_size <= 0; p_fc <= 0;
  		iline_pending <= 0; iline_valid <= 0; iline_way <= 0;
-@@ -1164,7 +1182,6 @@ always @(posedge clk) begin
+@@ -1164,7 +1199,6 @@ always @(posedge clk) begin
  					// up (xlook_read runs the reads); a miss bypasses
  					if (xlook_read) begin
  						fill_hold2 <= data_hit;
@@ -63,8 +87,8 @@ index 0db5994..48245ea 100644
  					else begin
 diff --git a/rtl/ap040_mmu.v b/rtl/ap040_mmu.v
 index dfa1e05..e17aae5 100644
---- rtl/ap040_mmu.v
-+++ rtl/ap040_mmu.v
+--- a/rtl/ap040_mmu.v
++++ b/rtl/ap040_mmu.v
 @@ -168,6 +168,20 @@ reg   [5:0] sweep_cnt;
  wire        fill_we;             // assigned below the walker state decls
  wire  [4:0] sweep_row = sweep_cnt[4:0];
@@ -130,8 +154,8 @@ index dfa1e05..e17aae5 100644
  			// PTEST proper, after its pre-flush sweep
 diff --git a/rtl/ap040_tg68k_compat.v b/rtl/ap040_tg68k_compat.v
 index 910208c..f3e708e 100644
---- rtl/ap040_tg68k_compat.v
-+++ rtl/ap040_tg68k_compat.v
+--- a/rtl/ap040_tg68k_compat.v
++++ b/rtl/ap040_tg68k_compat.v
 @@ -20,12 +20,22 @@ module ap040_tg68k_compat
  	parameter AP040_FAST_SIM     = 0,
  	// Post stores to on-board RAM (the MiSTer wrapper's behaviour).  A bench

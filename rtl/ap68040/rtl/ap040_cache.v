@@ -77,11 +77,6 @@ module ap040_cache
 	// requester was released; hosts that share one bus with the table
 	// walker hold the walker off while this is high.
 	output            c_busy,
-	// HARDWARE TRACE (NeXT_MiSTer, 2026-09-23): the last line-crossing
-	// read's internals, read back through a device window after a panic.
-	// 12 longwords: r_addr, fill_hold2, data_hit, result, flags, tags,
-	// data_q0..3, counters.  Remove when the crossing-read fault is found.
-	output reg [2047:0] dbg_x,     // 4-entry ring, newest at the highest index (dbg_x_ptr)
 	// The master-side write being presented was already acknowledged to
 	// the requester (posted): the store queue may acknowledge it in the
 	// same cycle it captures it, there is no requester path behind it.
@@ -195,6 +190,13 @@ always @(posedge clk) begin
 		data_q1 <= cdata1[cd_ridx1];
 		data_q2 <= cdata2[cd_ridx2];
 		data_q3 <= cdata3[cd_ridx3];
+`ifdef NEXT_RAM_PESSIMISTIC
+		// no_rw_check: a read of the index being written this clock is garbage
+		if (cd_we[0] && cd_widx == cd_ridx0) begin data_q0 <= $random; $display("[%0t] cdata0 read/write collision at %0h", $time, cd_widx); end
+		if (cd_we[1] && cd_widx == cd_ridx1) begin data_q1 <= $random; $display("[%0t] cdata1 read/write collision at %0h", $time, cd_widx); end
+		if (cd_we[2] && cd_widx == cd_ridx2) begin data_q2 <= $random; $display("[%0t] cdata2 read/write collision at %0h", $time, cd_widx); end
+		if (cd_we[3] && cd_widx == cd_ridx3) begin data_q3 <= $random; $display("[%0t] cdata3 read/write collision at %0h", $time, cd_widx); end
+`endif
 	end
 end
 
@@ -581,10 +583,6 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
 // must be the transaction's own row, not the live address's.
 // the line-crossing read's second lookup reads the next row (data and tag
 // alike) while the first lookup's hit is being decided
-reg [15:0] dbg_x_cnt = 0, dbg_x_byp = 0;
-reg  [1:0] dbg_x_ptr = 0;
-// only crossing reads of NeXTSTEP's vm_page_buckets table ($040e0c16..$040f0c16)
-wire dbg_x_sel = (r_addr[31:17] == 15'h0207);
 wire xlook_read = (cst == C_LOOK) && r_xline && !xlook && look_hit &&
                   !look_snooped && !snoop_look_row && !inv_wren;
 // The second lookup's row is held through xlook as well: the tag RAM reads
@@ -595,8 +593,18 @@ wire xlook_read = (cst == C_LOOK) && r_xline && !xlook && look_hit &&
 // false hit on the wrong way, read as 0 by NeXTSTEP's bucket walk).
 // idle_tag_idx records what was actually read, so the idle paths stay
 // correct while the address is held.
+// The switch to the second row happens only on the clock the FSM takes the
+// xlook_read step (ce high).  xlook_read is combinational in look_hit, so on
+// a gated ce it is already true on the un-enabled clock after the accept;
+// unqualified, it moved the tag RAM to the next row one clock early and the
+// first lookup was then compared against the NEXT set's tags (a line in the
+// adjacent set with the same tag is a false hit with that row's way, and
+// word 3 comes from the wrong way of the request row: NeXTSTEP's bucket
+// walk read 0 at 040efe2e from a correct cache).  Whether that clock is
+// enabled depends on the pace phase left by the previous bus cycle, which
+// is why the boot bench passed and the hardware failed deterministically.
 assign tag_ridx  = (fill_active || (cst == C_TAGW) || post_active) ? r_row :
-                   (xlook_read || xlook) ? {1'b0, r_setB} : x_row;
+                   ((ce && xlook_read) || xlook) ? {1'b0, r_setB} : x_row;
 wire [4*TAGW-1:0] tags_next = (r_way == 2'd0) ? {tag_q[4*TAGW-1:TAGW], r_tag} :
                         (r_way == 2'd1) ? {tag_q[4*TAGW-1:2*TAGW], r_tag, tag_q[TAGW-1:0]} :
                         (r_way == 2'd2) ? {tag_q[4*TAGW-1:3*TAGW], r_tag, tag_q[2*TAGW-1:0]} :
@@ -1157,27 +1165,6 @@ always @(posedge clk) begin
 					end
 				end
 				else if (xlook) begin
-					if (dbg_x_sel) begin
-					dbg_x_cnt <= dbg_x_cnt + 1'd1;
-					dbg_x_ptr <= dbg_x_ptr + 1'd1;
-					dbg_x[dbg_x_ptr*512 +  31 -: 32] <= r_addr;                                            // L0
-					dbg_x[dbg_x_ptr*512 + 63 -: 32] <= fill_hold2;                                        // L1 word 3 of the first line
-					dbg_x[dbg_x_ptr*512 + 95 -: 32] <= data_hit;                                          // L2 word 0 of the next line, hit way
-					dbg_x[dbg_x_ptr*512 + 127 -: 32] <= span_extract({fill_hold2, data_hit}, r_size, r_off); // L3 the value handed back on a hit
-					dbg_x[dbg_x_ptr*512 + 159 -: 32] <= {v_w3, v_w2, v_w1, v_w0, h3, h2, h1, h0,          // L4 flags
-					                   hit_way, look_hit, xsnooped, snoop_xrow, look_snooped, snoop_look_row, 1'b0,
-					                   r_off, r_size, q_word, 2'd0, 8'd0};
-					dbg_x[dbg_x_ptr*512 + 191 -: 32] <= {{(32-TAGW){1'b0}}, r_tagB};                       // L5 the tag expected
-					dbg_x[dbg_x_ptr*512 + 223 -: 32] <= {{(32-ROWIW){1'b0}}, tag_ridx};                    // L6 the row the tag RAM is addressing
-					dbg_x[dbg_x_ptr*512 + 255 -: 32] <= {{(32-SETW){1'b0}}, r_setB};                       // L7
-					dbg_x[dbg_x_ptr*512 + 287 -: 32] <= data_q0;                                           // L8..L11 all four arrays
-					dbg_x[dbg_x_ptr*512 + 319 -: 32] <= data_q1;
-					dbg_x[dbg_x_ptr*512 + 351 -: 32] <= data_q2;
-					dbg_x[dbg_x_ptr*512 + 383 -: 32] <= data_q3;
-					dbg_x[dbg_x_ptr*512 + 415 -: 32] <= {dbg_x_byp, dbg_x_cnt + 16'd1};                   // L12 {bypassed, consumed} counts
-					dbg_x[dbg_x_ptr*512 + 447 -: 32] <= {{(32-TAGW){1'b0}}, (hit_way == 2'd0) ? t_w0 : (hit_way == 2'd1) ? t_w1 : (hit_way == 2'd2) ? t_w2 : t_w3}; // L13 tag of the way taken
-					dbg_x[dbg_x_ptr*512 + 511 -: 64] <= 64'd0;
-					end
 					// the next line's tags and word 0 are in: assemble the
 					// crossing pair on a hit; on a clean miss fill the next
 					// line (word 0 first, the pair acknowledged on that
@@ -1215,7 +1202,6 @@ always @(posedge clk) begin
 						xlook <= 1;
 					end
 					else begin
-						dbg_x_byp <= dbg_x_byp + 1'd1;
 						pass_ci_chk <= 0;
 						cst <= C_PASS;
 					end

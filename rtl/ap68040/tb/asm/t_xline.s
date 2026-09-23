@@ -101,6 +101,39 @@ start:
 	move.l	($360E).l,d0
 	chkl	d0,$FF000E0F,11
 
+	; 12: the two lines in DIFFERENT ways.  A filler line with another tag
+	; ($4610: same set as $3610, tag 4) takes way 0 of the second set first,
+	; so $3610 lands in way 1 while $3600 sits in way 0.  Under a gated ce
+	; the first lookup's tag row used to switch to the second set one clock
+	; early (xlook_read is combinational in look_hit): the compare then hit
+	; way 1 of the SECOND set and word 3 was taken from way 1 of the first
+	; set, i.e. the wrong line (NeXTSTEP's bucket walk, 2026-09-23).  Which
+	; pace phase exposes it depends on the bus history, so the bench runs
+	; +pace with and without +paceshift.
+	move.l	#$40414243,($461C).l
+	move.l	#$0E0F1011,($3610).l
+	cinva	dc
+	move.l	($4610).l,d0
+	move.l	($3610).l,d0
+	move.l	($3600).l,d0
+	move.l	($360E).l,d0
+	chkl	d0,$FF000E0F,12
+	nop
+	move.l	($360E).l,d0
+	chkl	d0,$FF000E0F,13
+
+	; 14: the mirror image: the first line in way 1, the second in way 0
+	move.l	#$50515253,($460C).l
+	cinva	dc
+	move.l	($4600).l,d0
+	move.l	($3600).l,d0
+	move.l	($3610).l,d0
+	move.l	($360E).l,d0
+	chkl	d0,$FF000E0F,14
+	nop
+	move.l	($360E).l,d0
+	chkl	d0,$FF000E0F,15
+
 	move.w	#$600D,(DONEREG).l
 	stop	#$2700
 

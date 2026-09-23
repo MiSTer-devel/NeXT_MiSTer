@@ -100,9 +100,7 @@ module ap040_tg68k_compat
 	output [255:0] debug_status,
 	output [127:0] debug_status2,
 	output         debug_exception_valid,
-	output [511:0] debug_exception,
-	// HARDWARE TRACE (NeXT_MiSTer): the cache's last line-crossing read
-	output [2047:0] debug_cache
+	output [511:0] debug_exception
 );
 
 // NeXT port compatibility (docs/CPU_NEXT_PORT.md): no exception diagnostics here.
@@ -444,7 +442,6 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_line_tag(mm_line_tag),
 		.c_line_data(mm_line_data),
 		.c_busy(mm_busy),
-		.dbg_x(debug_cache),
 		.m_posted(),
 
 		.m_req(b_req),
@@ -464,7 +461,6 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 end
 else begin : g_nocache
 	assign cache_posting = 1'b0;
-	assign debug_cache = 2048'd0;
 	// no internal caches: the MMU talks straight to the bus adapter and
 	// CINV/CPUSH complete immediately (a 68040 whose caches never fill).
 	// The Minimig build uses this and relies on cpu_cache_new in the RAM

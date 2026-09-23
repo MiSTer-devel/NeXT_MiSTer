@@ -67,7 +67,12 @@ wire        berr = berr_d | fberr;
 // +pace: gate the internal clock enable on every other clock, as
 // NeXT_MiSTer's CPU_PACE 1/2 does (the cache's RAMs run on clk, so a
 // two-step lookup must survive an un-enabled clock in between)
+// +paceshift starts the gate on the other phase: which clocks are enabled
+// relative to a request's acceptance depends on where the previous bus
+// cycle left the phase, so a ce hazard can hide on one phase and show on
+// the other (the crossing-read tag-row switch did exactly that).
 reg         pace_tog = 0;
+initial pace_tog = $test$plusargs("paceshift");
 always @(posedge clk) pace_tog <= ~pace_tog;
 wire        pace_en = !$test$plusargs("pace") || pace_tog;
 wire        clkena_in = ((busstate == 2'b01) & pace_en) | mem_ready | berr;

@@ -29,17 +29,19 @@ the checklist at the end.
 | 2 | wrapper: `parameter AP040_DEBUG_EXCEPTIONS = 0`, outputs `debug_exception_valid` / `debug_exception[511:0]` tied to 0 | `next_system.sv` sets and connects these. This tree has no exception-diagnostic block (upstream `7431dcb` `ap040_core.v`, generate `g_debug_exceptions` / `g_debug_unhandled`). A non-zero value instantiates a deliberately undefined module so a `NEXT_EXCEPTION_DIAG=1` build fails at elaboration instead of silently reporting nothing. |
 | 3 | wrapper: `input tick_in`, unused | Upstream gates the IPL synchroniser on `tick`; NeXT ties it to 1 so interrupts are sampled through bus waits. This core samples `ipl` on every clock regardless of `ce`, which is the same behaviour. **Re-check this on a new drop** (the `ipl_s1 <= ipl` block near the top of `ap040_core.v` must not be under `ce`). |
 | 4 | wrapper: `AP040_POST_LO/HI` parameters | The posted-store window was the CPU bench's map (`addr[31:30]==0`); NeXT posts only main RAM `0x04000000-0x07FFFFFF` so a device write can still bus-error. |
-| 5 | `ap040_cache.v`: `tag_ridx` holds the crossing read's second row through `xlook`, not only `xlook_read` | **Bug under a gated `ce`** (see "Four bugs" below). |
-| 6 | `ap040_mmu.v`: the PFLUSH/PTEST sweep tracks which row `row_q` holds | **Bug under a gated `ce`** (see "Four bugs" below). |
-| 7 | `ap040_cache.v`: `xsnooped` (the crossing read's snoop guard) set free-running like `look_snooped`/`fill_snooped` | **Bug under a gated `ce`, hardware only** (see "Four bugs" below). |
+| 5 | `ap040_cache.v`: `tag_ridx` holds the crossing read's second row through `xlook`, not only `xlook_read` | **Bug under a gated `ce`** (see "Five bugs" below). |
+| 6 | `ap040_mmu.v`: the PFLUSH/PTEST sweep tracks which row `row_q` holds | **Bug under a gated `ce`** (see "Five bugs" below). |
+| 7 | `ap040_cache.v`: `xsnooped` (the crossing read's snoop guard) set free-running like `look_snooped`/`fill_snooped` | **Bug under a gated `ce`, hardware only** (see "Five bugs" below). |
+| 8 | `ap040_cache.v`: `tag_ridx` switches to the crossing read's second row only on the clock the FSM takes the `xlook_read` step (`ce && xlook_read`) | **Bug under a gated `ce`, hardware only** (bug 5 in "Five bugs" below): the un-qualified combinational `xlook_read` moved the tag row one clock early. |
 
 ## NeXT-side changes
 
 | file | change | why |
 |---|---|---|
 | `rtl/next/next_system.sv` | `POST_STORES` parameter (default 0), `.AP040_POST_LO/HI` = main RAM | With 0 no store is posted (the old CPU's behaviour); 1 posts stores to main RAM only. Both boot NeXTSTEP identically in simulation once the bugs below are fixed; the default stays 0 until the posted path has been run on hardware. |
-| `rtl/next/next_system.sv` | `walker_ack`/`walker_berr` held as a LEVEL until `walker_req` drops | **Bug under a gated `ce`** (see "Four bugs" below). The MMU only samples the ack under `ce`. |
+| `rtl/next/next_system.sv` | `walker_ack`/`walker_berr` held as a LEVEL until `walker_req` drops | **Bug under a gated `ce`** (see "Five bugs" below). The MMU only samples the ack under `ce`. |
 | `rtl/next/dpram.v` | `dpram` = MacQuadra800's `altsyncram` wrapper | Read-during-write semantics the CPU RAMs need on M10K (see "dpram" below). |
+| `rtl/next/dpram.v`, `ap040_cache.v` | `NEXT_RAM_PESSIMISTIC` (Verilator only) | The simulation models of the tag/ATC RAMs and the cache data arrays behave like the silicon: garbage on a mixed-port collision, NEW data on a same-port write-then-read, every collision counted and the first few printed (`-DNEXT_RAM_PESSIMISTIC` on the verilator line). Used to rule RAM semantics out for bug 5: NeXTSTEP boots under it. |
 | `files.qip` | `rtl/AP68040/` -> `rtl/ap68040/` | Directory case; only matters on a case-sensitive filesystem. |
 | `files.qip` | `NEXT_FIT_QUADRA=1` fitter recipe block | See "Fitting" below. Opt-in until made the project default. |
 | `NeXT.sv`, `tb/tb_next_boot.sv` | `CLK_HZ` 50 MHz -> **25 MHz**, `CPU_PACE` 2/2 -> **1/2** | CPU speed calibration, see below. |
@@ -47,7 +49,7 @@ the checklist at the end.
 | `NeXT.sv`, `next_system.sv`, `NeXT.qsf` | `reset` / `dev_reset` registered and routed on global networks; `next_rom` 96 KB; `next_scsi` `SCSI_UNITS=4` | Fit: -32 M10Ks, the two ~5,000-fanout nets off local routing ("Fitting" below). |
 | `tb/run_tests.sh` | `CPU=../rtl/ap68040/rtl` | Directory case. |
 | `tb/tb_next_boot.sv` | `+loopdump`, `+exctrace` probes; `POST_STORES` from `-DNEXT_POST_STORES` | Diagnostics used below. |
-| `rtl/ap68040/tb/tb_ap040_program.v` | `+pace` (gate `clkena` every other clock), walker ack level-held, `+mmutrace`, `+pftrace` | The paced CPU suite; `asm/t_xline.s`, `asm/t_xline_mmu.s` added. |
+| `rtl/ap68040/tb/tb_ap040_program.v` | `+pace` (gate `clkena` every other clock), `+paceshift` (the other phase), walker ack level-held, `+mmutrace`, `+pftrace` | The paced CPU suite; `asm/t_xline.s` (cases 12-15: the two lines in different ways, the bug-5 reproduction), `asm/t_xline_mmu.s` added. Run every test `+pace` and `+pace +paceshift`. |
 
 ## CPU speed calibration (the "System test failed" after RTC)
 
@@ -87,11 +89,11 @@ read was bug 4 above, which this change alone did not cure.) Keep the
 wrapper in step with the Quadra's `rtl/dpram.v`. The
 VRAM's `dpram_dc` is this core's own and is unchanged.
 
-## Four bugs under a gated clock enable (NeXTSTEP 3.3 double fault, 2026-09-23)
+## Five bugs under a gated clock enable (NeXTSTEP 3.3 double fault and panic, 2026-09-23)
 
 Both the Quadra core and the old NeXT integration run the CPU unpaced
 (`ce` = 1 except bus waits). NeXT now paces it 1 of 2 (calibration above),
-and four sequences that read a RAM (or sample a pulse) on one enabled
+and five sequences that read a RAM (or sample a pulse) on one enabled
 clock and consume the result on the next break when an un-enabled clock
 sits in between:
 
@@ -138,11 +140,35 @@ sits in between:
    models the collision as old data, so every simulation passed. Fix: set
    `xsnooped` free-running while `xlook` is pending, like the other two.
 
-The `ap040_cache.v` (bugs 1 and 4) and `ap040_mmu.v` (bug 3) fixes are in `CPU_NEXT_PORT.patch`
+5. **Cache, crossing read: the tag row switches one clock early (hardware
+   only)**. `tag_ridx` selected the second line's row on `xlook_read`, which
+   is combinational in `look_hit`. Paced, the clock after the accept is
+   un-enabled: the tag RAM had row A out, `look_hit` was already true, so
+   `xlook_read` steered the address to row B *before* the FSM took its
+   first-lookup step; on the next enabled clock the compare ran against
+   row B's tags. Adjacent lines share the 20-bit tag, so with line B
+   resident the first lookup was a false hit with **row B's way number**,
+   and word 3 was taken from that way of row A (the data arrays are
+   `ce`-gated, so they still held row A): the wrong line, or an empty way.
+   NeXTSTEP's `vm_page_lookup` read `00006a8a` for bucket `040efe2e`
+   (correct `04106a8a`), walked into the ROM at `$6a8a` and found the
+   `c0835380` "next" pointer that faulted at `c0835398`. Whether the
+   un-enabled clock lands after the accept depends on the pace phase the
+   previous bus cycle left behind, so the boot bench (different DDR
+   latency) never saw it while the hardware failed byte-identically on
+   every build; 52,261 of 52,282 crossing reads went to the bypass on
+   hardware for the same reason. Fix: `(ce && xlook_read) || xlook`.
+   Directed test `t_xline` cases 12-15 (the two lines in different ways)
+   fail on the old cache under `+pace` on both phases and pass with the fix.
+
+The `ap040_cache.v` (bugs 1, 4 and 5) and `ap040_mmu.v` (bug 3) fixes are in `CPU_NEXT_PORT.patch`
 and are candidates for upstream (they are correct under any `ce` pattern).
 The pattern to look for on a new drop: a RAM read on one clock whose result
 is consumed at a *state-machine step* -- either gate the RAM read on `ce`
 (as the cache's data arrays are) or track which address the output holds.
+The second pattern (bug 5): a RAM *address* driven by a combinational
+function of that RAM's own output (`look_hit` -> `xlook_read` -> `tag_ridx`)
+advances on un-enabled clocks; qualify the step with `ce`.
 
 ### How it was found (kept for the next one)
 
@@ -158,6 +184,24 @@ and with the MMU on, and only failed once `+pace` gated `clkena` the way
 `next_system` does -- which then also exposed bugs 2 and 3 (7 of 16 suite
 tests fail paced on the pristine tree; all 16 pass with the fixes).
 
+Bug 5 survived all of that (the CPU suite and the boot bench pass paced) and
+was found on the hardware: a read-only device window (`0x0201F000`, 16
+longwords per entry, ringed in M10K in `next_system.sv`) exposed a capture
+register in `ap040_cache.v`, read from the ROM monitor after the panic
+(`monitor`, `el 201f000`, Enter per longword). Three captures in sequence:
+(1) the crossing read's own internals (`r_addr`, word 3 of line A, word 0 of
+line B, the assembled result, tag/valid/hit flags, all four data arrays):
+showed a *valid* line with a fresh word 0 and a zero word 3 while RAM was
+correct; (2) every event on that data row (array writes with their data,
+tag writes, port-B invalidates, the crossing read) frozen at the fatal read:
+showed the refill writing the correct word 3 into array 3 way 0 two events
+before the fatal read, and an earlier first lookup of the same read comparing
+against the *next* row's tags (tag `040c3`, a row-e3 resident, with the
+request row `e2`). Lessons for the next one: freeze the log at the event of
+interest (the ROM monitor's own VRAM stores invalidate the watched row
+thousands of times while you read the window), and keep the capture small
+(a 2,048-bit flop ring plus a 64:1 readout mux did not route at 94 %).
+
 ## Checklist for a new CPU drop
 
 0. Re-measure the DBF loop speed and update `CLK_HZ`/`CPU_PACE_*` (above).
@@ -167,8 +211,8 @@ tests fail paced on the pristine tree; all 16 pass with the fixes).
    new inputs need a tie-off.
 3. IPL sampling is still not under `ce` (change 3).
 4. The post-store window (`AP040_POST_LO/HI`) still exists in the wrapper.
-5. **Run the CPU suite paced**: `vvp build/tb_prog.vvp +prog=... +pace` for
-   every test as well as unpaced. Anything that only fails paced is a `ce`
+5. **Run the CPU suite paced, on both phases**: `vvp build/tb_prog.vvp
+   +prog=... +pace` and `+pace +paceshift` for every test as well as unpaced. Anything that only fails paced is a `ce`
    hazard of the kind above. `t_xline`, `t_xline_mmu`, `t_atcprobe` are the
    directed tests.
 6. NeXT-relevant CPU fixes are present, by their directed tests in
@@ -215,7 +259,10 @@ tables stubbed).
 
 ## Open items
 
-- Hardware boot of NeXTSTEP with the `dpram` wrapper: in progress.
+- Hardware boot of NeXTSTEP 3.3 with bug 5 fixed (2026-09-23, build
+  `NeXT_q800cpu_20260923i_fix`, 39,265 ALMs): POST, `bsd`, the kernel's
+  device probe, disk check, multi-user startup and the login window,
+  about 2.5 minutes from `bsd` (Control-C at the network prompt).
 - `POST_STORES(1)` on hardware (performance) once the boot is solid.
 - The exception diagnostics (`NEXT_EXCEPTION_DIAG=1`, `tb_next_exception_cpu`,
   `tb_next_unhandled_cpu`) do not build against this tree until the
