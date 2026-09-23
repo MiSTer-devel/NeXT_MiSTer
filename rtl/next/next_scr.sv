@@ -59,6 +59,14 @@ module next_scr #(
 	input         floppy_mounted,
 	input   [2:0] sd_lower_mounted,   // SCSI disks at targets 0-2, below the CD-ROM
 
+	// the host's clock from hps_io (MSM6242 layout: BCD seconds, minutes,
+	// hours, day, month, two-digit year, then the weekday 0 = Sunday;
+	// bit 64 toggles on every update).  The time of day is seeded from it
+	// once, on the first update after configuration, so the guest sees
+	// the real date without any NVRAM persistence; after that the clock
+	// free-runs and the guest may set it.  Tie to 0 for no seed.
+	input  [64:0] rtc_host,
+
 	output        timer_ipl7,    // SCR2 byte 2 bit 7
 	output        led,           // SCR2 byte 3 bit 0
 	output        rom_overlay,   // SCR2 byte 3 bit 7 (not used by decode)
@@ -88,7 +96,8 @@ reg  [7:0] rtc_val;
 reg  [7:0] clkctrl;              // reg 0x31
 reg  [7:0] intctrl;              // reg 0x32
 
-// time of day, BCD (date part is static, see docs/PORTING.md)
+// time of day, BCD (seeded from rtc_host; the date does not roll over at
+// midnight, the guest keeps its own calendar once booted)
 reg  [7:0] t_sec = 8'h00, t_min = 8'h00, t_hour = 8'h00;
 reg  [7:0] t_wday = 8'h01, t_mday = 8'h01, t_month = 8'h01, t_year = 8'h00;
 
@@ -242,12 +251,19 @@ initial begin
 	nvram[0]  = 8'h94;
 	nvram[1]  = 8'h0F;
 	nvram[2]  = 8'h40;
-	nvram[14] = 8'h4B;
+	// POST options: the ROM's own factory default (written at $01000ac8 when
+	// it finds an invalid NVRAM): self test on and the DRAM test, without
+	// the verbose listing, the extended (SCSI) test and the sound test that
+	// Previous's 0x4B enables.  The ROM `p` command can change it for a
+	// session.
+	nvram[14] = 8'h11;
 	nvram[30] = 8'hE0;
 	nvram[31] = 8'hEF;
 end
 
 reg boot_init = 1'b1;
+reg rtc_seeded = 1'b0;
+reg rtc_host_flag = 1'b0;
 
 always @(posedge clk) begin
 	//------------------------------------------------------------
@@ -284,6 +300,19 @@ always @(posedge clk) begin
 			else t_min <= bcd_inc(t_min);
 		end
 		else t_sec <= bcd_inc(t_sec);
+	end
+
+	// seed the clock from the host once (the first hps_io update)
+	rtc_host_flag <= rtc_host[64];
+	if (!rtc_seeded && (rtc_host_flag != rtc_host[64])) begin
+		rtc_seeded <= 1'b1;
+		t_sec   <= rtc_host[7:0];
+		t_min   <= rtc_host[15:8];
+		t_hour  <= rtc_host[23:16];
+		t_mday  <= rtc_host[31:24];
+		t_month <= rtc_host[39:32];
+		t_year  <= rtc_host[47:40];
+		t_wday  <= {4'd0, rtc_host[51:48]} + 8'd1;   // NeXT counts Sunday as 1
 	end
 
 	if (reset) begin

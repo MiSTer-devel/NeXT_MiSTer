@@ -22,7 +22,7 @@ Rev 2.5 v66 (`reference/previous/src/Rev_2.5_v66.BIN`).
 | `src/sysReg.c` interrupts  | `rtl/next/next_intc.sv`    | done, including the TIMERIPL7 promotion |
 | `src/sysReg.c` hardclock   | `rtl/next/next_timer.sv`   | done |
 | `src/sysReg.c` event ctr   | in `next_system.sv`        | done (microsecond counter with byte-0 read latch) |
-| `src/rtcnvram.c`           | in `next_scr.sv`           | done: MC68HC68T1 serial protocol, 32-byte NVRAM with the default image (valid checksum), BCD time-of-day counter. Date registers are static defaults; no alarm, no power-down |
+| `src/rtcnvram.c`           | in `next_scr.sv`           | done: MC68HC68T1 serial protocol, 32-byte NVRAM with the default image (valid checksum), BCD time-of-day counter seeded once from the HPS clock (hps_io `RTC`) so the guest boots with the real date; the date does not roll over at midnight; no alarm, no power-down. NVRAM starts from Previous's default image with the ROM's own factory POST byte (0x11: quiet self test) and the boot command from the OSD |
 | `src/bmap.c`               | `rtl/next/next_bmap.sv`    | done (register file plus heartbeat bit) |
 | `src/video.c` + real HW    | `rtl/next/next_video.sv`   | done: 1120x832 2bpp scan-out at 68.5 Hz from VRAM, VBL |
 | VRAM                       | `rtl/next/next_vram.sv`    | done, 256 KB BRAM, CPU port + scan port |

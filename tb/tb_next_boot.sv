@@ -73,6 +73,7 @@ next_system #(
 		.ps2_key(ps2),
 		.ps2_mouse(25'd0),
 	.boot_sel(bootfd ? 3'd2 : bootcd ? 3'd6 : bootsd ? 3'd1 : 3'd0),
+	.rtc_host(rtc_host),
 	.enet_connected(net_enable),
 	.fimg_mounted(fimg_mounted), .fsd_unit(), .fimg_readonly(1'b0),
 	.fimg_size(fimg_bytes),
@@ -233,6 +234,15 @@ wire  [7:0] brx_data;
 wire [47:0] enet_mac;
 
 reg         net_enable = 1;
+// +rtc: seed the NeXT clock as the HPS would (Wed 2026-09-23 16:58:30),
+// one update pulse shortly after reset; without it the RTC starts at zero
+// as it did before the seed existed.
+reg  [64:0] rtc_host = 65'd0;
+reg         rtc_pulsed = 0;
+always @(posedge clk) if (!reset && !rtc_pulsed && $test$plusargs("rtc")) begin
+	rtc_pulsed <= 1;
+	rtc_host <= {1'b1, 8'h40, 4'd0, 4'd3, 8'h26, 8'h09, 8'h23, 8'h16, 8'h58, 8'h30};
+end
 
 next_enet_bridge #(.CLK_HZ(50000000)) bridge
 (

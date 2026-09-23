@@ -56,6 +56,7 @@ module next_system #(
 
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [2:0] boot_sel,
+	input  [64:0] rtc_host,      // host clock from hps_io (see next_scr)
 
 	// external ethernet cable/backend state.  Internal loopback remains
 	// available inside next_enet_dma when this is false.
@@ -762,6 +763,7 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.rdata(scr_rdata),
 	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
 	.boot_sel(boot_sel),
+	.rtc_host(rtc_host),
 	.floppy_mounted(floppy_mounted),
 	.sd_lower_mounted(sd_lower_mounted),
 	.timer_ipl7(timer_ipl7),
