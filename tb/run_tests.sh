@@ -23,7 +23,7 @@ set -eu
 cd "$(dirname "$0")"
 
 RTL=../rtl/next
-CPU=../rtl/AP68040/rtl
+CPU=../rtl/ap68040/rtl
 ROM=../reference/previous/src/Rev_2.5_v66.BIN
 WORK=build
 mkdir -p "$WORK"

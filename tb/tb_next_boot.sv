@@ -50,16 +50,21 @@ localparam DEBUG_EXCEPTIONS = 0;
 wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
-// exactly the FPGA parameterization: virtual microsecond of 50 clocks,
-// no pacing (the physical simulation clock rate is immaterial, the
-// clock ratios are what the ROM's calibration checks measure)
+// exactly the FPGA parameterization: virtual microsecond of 25 clocks,
+// CPU paced 1 of 2 (the physical simulation clock rate is immaterial,
+// the clock ratios are what the ROM's calibration checks measure)
 next_system #(
-	.CLK_HZ(50000000),
-	.CPU_PACE_NUM(2),
+	.CLK_HZ(25000000),
+	.CPU_PACE_NUM(1),
 	.CPU_PACE_DEN(2),
 	.ROM_INIT_EN(1),
 	.ROM_INIT("build/rom.hex"),
-	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
+`ifdef NEXT_POST_STORES
+	.POST_STORES(`NEXT_POST_STORES)
+`else
+	.POST_STORES(0)
+`endif
 ) dut
 (
 	.clk(clk),
@@ -521,8 +526,28 @@ always @(posedge clk) begin
 		pc_ring[pc_ring_n % 64] <= dbg_pc;
 		pc_ring_n = pc_ring_n + 1;
 		post_trace(dbg_pc);
+		// TEMP loop timing probe: PCs seen inside the ROM's delay() body
+	end
+	// +loopdump: time every looped call of the ROM's delay(n) (entry
+	// $010024CC, rts $010024FC; n is the longword read off the stack on
+	// entry), to recalibrate CLK_HZ/CPU_PACE for a CPU whose cached DBF
+	// speed changed.  The delay() entry watchpoint above does not fire
+	// on every core (the front end need not present that PC), this does.
+	if ($test$plusargs("loopdump")) begin
+		if (dbg_pc == 32'h010024cc && loop_t0 == 0) begin loop_t0 = $time; loop_n = 0; loop_nw = 0; end
+		if (loop_t0 != 0 && mem_ready && !is_write && loop_nw < 2) begin
+			loop_n = {loop_n[15:0], cpu_din}; loop_nw = loop_nw + 1;
+		end
+		if (dbg_pc == 32'h010024fc && loop_t0 != 0) begin
+			if (($time - loop_t0) / 10 > 40)   // n <= 3 returns before the loop
+				$display("[%0t] LOOP n=%0d clocks=%0d", $time, loop_n, ($time - loop_t0) / 10);
+			loop_t0 = 0;
+		end
 	end
 end
+time loop_t0 = 0;
+reg [31:0] loop_n;
+integer loop_nw;
 
 task dump_state;
 	integer i, k;
@@ -687,6 +712,58 @@ always @(posedge clk) if (!reset && panic_trace && saw_kernel && !wildpc_seen &&
 	ptr_data[ptr_n % 64] <= dut.cpu.mem_write ? dut.cpu.mem_wdata : dut.cpu.mem_rdata;
 	ptr_kind[ptr_n % 64] <= {dut.cpu.mem_write, dut.cpu.mem_instr, dut.cpu.mem_size};
 	ptr_n <= ptr_n + 1;
+end
+
+// +exctrace: log exception entries once the kernel runs (vector, the
+// instruction PC, the exception's own PC/address arguments, SR) and, on a
+// processor halt (double fault), the core's state, the words around the
+// halting PC in physical RAM and the +panictrace completions.
+reg exctrace = 0;
+initial exctrace = $test$plusargs("exctrace");
+reg exc_prev = 0, halted_prev = 0;
+integer exc_n = 0, ex_i;
+always @(posedge clk) if (!reset) begin
+	exc_prev <= dut.cpu.core.in_exc;
+	if (exctrace && saw_kernel && dut.cpu.core.in_exc && !exc_prev && exc_n < 400) begin
+		$display("[%0t] EXC: vec=%0d pc_i=%08x spc=%08x addr=%08x sr=%04x aer_fa=%08x sp=%08x",
+		         $time, dut.cpu.core.exc_vec, dut.cpu.core.pc_i, dut.cpu.core.exc_spc,
+		         dut.cpu.core.exc_addr, dut.cpu.core.sr, dut.cpu.core.aer_fa, dut.cpu.core.dbg_a7);
+		exc_n = exc_n + 1;
+	end
+	halted_prev <= dbg_halted;
+	if (exctrace && dbg_halted && !halted_prev) begin
+		$display("[%0t] HALT: double fault. pc_i=%08x pc=%08x ir=%04x state=%0d in_exc=%b exc_vec=%0d exc_spc=%08x exc_addr=%08x aer_fa=%08x sr=%04x sp=%08x vbr=%08x",
+		         $time, dut.cpu.core.pc_i, dut.cpu.core.pc, dut.cpu.core.ir, dut.cpu.core.state,
+		         dut.cpu.core.in_exc, dut.cpu.core.exc_vec, dut.cpu.core.exc_spc, dut.cpu.core.exc_addr,
+		         dut.cpu.core.aer_fa, dut.cpu.core.sr, dut.cpu.core.dbg_a7, dut.cpu.core.vbr);
+		$display("  mmu: tc=%08x srp=%08x urp=%08x  cpu: mem_addr=%08x phys=%08x mem_req=%b mem_write=%b fc=%0d",
+		         dut.cpu.mmu.tc, dut.cpu.mmu.srp, dut.cpu.mmu.urp,
+		         dut.cpu.mem_addr, dut.cpu.mmu_addr_phys, dut.cpu.mem_req, dut.cpu.mem_write, dut.cpu.mem_fc);
+		$display("  RAM around pc_i (physical = pc - 0x04000000 assumed):");
+		for (ex_i = -8; ex_i < 8; ex_i = ex_i + 1)
+			$display("    %08x: %08x", dut.cpu.core.pc_i + ex_i*4,
+			         ram_mem[((dut.cpu.core.pc_i - 32'h04000000) >> 2) + ex_i]);
+		$display("  RAM around sp:");
+		for (ex_i = -4; ex_i < 12; ex_i = ex_i + 1)
+			$display("    %08x: %08x", dut.cpu.core.dbg_a7 + ex_i*4,
+			         ram_mem[((dut.cpu.core.dbg_a7 - 32'h04000000) >> 2) + ex_i]);
+		// NS3.3 vm_page_lookup: the bucket table pointer and hash mask live at
+		// $040c4338/$040c433c; an empty bucket is a self-pointer, never 0
+		begin : buckets
+			reg [31:0] tab, mask; integer zeros, k;
+			tab = ram_mem[(32'h040c4338 - 32'h04000000) >> 2];
+			mask = ram_mem[(32'h040c433c - 32'h04000000) >> 2];
+			zeros = 0;
+			for (k = 0; k <= mask && k < 65536; k = k + 1)
+				if (ram_mem[((tab - 32'h04000000) >> 2) + 2*k] == 0) zeros = zeros + 1;
+			$display("  vm_page_buckets=%08x mask=%08x: %0d of %0d buckets read 0 in RAM", tab, mask, zeros, mask + 1);
+			for (k = 0; k < 8; k = k + 1)
+				$display("    bucket %0d @%08x: next=%08x prev=%08x", k, tab + 8*k,
+				         ram_mem[((tab - 32'h04000000) >> 2) + 2*k], ram_mem[((tab - 32'h04000000) >> 2) + 2*k + 1]);
+		end
+		dump_panic_trace;
+		halt_run <= 1;
+	end
 end
 
 task dump_panic_trace;

@@ -46,7 +46,8 @@ module next_system #(
 	parameter CLK_REAL_HZ = CLK_HZ,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex",
-	parameter DEBUG_EXCEPTIONS = 0
+	parameter DEBUG_EXCEPTIONS = 0,
+	parameter POST_STORES = 0
 )
 (
 	input         clk,            // system clock: CPU, devices, RAM
@@ -241,6 +242,7 @@ always @(posedge clk)
 wire clkena = ((busstate == 2'b01) & pace) | mem_ready | berr_hold;
 
 wire [255:0] debug_status;
+wire [2047:0] debug_cache;  // HARDWARE TRACE window at 0x0201F000 (below): 4 x 16 longwords
 assign dbg_pc  = debug_status[31:0];
 assign dbg_ipl = ipl_level;
 
@@ -250,6 +252,12 @@ ap040_tg68k_compat #(
 	// Match Previous's non-Turbo 040: old Mach expects 44-byte FPU frames.
 	.AP040_FPU_REVISION(8'h40),
 	.AP040_ENABLE_CACHE(1),
+	// Post stores to main RAM only (0x04000000-0x07FFFFFF): device space
+	// must still be able to bus-error a write.  POST_STORES is a parameter
+	// of this module so the bench can run both ways.
+	.AP040_POST_STORES(POST_STORES),
+	.AP040_POST_LO(32'h0400_0000),
+	.AP040_POST_HI(32'h0800_0000),
 	.AP040_DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
 ) cpu
 (
@@ -315,12 +323,15 @@ ap040_tg68k_compat #(
 	.debug_halted(dbg_halted),
 	.debug_status(debug_status),
 	.debug_status2(),
+	.debug_cache(debug_cache),
 	.debug_exception_valid(dbg_exception_valid),
 	.debug_exception(dbg_exception)
 );
 
 // devices also see the RESET instruction
-wire dev_reset = reset | ~nresetout;
+// registered: a global-routed net (NeXT.qsf), ~4,000 device registers
+reg  dev_reset = 1;
+always @(posedge clk) dev_reset <= reset | ~nresetout;
 
 //----------------------------------------------------------------------------
 // address decode
@@ -391,8 +402,18 @@ assign si_m_err = si_m_req && !si_m_is_ram;
 
 always @(posedge clk) begin
 	mem_ready  <= 0;
-	walker_ack <= 0;
-	walker_berr<= 0;
+	// The walker's acknowledge is a LEVEL held until the MMU drops its
+	// request, not a one-clock pulse: the MMU samples it only under the
+	// CPU's clock enable, and with the core paced (CPU_PACE 1 of 2) a
+	// pulse landing on the un-enabled clock was lost, hanging the table
+	// walk until the stall watchdog faulted it (every MMU test of the CPU
+	// suite failed +pace this way).  The MMU inserts a request-low cycle
+	// after every descriptor transaction (w_issued), so a held ack can
+	// never complete the next one -- the contract ap040_walker_cdc keeps.
+	if (!walker_req) begin
+		walker_ack <= 0;
+		walker_berr<= 0;
+	end
 
 	dma_snoop_stb <= 0;
 	if (reset) begin
@@ -652,6 +673,11 @@ wire io_scc   = sel_io && (io_off[16:3]  == 14'h3000);          // 0x18000-0x180
 wire io_esp   = sel_io && (io_off[16:6]  == 11'h500);           // 0x14000-0x1403f
 wire io_flp   = sel_io && (io_off[16:4]  == 13'h1410);          // 0x14100-0x1410f
 wire io_evt   = sel_io && (io_off[16:12] == 5'h1a);             // 0x1a000-0x1afff
+// HARDWARE TRACE (2026-09-23): 16 longwords of the cache's last line-crossing
+// read, readable from the ROM monitor (el 201f000 ...).  Unmapped before.
+wire io_dbg   = sel_io && (io_off[16:8] == 9'h1f0);             // 0x1f000-0x1f0ff: entry n at 0x1f000 + 0x40*n
+wire [31:0] dbg_long = debug_cache[cpu_addr[7:2]*32 +: 32];
+wire [15:0] dbg_rdata = cpu_addr[1] ? dbg_long[15:0] : dbg_long[31:16];
 wire io_scr   = io_scr1 | io_sid | io_scr2;
 
 wire [15:0] scr_rdata, intc_rdata, timer_rdata, dma_rdata, scc_rdata, esp_rdata, enet_rdata, mo_rdata, snd_rdata;
@@ -695,7 +721,8 @@ assign io_rdata = io_enet  ? enet_rdata :
                   io_scc   ? scc_rdata :
                   io_esp   ? esp_rdata :
                   io_flp   ? flp_rdata :
-                  io_evt   ? evt_rdata : 16'h0000;
+                  io_evt   ? evt_rdata :
+                  io_dbg   ? dbg_rdata : 16'h0000;
 
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;

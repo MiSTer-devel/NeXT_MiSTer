@@ -145,7 +145,10 @@ assign int_scsi = dma_control[5] & status[7];   // ESPCTRL_ENABLE_INT & STAT_INT
 // SCSI disk target state
 //----------------------------------------------------------------------------
 
-localparam SCSI_UNITS = 6;       // targets 0..5; the host is 7
+// Targets 0..3 have host slots (NeXT.sv VDNUM); selecting a target at or
+// above SCSI_UNITS times out exactly like an unmounted one, so 4 and 5 are
+// not modelled (150 ALMs and 190 registers of per-target state).
+localparam SCSI_UNITS = 4;       // targets 0..3; the host is 7
 integer mk;                      // mount scan index
 integer sk;                      // reset scan index
 

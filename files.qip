@@ -1,4 +1,4 @@
-set_global_assignment -name QIP_FILE rtl/AP68040/rtl/ap040.qip
+set_global_assignment -name QIP_FILE rtl/ap68040/rtl/ap040.qip
 set_global_assignment -name VERILOG_FILE rtl/next/dpram.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_system.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_scr.sv
@@ -42,6 +42,23 @@ if {[info exists ::env(NEXT_EXCEPTION_DIAG)]
 	# Preserve the full diagnostic design while reducing synthesized logic area.
 	set_global_assignment -name OPTIMIZATION_TECHNIQUE AREA
 	set_global_assignment -name SEED 2
+}
+# The Quadra 800 AP68040 tree places but does not route under this project's
+# HIGH PERFORMANCE / SPEED settings (docs/CPU_NEXT_PORT.md).  This is the
+# recipe MacQuadra800_MiSTer closes the same CPU with:
+#
+#   NEXT_FIT_QUADRA=1 quartus_sh --flow compile NeXT
+if {[info exists ::env(NEXT_FIT_QUADRA)] && $::env(NEXT_FIT_QUADRA) eq "1"} {
+	set_global_assignment -name OPTIMIZATION_MODE BALANCED
+	set_global_assignment -name OPTIMIZATION_TECHNIQUE BALANCED
+	set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF
+	set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
+	# NEXT_SEED=<n> walks the fitter seed: at 94% ALMs a netlist change can
+	# fail to route on one seed and close on the next (MacQuadra800 keeps a
+	# log of the same in its qsf).
+	if {[info exists ::env(NEXT_SEED)]} {
+		set_global_assignment -name SEED $::env(NEXT_SEED)
+	}
 }
 set_global_assignment -name QIP_FILE rtl/pll.qip
 set_global_assignment -name SDC_FILE NeXT.sdc

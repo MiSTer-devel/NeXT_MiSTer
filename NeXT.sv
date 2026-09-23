@@ -53,11 +53,13 @@ assign BUTTONS = 0;
 
 //////////////////////////////////////////////////////////////////
 
-// 1120 x 832 is close to 4:3
+// The MegaPixel display is 1120 x 832, which is 35:26 exactly (not 4:3:
+// declaring 4:3 makes the scaler squeeze 1120 columns into 1109 at 1x
+// integer scaling and blurs the one-pixel font strokes).
 wire [1:0] ar = status[122:121];
 
-assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
+assign VIDEO_ARX = (!ar) ? 12'd35 : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? 12'd26 : 12'd0;
 
 `include "build_id.v"
 localparam CONF_STR = {
@@ -194,7 +196,11 @@ wire rom_download = ioctl_download && (ioctl_index[5:0] <= 6'd1);
 reg  rom_loaded = 0;
 always @(posedge clk_sys) if (rom_download) rom_loaded <= 1;
 
-wire reset = RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
+// Registered so the net can ride a global network (NeXT.qsf GLOBAL_SIGNAL):
+// it fans out to some 5,500 registers and was the largest net on ordinary
+// routing in a design whose peak interconnect usage sits at 95%.
+reg  reset = 1;
+always @(posedge clk_sys) reset <= RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
 
 wire signed [15:0] adc_audio_in;
 next_audio_adc #(.CLK_REAL_HZ(28000000)) adc_input
@@ -229,15 +235,16 @@ localparam DEBUG_EXCEPTIONS = 0;
 wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
-// CLK_HZ sets the machine's microsecond tick at 50 clocks: with the
-// 32 MHz system clock this is a virtual microsecond (the machine runs
-// at 64 percent of real time, uniformly), which satisfies the boot
-// ROM's CPU-speed calibration invariant (see CPU_PACE_* in
-// next_system.sv).  Pacing is off: 32 MHz is already below the
-// calibrated speed.
+// CLK_HZ sets the machine's microsecond tick: with the 28 MHz system
+// clock this is a virtual microsecond (the machine runs at 112 percent
+// of real time, uniformly), chosen to satisfy the boot ROM's CPU-speed
+// calibration invariant (see CPU_PACE_* in next_system.sv).  The Quadra
+// 800 AP68040 tree runs the ROM's cached DBF delay() loop in 2 clocks
+// per iteration (measured, docs/CPU_NEXT_PORT.md); paced to 1 of every
+// 2 clocks that is 4, so 6.25 iterations per microsecond need 25 clocks.
 next_system #(
-	.CLK_HZ(50000000),
-	.CPU_PACE_NUM(2),
+	.CLK_HZ(25000000),
+	.CPU_PACE_NUM(1),
 	.CPU_PACE_DEN(2),
 	.CLK_REAL_HZ(28000000),   // the real clk_sys, so the clock keeps time
 	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
