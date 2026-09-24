@@ -59,13 +59,21 @@ module next_scr #(
 	input         floppy_mounted,
 	input   [2:0] sd_lower_mounted,   // SCSI disks at targets 0-2, below the CD-ROM
 
-	// the host's clock from hps_io (MSM6242 layout: BCD seconds, minutes,
-	// hours, day, month, two-digit year, then the weekday 0 = Sunday;
-	// bit 64 toggles on every update).  The time of day is seeded from it
-	// once, on the first update after configuration, so the guest sees
-	// the real date without any NVRAM persistence; after that the clock
-	// free-runs and the guest may set it.  Tie to 0 for no seed.
-	input  [64:0] rtc_host,
+	// the host's clock from hps_io: TIMESTAMP, Unix seconds (UTC) in
+	// [31:0], bit 32 toggling on every update.  The time of day is seeded
+	// from it once, on the first update after configuration, so the guest
+	// sees the real date without any NVRAM persistence; after that the
+	// clock free-runs and the guest may set it.  Tie to 0 for no seed.
+	// NeXTSTEP reads the chip as UTC (a 12:00 seed prints as 05:00 PDT)
+	// and wants the year as two plain BCD digits (0x24 = 2024; it
+	// accepts 0xC4 too), which is why the calendar is derived here from
+	// the epoch rather than taken from hps_io's local-time RTC bus.  The
+	// kernel also only trusts an RTC within a window of the root
+	// filesystem's last-write time (two days accepted, one year rejected,
+	// measured 2026-09-24), so a fresh image takes the date once from the
+	// guest (Preferences or `date`); from the next boot on the seed is
+	// accepted.
+	input  [32:0] ts_host,
 
 	output        timer_ipl7,    // SCR2 byte 2 bit 7
 	output        led,           // SCR2 byte 3 bit 0
@@ -96,7 +104,7 @@ reg  [7:0] rtc_val;
 reg  [7:0] clkctrl;              // reg 0x31
 reg  [7:0] intctrl;              // reg 0x32
 
-// time of day, BCD (seeded from rtc_host; the date does not roll over at
+// time of day, BCD (seeded from ts_host; the date does not roll over at
 // midnight, the guest keeps its own calendar once booted)
 reg  [7:0] t_sec = 8'h00, t_min = 8'h00, t_hour = 8'h00;
 reg  [7:0] t_wday = 8'h01, t_mday = 8'h01, t_month = 8'h01, t_year = 8'h00;
@@ -154,6 +162,13 @@ wire [4:0] next_phase = rtc_phase + 5'd1;
 wire       rtc_is_write = rtc_addr[7];
 wire       rtc_is_clock = rtc_addr[5];
 wire [7:0] rtc_load = rtc_is_clock ? clock_get(rtc_addr) : nvram[rtc_addr[4:0]];
+`ifdef VERILATOR
+// +rtctrace: every clock-register access the guest makes
+always @(posedge clk) if (rtc_step && next_phase == 5'd16 && rtc_is_write && rtc_is_clock && $test$plusargs("rtctrace"))
+	$display("[%0t] RTC: guest WRITES reg %h = %h", $time, rtc_addr, {rtc_val_cur[6:0], rtc_bit_in});
+always @(posedge clk) if (rtc_step && next_phase == 5'd9 && !rtc_is_write && rtc_is_clock && $test$plusargs("rtctrace"))
+	$display("[%0t] RTC: guest reads reg %h = %h", $time, rtc_addr, rtc_load);
+`endif
 
 // output bit for read transfers: bit (16 - phase) of the value
 wire [7:0] rtc_val_cur = (next_phase == 5'd9 && !rtc_is_write) ? rtc_load : rtc_val;
@@ -257,13 +272,55 @@ initial begin
 	// Previous's 0x4B enables.  The ROM `p` command can change it for a
 	// session.
 	nvram[14] = 8'h11;
+`ifdef VERILATOR
+	// +verbosepot: Previous's 0x4B (verbose, extended, sound test) so the
+	// kernel boots in its text panel and its console lines can be read from
+	// the framebuffer dump
+	if ($test$plusargs("verbosepot")) nvram[14] = 8'h4B;
+`endif
 	nvram[30] = 8'hE0;
 	nvram[31] = 8'hEF;
 end
 
 reg boot_init = 1'b1;
 reg rtc_seeded = 1'b0;
-reg rtc_host_flag = 1'b0;
+reg ts_flag = 1'b0;
+// epoch -> calendar, one subtraction per clock (about 21,000 clocks for
+// 2026, well inside the ROM's first RTC access): days and the weekday,
+// then hours, minutes, seconds, then years from 1970 and months
+localparam CV_IDLE = 3'd0, CV_DAYS = 3'd1, CV_HOURS = 3'd2, CV_MINS = 3'd3,
+           CV_YEARS = 3'd4, CV_MONTHS = 3'd5, CV_DONE = 3'd6;
+reg  [2:0] cv_st = CV_IDLE;
+reg [31:0] cv_secs = 0;
+reg [15:0] cv_days = 0;
+reg  [2:0] cv_wday = 0;    // 0 = Sunday
+reg  [4:0] cv_hour = 0;
+reg  [5:0] cv_min = 0;
+reg  [7:0] cv_year = 0;    // years since 1970
+reg  [3:0] cv_mon = 0;     // 0 = January
+wire [11:0] cv_yfull = 12'd1970 + {4'd0, cv_year};
+wire        cv_leap  = (cv_yfull[1:0] == 2'd0) && (cv_yfull != 12'd2100);
+wire  [8:0] cv_ylen  = cv_leap ? 9'd366 : 9'd365;
+reg   [4:0] cv_mlen;
+always @(*) case (cv_mon)
+	4'd1: cv_mlen = cv_leap ? 5'd29 : 5'd28;
+	4'd3, 4'd5, 4'd8, 4'd10: cv_mlen = 5'd30;
+	default: cv_mlen = 5'd31;
+endcase
+function [7:0] to_bcd;   // 0..99
+	input [6:0] v;
+	reg [3:0] tens;
+	reg [6:0] rest;
+	begin
+		tens = (v >= 7'd90) ? 4'd9 : (v >= 7'd80) ? 4'd8 : (v >= 7'd70) ? 4'd7 :
+		       (v >= 7'd60) ? 4'd6 : (v >= 7'd50) ? 4'd5 : (v >= 7'd40) ? 4'd4 :
+		       (v >= 7'd30) ? 4'd3 : (v >= 7'd20) ? 4'd2 : (v >= 7'd10) ? 4'd1 : 4'd0;
+		rest = v - {tens, 3'd0} - {2'd0, tens, 1'b0};   // v - tens*10
+		to_bcd = {tens, rest[3:0]};
+	end
+endfunction
+wire [7:0] cv_yy = (cv_year >= 8'd130) ? cv_year - 8'd130 :
+                   (cv_year >= 8'd30)  ? cv_year - 8'd30  : cv_year + 8'd70;   // (1970+y) mod 100
 
 always @(posedge clk) begin
 	//------------------------------------------------------------
@@ -303,17 +360,44 @@ always @(posedge clk) begin
 	end
 
 	// seed the clock from the host once (the first hps_io update)
-	rtc_host_flag <= rtc_host[64];
-	if (!rtc_seeded && (rtc_host_flag != rtc_host[64])) begin
-		rtc_seeded <= 1'b1;
-		t_sec   <= rtc_host[7:0];
-		t_min   <= rtc_host[15:8];
-		t_hour  <= rtc_host[23:16];
-		t_mday  <= rtc_host[31:24];
-		t_month <= rtc_host[39:32];
-		t_year  <= rtc_host[47:40];
-		t_wday  <= {4'd0, rtc_host[51:48]} + 8'd1;   // NeXT counts Sunday as 1
+	ts_flag <= ts_host[32];
+	if (!rtc_seeded && cv_st == CV_IDLE && (ts_flag != ts_host[32])) begin
+		cv_secs <= ts_host[31:0];
+		cv_days <= 0; cv_wday <= 3'd4;   // 1970-01-01 was a Thursday
+		cv_hour <= 0; cv_min <= 0; cv_year <= 0; cv_mon <= 0;
+		cv_st <= CV_DAYS;
 	end
+	case (cv_st)
+		CV_DAYS:   if (cv_secs >= 32'd86400) begin
+				cv_secs <= cv_secs - 32'd86400; cv_days <= cv_days + 1'd1;
+				cv_wday <= (cv_wday == 3'd6) ? 3'd0 : cv_wday + 1'd1;
+			end else cv_st <= CV_HOURS;
+		CV_HOURS:  if (cv_secs >= 32'd3600) begin cv_secs <= cv_secs - 32'd3600; cv_hour <= cv_hour + 1'd1; end
+		           else cv_st <= CV_MINS;
+		CV_MINS:   if (cv_secs >= 32'd60) begin cv_secs <= cv_secs - 32'd60; cv_min <= cv_min + 1'd1; end
+		           else cv_st <= CV_YEARS;
+		CV_YEARS:  if (cv_days >= {7'd0, cv_ylen}) begin cv_days <= cv_days - {7'd0, cv_ylen}; cv_year <= cv_year + 1'd1; end
+		           else cv_st <= CV_MONTHS;
+		CV_MONTHS: if (cv_days >= {11'd0, cv_mlen}) begin cv_days <= cv_days - {11'd0, cv_mlen}; cv_mon <= cv_mon + 1'd1; end
+		           else cv_st <= CV_DONE;
+		CV_DONE: begin
+			rtc_seeded <= 1'b1;
+			cv_st <= CV_IDLE;
+			t_sec   <= to_bcd({1'b0, cv_secs[5:0]});
+			t_min   <= to_bcd({1'b0, cv_min});
+			t_hour  <= to_bcd({2'd0, cv_hour});
+			t_mday  <= to_bcd({2'd0, cv_days[4:0]} + 7'd1);
+			t_month <= to_bcd({3'd0, cv_mon} + 7'd1);
+			t_year  <= to_bcd(cv_yy[6:0]);
+			t_wday  <= {5'd0, cv_wday} + 8'd1;   // NeXT counts Sunday as 1
+`ifdef VERILATOR
+			$display("[%0t] RTC: seeded from host epoch %0d -> %02x/%02x/%02x %02x:%02x:%02x wday %0d", $time, ts_host[31:0],
+			         to_bcd(cv_yy[6:0]), to_bcd({3'd0, cv_mon} + 7'd1), to_bcd({2'd0, cv_days[4:0]} + 7'd1),
+			         to_bcd({2'd0, cv_hour}), to_bcd({1'b0, cv_min}), to_bcd({1'b0, cv_secs[5:0]}), cv_wday + 1);
+`endif
+		end
+		default: ;
+	endcase
 
 	if (reset) begin
 		scr2_0 <= 8'h00;

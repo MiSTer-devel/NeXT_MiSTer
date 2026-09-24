@@ -73,7 +73,7 @@ next_system #(
 		.ps2_key(ps2),
 		.ps2_mouse(25'd0),
 	.boot_sel(bootfd ? 3'd2 : bootcd ? 3'd6 : bootsd ? 3'd1 : 3'd0),
-	.rtc_host(rtc_host),
+	.ts_host(ts_host),
 	.enet_connected(net_enable),
 	.fimg_mounted(fimg_mounted), .fsd_unit(), .fimg_readonly(1'b0),
 	.fimg_size(fimg_bytes),
@@ -234,14 +234,17 @@ wire  [7:0] brx_data;
 wire [47:0] enet_mac;
 
 reg         net_enable = 1;
-// +rtc: seed the NeXT clock as the HPS would (Wed 2026-09-23 16:58:30),
-// one update pulse shortly after reset; without it the RTC starts at zero
-// as it did before the seed existed.
-reg  [64:0] rtc_host = 65'd0;
+// +rtc: seed the NeXT clock as the HPS would, one TIMESTAMP update shortly
+// after reset; +rtcts=<unix seconds> chooses the moment (default
+// 1718884800 = Thu 2024-06-20 12:00:00 UTC, inside this image's window).
+// Without +rtc the RTC starts at zero as it did before the seed existed.
+reg  [32:0] ts_host = 33'd0;
+reg  [31:0] rtc_ts = 32'd1718884800;
+initial if ($value$plusargs("rtcts=%d", rtc_ts)) ;
 reg         rtc_pulsed = 0;
 always @(posedge clk) if (!reset && !rtc_pulsed && $test$plusargs("rtc")) begin
 	rtc_pulsed <= 1;
-	rtc_host <= {1'b1, 8'h40, 4'd0, 4'd3, 8'h26, 8'h09, 8'h23, 8'h16, 8'h58, 8'h30};
+	ts_host <= {1'b1, rtc_ts};
 end
 
 next_enet_bridge #(.CLK_HZ(50000000)) bridge
@@ -1265,11 +1268,13 @@ end
 
 // 1120x832 2bpp NeXT gray to PGM: 0 = white, 3 = black, line pitch
 // 288 bytes (1120/4 active plus 8 pad), even address byte in mem_hi
+string fb_path;   // +fbout=<path> chooses the dump file (parallel runs)
 task fb_dump;
 	integer fd, y, xb, p;
 	reg [7:0] b;
 	begin
-		fd = $fopen("build/fb.pgm", "wb");
+		if (!$value$plusargs("fbout=%s", fb_path)) fb_path = "build/fb.pgm";
+		fd = $fopen(fb_path, "wb");
 		$fwrite(fd, "P5\n1120 832\n255\n");
 		for (y = 0; y < 832; y = y + 1) begin
 			for (xb = 0; xb < 280; xb = xb + 1) begin : row

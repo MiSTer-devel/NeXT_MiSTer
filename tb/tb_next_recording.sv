@@ -14,7 +14,7 @@ next_system #(.CLK_HZ(1000000),.CLK_REAL_HZ(1000000),
  .CPU_PACE_NUM(2),.CPU_PACE_DEN(2),.ROM_INIT_EN(0)) dut(
  .clk(clk),.clk_vid(clk),.reset(reset),.ps2_key(11'd0),.ps2_mouse(25'd0),
  .boot_sel(3'd0),
- .rtc_host(65'd0),.enet_connected(1'b0),
+ .ts_host(33'd0),.enet_connected(1'b0),
  .oimg_mounted(2'd0),.oimg_readonly(1'b0),.oimg_size(64'd0),.osd_ack(1'b0),
  .fimg_mounted(2'd0),.fimg_readonly(1'b0),.fimg_size(64'd0),.fsd_ack(1'b0),
  .fsd_buff_addr(9'd0),.fsd_buff_dout(8'd0),.fsd_buff_wr(1'b0),

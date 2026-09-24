@@ -87,7 +87,7 @@ localparam CONF_STR = {
 wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
-wire  [64:0] RTC;            // the HPS clock, seeds the NeXT RTC
+wire  [32:0] TIMESTAMP;      // the HPS clock (Unix seconds), seeds the NeXT RTC
 wire  [10:0] ps2_key;
 wire  [24:0] ps2_mouse;
 wire        enet_connected = |status[54:52] && !status[58];
@@ -153,7 +153,7 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 	.buttons(buttons),
 	.status(status),
 	.status_menumask(0),
-	.RTC(RTC),
+	.TIMESTAMP(TIMESTAMP),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -259,7 +259,7 @@ next_system #(
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
 	.boot_sel(status[57:55]),
-	.rtc_host(RTC),
+	.ts_host(TIMESTAMP),
 	.enet_connected(enet_connected),
 
 	.oimg_mounted(oimg_mounted),
