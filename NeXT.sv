@@ -64,10 +64,13 @@ assign VIDEO_ARY = (!ar) ? 12'd26 : 12'd0;
 `include "build_id.v"
 localparam CONF_STR = {
 	"NeXT;;",
+	// SC slots: main remembers the mounted image in config/NeXT.s<n> and
+	// re-mounts it at core start, so the ROM auto-boots from the disk.
+	// The removable media (CD-ROM, floppy, MO) stay plain S slots.
 	"F1,BINROM,Boot ROM;",
-	"S0,VHDIMG,SCSI Disk 0;",
-	"S1,VHDIMG,SCSI Disk 1;",
-	"S2,VHDIMG,SCSI Disk 2;",
+	"SC0,VHDIMG,SCSI Disk 0;",
+	"SC1,VHDIMG,SCSI Disk 1;",
+	"SC2,VHDIMG,SCSI Disk 2;",
 	"S3,ISO,CD-ROM;",
 	"S4,IMGIMAFLPVFDFD ,Floppy;",
 	"S5,IMGMO OD ,Magneto-optical;",
