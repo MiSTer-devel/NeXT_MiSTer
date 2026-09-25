@@ -111,8 +111,10 @@ module next_system #(
 	output [31:0] sd_lba,
 	output        sd_rd,
 	output        sd_wr,
+	output  [5:0] sd_blk_cnt,      // hps_io blocks-1 for the CD-ROM slot (audio frames)
+	output  [5:0] osd_blk_cnt,     // ... for the MO slot (the ECC exchange)
 	input         sd_ack,
-	input   [8:0] sd_buff_addr,
+	input  [12:0] sd_buff_addr,    // multi-block transfers reach 2560 bytes
 	input   [7:0] sd_buff_dout,
 	output  [7:0] sd_buff_din,
 	input         sd_buff_wr,
@@ -930,10 +932,11 @@ next_mo #(.CLK_HZ(CLK_HZ), .DRIVE_CONNECTED(2'b01)) mo
 	.sd_rd(osd_rd),
 	.sd_wr(osd_wr),
 	.sd_ack(osd_ack),
-	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_addr(sd_buff_addr[10:0]),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(osd_buff_din),
-	.sd_buff_wr(sd_buff_wr)
+	.sd_buff_wr(sd_buff_wr),
+	.sd_blk_cnt(osd_blk_cnt)
 );
 
 // KMS and sound out DMA (a RAM bus master)
@@ -967,9 +970,16 @@ next_kms_snd #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) kms_snd
 	.sndin_request(sndin_request), .sndin_overrun(sndin_overrun),
 	.int_keymouse(int_keymouse),
 	.int_power(int_power),
-	.audio_l(audio_l),
-	.audio_r(audio_r)
+	.audio_l(kms_l),
+	.audio_r(kms_r)
 );
+
+// the CD-ROM's audio is summed into the sound output with saturation
+wire signed [15:0] kms_l, kms_r, cd_l, cd_r;
+wire signed [16:0] mix_l = {kms_l[15], kms_l} + {cd_l[15], cd_l};
+wire signed [16:0] mix_r = {kms_r[15], kms_r} + {cd_r[15], cd_r};
+assign audio_l = (mix_l[16] != mix_l[15]) ? (mix_l[16] ? 16'h8000 : 16'h7FFF) : mix_l[15:0];
+assign audio_r = (mix_r[16] != mix_r[15]) ? (mix_r[16] ? 16'h8000 : 16'h7FFF) : mix_r[15:0];
 
 next_snd_in #(.CLK_REAL_HZ(CLK_REAL_HZ)) snd_in
 (
@@ -1093,16 +1103,55 @@ next_scsi #(.CLK_HZ(CLK_HZ), .CD_UNITS(6'b001000)) scsi   // target 3 is the CD-
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_unit(sd_unit),
-	.sd_lba(sd_lba),
-	.sd_rd(sd_rd),
+	.sd_unit(scsi_sd_unit),
+	.sd_lba(scsi_sd_lba),
+	.sd_rd(scsi_sd_rd),
 	.sd_wr(sd_wr),
-	.sd_ack(sd_ack),
-	.sd_buff_addr(sd_buff_addr),
+	.sd_ack_in(sd_ack),
+	.sd_buff_addr(sd_buff_addr[8:0]),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
-	.sd_buff_wr(sd_buff_wr)
+	.sd_buff_wr(sd_buff_wr),
+	.sd_busy(scsi_sd_busy),
+	.sd_hold(ca_req | ca_act),
+	.cd_fwd_stb(cd_fwd_stb)
 );
+
+// The CD-ROM's audio front end shares the CD-ROM slot with the target:
+// while it owns the channel the slot sees its frame request.
+wire  [2:0] scsi_sd_unit;
+wire [31:0] scsi_sd_lba, ca_lba;
+wire        scsi_sd_rd, scsi_sd_busy, ca_req, ca_act, ca_rd, cd_fwd_stb;
+wire  [5:0] ca_blk_cnt;
+assign sd_unit    = ca_act ? 3'd3 : scsi_sd_unit;
+assign sd_lba     = ca_act ? ca_lba : scsi_sd_lba;
+assign sd_rd      = scsi_sd_rd | ca_rd;
+assign sd_blk_cnt = ca_act ? ca_blk_cnt : 6'd0;
+
+next_cd_audio #(.CLK_HZ(CLK_REAL_HZ)) cd_audio
+(
+	.clk(clk),
+	.rst(dev_reset),
+	.mounted(cd_mounted),
+	.fwd_stb(cd_fwd_stb),
+	.stop_stb(1'b0),
+	.scsi_busy(scsi_sd_busy),
+	.ch_req(ca_req),
+	.ch_act(ca_act),
+	.io_rd(ca_rd),
+	.io_lba(ca_lba),
+	.io_blk_cnt(ca_blk_cnt),
+	.io_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_wr(sd_buff_wr),
+	.snd_l(cd_l),
+	.snd_r(cd_r)
+);
+
+// the CD-ROM slot's mount state, from its mount pulses
+reg cd_mounted = 0;
+always @(posedge clk) if (img_mounted[3]) cd_mounted <= (img_size != 0);
 
 // SCC serial controller
 next_scc scc_dev

@@ -71,7 +71,7 @@ localparam CONF_STR = {
 	"SC0,VHDIMG,SCSI Disk 0;",
 	"SC1,VHDIMG,SCSI Disk 1;",
 	"SC2,VHDIMG,SCSI Disk 2;",
-	"S3,ISO,CD-ROM;",
+	"S3,ISOCUEBINCHD,CD-ROM;",
 	"S4,IMGIMAFLPVFDFD ,Floppy;",
 	"S5,IMGMO OD ,Magneto-optical;",
 	"-;",
@@ -141,6 +141,7 @@ wire [63:0] img_size;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 wire [13:0] sd_buff_addr;
+wire  [5:0] sd_blk_cnt, osd_blk_cnt;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
 
@@ -171,6 +172,7 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 	.sd_rd({osd_rd, fsd_rd, {4{sd_rd}} & scsi_onehot[3:0]}),
 	.sd_wr({osd_wr, fsd_wr, {4{sd_wr}} & scsi_onehot[3:0]}),
 	.sd_ack(sd_ack_v),
+	.sd_blk_cnt('{6'd0, 6'd0, 6'd0, sd_blk_cnt, 6'd0, osd_blk_cnt}),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din('{sd_buff_din, sd_buff_din, sd_buff_din, sd_buff_din,
@@ -296,6 +298,8 @@ next_system #(
 	.img_readonly(img_readonly),
 	.img_size(img_size),
 	.sd_unit(sd_unit),
+	.sd_blk_cnt(sd_blk_cnt),
+	.osd_blk_cnt(osd_blk_cnt),
 	.sd_lba(sd_lba),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),

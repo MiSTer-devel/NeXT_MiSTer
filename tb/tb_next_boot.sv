@@ -22,6 +22,15 @@
 
 module tb_next_boot;
 
+// The HPS side of the SCSI/MO windows: the real Main_MiSTer support/next
+// code (tb/host/next_host_dpi.cpp, sources synced by tb/host/sync_main.sh).
+import "DPI-C" function int  host_fill(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_byte(input int i);
+import "DPI-C" function void host_put(input int i, input int b);
+import "DPI-C" function void host_exec(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_mount_cd(input string path);
+import "DPI-C" function int  host_mount_disk(input int slot, input longint bytes);
+
 reg clk = 0;
 reg reset = 1;
 
@@ -109,6 +118,11 @@ next_system #(
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
+	.sd_blk_cnt(sd_blk_cnt),
+	.osd_blk_cnt(osd_blk_cnt),
+	.oimg_mounted(2'b00), .oimg_readonly(1'b0), .oimg_size(64'd0),
+	.osd_unit(), .osd_lba(osd_lba), .osd_rd(osd_rd), .osd_wr(osd_wr),
+	.osd_ack(osd_ack), .osd_buff_din(osd_buff_din),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
@@ -1034,10 +1048,16 @@ reg  [2:0] img_mounted = 0;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 reg         sd_ack = 0;
-reg   [8:0] sd_buff_addr = 0;
+reg  [12:0] sd_buff_addr = 0;     // one buffer bus for the SCSI and MO slots
 reg   [7:0] sd_buff_dout = 0;
 wire  [7:0] sd_buff_din;
 reg         sd_buff_wr = 0;
+wire  [5:0] sd_blk_cnt, osd_blk_cnt;
+// the MO slot: no cartridge, only the ECC exchange (a 3-block window)
+wire [31:0] osd_lba;
+wire        osd_rd, osd_wr;
+wire  [7:0] osd_buff_din;
+reg         osd_ack = 0;
 
 reg  [7:0] disk [0:2048*512-1];
 
@@ -1090,53 +1110,119 @@ initial for (sdi = 0; sdi < 2048*512; sdi = sdi + 1)
 reg sd_rd_act = 0, sd_wr_act = 0, sd_rphase = 0, img_flush = 0;
 integer sd_reads = 0;
 reg sd_lba0 = 0;
+// A window transaction (lba >= 0x7C000000) is served by the HPS model;
+// the MO slot shares the buffer bus and only ever carries windows.
+reg         sd_win = 0;
+reg  [12:0] sd_last = 13'd511;
+reg         osd_rd_act = 0, osd_wr_act = 0;
+integer     hr;
+
+// the mounts, as user_io's mount hook reports them to the HPS
+always @(negedge clk) begin
+	if (img_mounted[0]) hr = host_mount_disk(0, img_bytes);
+	if (img_mounted[2]) hr = host_mount_disk(2, img_bytes);
+	if (cimg_mounted) begin
+		if (img_fd != 0) hr = host_mount_cd(img_path);
+		else hr = host_mount_disk(3, img_bytes);
+	end
+end
 
 always @(posedge clk) begin
 	sd_buff_wr <= 0;
-	if (sd_rd && !sd_ack) begin
+	if (!sd_ack && !osd_ack && sd_rd) begin
 		sd_ack <= 1;
 		sd_rd_act <= 1;
 		sd_buff_addr <= 0;
-		sd_reads = sd_reads + 1;
-		if (sd_lba == 0) sd_lba0 <= 1;
-		if (img_fd != 0) begin
-			fr = $fseek(img_fd, {sd_lba, 9'd0}, 0);
-			fr = $fread(fbuf, img_fd);
+		sd_win <= (sd_lba >= 32'h7C00_0000);
+		sd_last <= ({7'd0, sd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+		if (sd_lba >= 32'h7C00_0000)
+			hr = host_fill(3, sd_lba, ({26'd0, sd_blk_cnt} + 32'd1) * 32'd512);
+		else begin
+			sd_reads = sd_reads + 1;
+			if (sd_lba == 0) sd_lba0 <= 1;
+			if (img_fd != 0) begin
+				fr = $fseek(img_fd, {sd_lba, 9'd0}, 0);
+				fr = $fread(fbuf, img_fd);
+			end
+			if (sd_reads < 200 || (sd_reads % 256) == 0)
+				$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
 		end
-		if (sd_reads < 200 || (sd_reads % 256) == 0)
-			$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
 	end
 	else if (sd_ack && sd_rd_act) begin
 		if (!sd_buff_wr) begin
-			sd_buff_dout <= (img_fd != 0)
-			              ? fbuf[sd_buff_addr]
-			              : disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}];
+			sd_buff_dout <= sd_win ? host_byte(sd_buff_addr) :
+			                (img_fd != 0) ? fbuf[sd_buff_addr[8:0]]
+			              : disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr[8:0]}];
 			sd_buff_wr <= 1;
-			if (sd_buff_addr == 9'd511) begin
+			if (sd_buff_addr == sd_last) begin
 				sd_ack <= 0;
 				sd_rd_act <= 0;
 			end
 		end
 		else begin
-			if (sd_buff_addr != 9'd511) sd_buff_addr <= sd_buff_addr + 1'd1;
+			if (sd_buff_addr != sd_last) sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 	end
-	else if (sd_wr && !sd_ack) begin
+	else if (!sd_ack && !osd_ack && sd_wr) begin
 		sd_ack <= 1;
 		sd_wr_act <= 1;
 		sd_buff_addr <= 0;
 		sd_rphase <= 0;
-		$display("[%0t] BOOT: SD write lba %0d", $time, sd_lba);
+		sd_win <= (sd_lba >= 32'h7C00_0000);
+		sd_last <= ({7'd0, sd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+		if (sd_lba < 32'h7C00_0000)
+			$display("[%0t] BOOT: SD write lba %0d", $time, sd_lba);
 	end
 	else if (sd_ack && sd_wr_act) begin
 		if (sd_rphase) begin
-			if (img_fd != 0) fbuf[sd_buff_addr] <= sd_buff_din;
-			else disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+			if (sd_win) host_put(sd_buff_addr, sd_buff_din);
+			else if (img_fd != 0) fbuf[sd_buff_addr[8:0]] <= sd_buff_din;
+			else disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr[8:0]}] <= sd_buff_din;
 			sd_rphase <= 0;
-			if (sd_buff_addr == 9'd511) begin
+			if (sd_buff_addr == sd_last) begin
 				sd_ack <= 0;
 				sd_wr_act <= 0;
-				if (img_fd != 0) img_flush <= 1;
+				if (sd_win) host_exec(3, sd_lba, {19'd0, sd_last} + 32'd1);
+				else if (img_fd != 0) img_flush <= 1;
+			end
+			else sd_buff_addr <= sd_buff_addr + 1'd1;
+		end
+		else sd_rphase <= 1;
+	end
+	// the MO slot's ECC exchange
+	else if (!sd_ack && !osd_ack && osd_rd) begin
+		osd_ack <= 1;
+		osd_rd_act <= 1;
+		sd_buff_addr <= 0;
+		sd_last <= ({7'd0, osd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+		hr = host_fill(5, osd_lba, ({26'd0, osd_blk_cnt} + 32'd1) * 32'd512);
+	end
+	else if (osd_ack && osd_rd_act) begin
+		if (!sd_buff_wr) begin
+			sd_buff_dout <= host_byte(sd_buff_addr);
+			sd_buff_wr <= 1;
+			if (sd_buff_addr == sd_last) begin
+				osd_ack <= 0;
+				osd_rd_act <= 0;
+			end
+		end
+		else if (sd_buff_addr != sd_last) sd_buff_addr <= sd_buff_addr + 1'd1;
+	end
+	else if (!sd_ack && !osd_ack && osd_wr) begin
+		osd_ack <= 1;
+		osd_wr_act <= 1;
+		sd_buff_addr <= 0;
+		sd_rphase <= 0;
+		sd_last <= ({7'd0, osd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+	end
+	else if (osd_ack && osd_wr_act) begin
+		if (sd_rphase) begin
+			host_put(sd_buff_addr, osd_buff_din);
+			sd_rphase <= 0;
+			if (sd_buff_addr == sd_last) begin
+				osd_ack <= 0;
+				osd_wr_act <= 0;
+				host_exec(5, osd_lba, {19'd0, sd_last} + 32'd1);
 			end
 			else sd_buff_addr <= sd_buff_addr + 1'd1;
 		end

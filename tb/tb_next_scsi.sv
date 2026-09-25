@@ -19,6 +19,15 @@
 
 module tb_next_scsi;
 
+// The HPS side of the SCSI/MO windows: the real Main_MiSTer support/next
+// code (tb/host/next_host_dpi.cpp, sources synced by tb/host/sync_main.sh).
+import "DPI-C" function int  host_fill(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_byte(input int i);
+import "DPI-C" function void host_put(input int i, input int b);
+import "DPI-C" function void host_exec(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_mount_cd(input string path);
+import "DPI-C" function int  host_mount_disk(input int slot, input longint bytes);
+
 reg clk = 0;
 always #5 clk = ~clk;
 
@@ -91,7 +100,7 @@ next_scsi #(.CLK_HZ(1000000), .CD_UNITS(6'b001000)) dut   // target 3 is a CD-RO
 	.int_scsi(int_scsi), .int_scsi_dma(int_scsi_dma),
 	.img_mounted({2'b00, img_mounted_cd, 1'b0, img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
 	.sd_unit(),
-	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
+	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack_in(sd_ack), .sd_hold(1'b0),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
 	.flp_select(flp_select), .flp_req(flp_req), .flp_wr(flp_wr),
@@ -190,6 +199,15 @@ initial begin
 	end
 end
 
+// the mounts, as user_io's mount hook reports them to the HPS model
+integer hr;
+reg     sd_win = 0;     // the transaction is a window (served by the HPS model)
+always @(negedge clk) begin   // the pulses are driven with blocking assignments around the posedge
+	if (img_mounted)    hr = host_mount_disk(0, img_size);
+	if (img_mounted2)   hr = host_mount_disk(1, img_size);
+	if (img_mounted_cd) hr = host_mount_disk(3, img_size);
+end
+
 // serve sd_rd / sd_wr with the hps_io handshake
 always @(posedge clk) begin
 	// hps_io registers sd_buff_wr separately from sd_ack.  Its final write
@@ -198,11 +216,14 @@ always @(posedge clk) begin
 	if (sd_rd && !sd_ack) begin
 		sd_ack <= 1;
 		sd_buff_addr <= 0;
+		sd_win <= (sd_lba >= 32'h7C00_0000);
+		if (sd_lba >= 32'h7C00_0000) hr = host_fill(3, sd_lba, 512);
 	end
 	else if (sd_ack && sd_rd_active) begin
 		// one byte every other cycle
 		if (!sd_buff_wr && sd_buff_addr <= 9'd511) begin
-			sd_buff_dout <= (dut.sd_unit == 3'd3)
+			sd_buff_dout <= sd_win ? host_byte(sd_buff_addr)
+			              : (dut.sd_unit == 3'd3)
 			              ? cd   [{sd_lba[3:0], 9'd0} + {23'd0, sd_buff_addr}]
 			              : (dut.sd_unit == 3'd1)
 			              ? disk2[{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}]
@@ -220,7 +241,8 @@ always @(posedge clk) begin
 	else if (sd_ack && sd_wr_active) begin
 		// read a byte every other cycle (registered buffer read)
 		if (rd_phase) begin
-			if (dut.sd_unit == 3'd1)
+			if (sd_win) host_put(sd_buff_addr, sd_buff_din);
+			else if (dut.sd_unit == 3'd1)
 				disk2[{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			else
 				disk [{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
@@ -228,6 +250,7 @@ always @(posedge clk) begin
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
 				sd_wr_active <= 0;
+				if (sd_win) host_exec(3, sd_lba, 512);
 			end
 			else sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
@@ -238,6 +261,7 @@ always @(posedge clk) begin
 		sd_buff_addr <= 0;
 		rd_phase <= 0;
 		sd_wr_active <= 1;
+		sd_win <= (sd_lba >= 32'h7C00_0000);
 	end
 	if (sd_rd && !sd_ack && !sd_rd_active) sd_rd_active <= 1;
 end

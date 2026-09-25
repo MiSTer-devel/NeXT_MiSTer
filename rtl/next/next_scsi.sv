@@ -10,6 +10,16 @@
 //    sel_ptr: DMA next/limit     0x02004010-0x0200401F
 //    sel_ini: DMA init           0x02004210-0x02004213
 //
+//  The target's command responses (INQUIRY, READ CAPACITY, MODE SENSE,
+//  READ TOC, READ SUB-CHANNEL) are built by the HPS (Main_MiSTer
+//  support/next/next_scsi.cpp) and fetched as one block read of a window
+//  LBA on the CD-ROM slot: 0x7E000000 | unit<<20 | flags<<16 | op<<8 | a,
+//  bytes 510..511 carrying the response length.  CD audio transport
+//  commands and MODE SELECT are forwarded as one block write of
+//  0x7D000000 | unit<<20 | op<<8, the CDB at bytes 496..505 and the
+//  parameter list at 0.  REQUEST SENSE stays here (the sense is this
+//  engine's state), as do the sector data paths.
+//
 //  Selection reads the CDB from the FIFO; partial CDBs and selection
 //  with ATN and stop continue through transfer information. TI moves
 //  bytes in all six information phases through PIO or the DMA channel;
@@ -81,12 +91,21 @@ module next_scsi #(
 	output [31:0] sd_lba,
 	output reg    sd_rd,
 	output reg    sd_wr,
-	input         sd_ack,
+	input         sd_ack_in,
 	input   [8:0] sd_buff_addr,
 	input   [7:0] sd_buff_dout,
 	output  [7:0] sd_buff_din,
-	input         sd_buff_wr
+	input         sd_buff_wr,
+	// the CD audio engine shares the CD-ROM slot: it may only start a
+	// transfer while sd_busy is low, and this engine starts none while
+	// sd_hold is high
+	output        sd_busy,
+	input         sd_hold,
+	output reg    cd_fwd_stb     // one clock: a CD transport command was forwarded
 );
+
+// an acknowledge on the shared slot belongs to the audio engine while it holds it
+wire sd_ack = sd_ack_in & ~sd_hold;
 
 localparam STAT_VGC = 8'h08, STAT_TC = 8'h10, STAT_PE = 8'h20,
            STAT_GE  = 8'h40, STAT_INT = 8'h80;
@@ -156,7 +175,7 @@ reg  [5:0] disk_present_v = 0;
 reg  [5:0] disk_ro_v = 0;
 reg [31:0] img_blocks_v [0:SCSI_UNITS-1];   // disk size in 512 byte blocks
 reg  [2:0] t_unit = 0;           // target the connected command addresses
-assign sd_unit = t_unit;
+assign sd_unit = win_act ? 3'd3 : t_unit;   // windows live on the CD-ROM slot
 
 // The engine was written for one disk; keeping these names as views of
 // the connected target leaves every user of them unchanged.
@@ -179,17 +198,6 @@ reg  [2:0] t_lun;
 reg [31:0] lba;
 reg [15:0] blockcounter;
 
-// disk geometry for mode sense page 4 (cylinders = blocks / (4*32),
-// rounded up; the head/sector fallback geometry of SCSI_GuessGeometry)
-reg [23:0] geo_cyl_v [0:SCSI_UNITS-1];
-wire [23:0] geo_cyl = geo_cyl_v[t_unit];
-// ceil(blocks/128), retaining the former divider's 24-bit quotient wrap.
-// blocks is img_size[40:9]; bit 40 lies above that stored quotient, and
-// partial 512-byte blocks (bits 8:0) do not contribute to the geometry.
-// All slots named by a mount pulse share img_size, so one incrementer
-// serves every slot without a divider, pending queue or remount race.
-wire [23:0] mount_cyl = img_size[39:16] + {23'd0, |img_size[15:9]};
-
 //----------------------------------------------------------------------------
 // DMA channel (CHANNEL_SCSI)
 //----------------------------------------------------------------------------
@@ -204,7 +212,7 @@ reg        d_dev2m;             // last DMA CSR write bit 2
 // can issue several pumps before the first RAM acknowledgement, so retain
 // every write instead of collapsing them into one pending bit.
 reg  [3:0] dma_flush_count;
-reg  [4:0] dma_flush_return;
+reg  [5:0] dma_flush_return;
 reg        dma_flush_active;    // current memory request is a queued FLUSH
 reg  [1:0] dma_irq_resume;      // 1: retained DI bytes, 2: retained DO bytes
 // saved registers: plain storage on the non-turbo board (the engine
@@ -225,28 +233,31 @@ reg  [9:0] buf_pos, buf_limit;
 reg        buf_disk;             // 1 = buffer refills from the disk image
 
 reg  [8:0] fill_idx;
-reg  [1:0] fill_kind;
-localparam R_INQ = 2'd0, R_CAP = 2'd1, R_SENSE = 2'd2, R_MODE = 2'd3;
 
-// mode sense composition, precomputed at dispatch
-reg  [7:0] ms_page;
-reg  [1:0] ms_ctl;
-reg  [4:0] ms_hdr;               // 4 or 12
-reg  [7:0] ms_total;
+// the HPS window (see the header): the response block lands in dbuf
+localparam [31:0] WIN_RESP = 32'h7E00_0000, WIN_CMD = 32'h7D00_0000;
+reg [31:0] win_lba;
+reg  [9:0] win_alloc;            // the CDB's allocation length, clamped to a block
+reg [15:0] win_len;              // bytes 510..511 of the response block
+reg        win_act;              // a window transfer owns the CD-ROM slot
+reg        msel;                 // the DATA OUT in flight is a MODE SELECT list
+reg  [5:0] fwd_ret;              // state after a forwarded command's block write
 
 // engine states
-localparam X_IDLE    = 5'd0,  X_SEL_MSG = 5'd1,  X_SEL_CDB = 5'd2,
-           X_DISPATCH= 5'd3,  X_FILL    = 5'd4,  X_POSTCMD = 5'd5,
-           X_INT_WAIT= 5'd6,  X_RD_SECT = 5'd7,  X_SD_RD_GO= 5'd8,
-           X_SD_RD_ACK=5'd9,  X_WR_SECT = 5'd10, X_SD_WR_GO= 5'd11,
-           X_SD_WR_ACK=5'd12, X_DI_CHK  = 5'd13, X_DI_RD   = 5'd14,
-           X_DI_GET  = 5'd15, X_DI_WR   = 5'd16, X_DO_CHK  = 5'd17,
-	           X_DO_RD   = 5'd18, X_DO_PUT  = 5'd19, X_ICCS1   = 5'd20,
-	           X_ICCS2   = 5'd21, X_PIO_RD  = 5'd22, X_PIO_GET = 5'd23,
-	           X_PIO_WAIT= 5'd24, X_FDI_CHK = 5'd25, X_FDI_WAIT= 5'd26,
-	           X_FDI_GET = 5'd27, X_FDO     = 5'd28,
-	           X_TI_IN   = 5'd29, X_TI_OUT = 5'd30;
-reg  [4:0] xst;
+localparam X_IDLE    = 6'd0,  X_SEL_MSG = 6'd1,  X_SEL_CDB = 6'd2,
+           X_DISPATCH= 6'd3,  X_FILL    = 6'd4,  X_POSTCMD = 6'd5,
+           X_INT_WAIT= 6'd6,  X_RD_SECT = 6'd7,  X_SD_RD_GO= 6'd8,
+           X_SD_RD_ACK=6'd9,  X_WR_SECT = 6'd10, X_SD_WR_GO= 6'd11,
+           X_SD_WR_ACK=6'd12, X_DI_CHK  = 6'd13, X_DI_RD   = 6'd14,
+           X_DI_GET  = 6'd15, X_DI_WR   = 6'd16, X_DO_CHK  = 6'd17,
+	           X_DO_RD   = 6'd18, X_DO_PUT  = 6'd19, X_ICCS1   = 6'd20,
+	           X_ICCS2   = 6'd21, X_PIO_RD  = 6'd22, X_PIO_GET = 6'd23,
+	           X_PIO_WAIT= 6'd24, X_FDI_CHK = 6'd25, X_FDI_WAIT= 6'd26,
+	           X_FDI_GET = 6'd27, X_FDO     = 6'd28,
+	           X_TI_IN   = 6'd29, X_TI_OUT = 6'd30,
+	           X_WIN_GO  = 6'd31, X_WIN_ACK = 6'd32, X_WIN_DONE= 6'd33,
+	           X_CMD_FILL= 6'd34, X_CMD_GO  = 6'd35, X_CMD_ACK = 6'd36;
+reg  [5:0] xst;
 
 reg        sel_atn;              // current select has an identify message
 reg  [7:0] cdb0, cdb1, cdb2, cdb3, cdb4, cdb5, cdb6, cdb7, cdb8, cdb9;
@@ -306,7 +317,7 @@ reg [31:0] sd_lba_r;
 // ownership through that falling edge so the final byte of the block is not
 // discarded, while still rejecting the shared stream before our ack arrives.
 reg        sd_read_owned;
-assign sd_lba = sd_lba_r;
+assign sd_lba = win_act ? win_lba : sd_lba_r;
 
 //----------------------------------------------------------------------------
 // disk image mount and geometry (cylinders = blocks/128, rounded up).
@@ -321,7 +332,6 @@ always @(posedge clk) begin
 			disk_present_v[mk] <= (img_size != 0);
 			disk_ro_v[mk] <= img_readonly;
 			img_blocks_v[mk] <= img_size[40:9];
-			geo_cyl_v[mk] <= mount_cyl;
 		end
 	end
 end
@@ -378,9 +388,12 @@ assign rdata = sel_esp ? {`ESP_READ(a_even), `ESP_READ(a_odd)} :
 // The buffer bus from the host is one stream shared by every image slot.
 // sd_ack identifies the owner at the start, then sd_read_owned covers the
 // delayed final write strobe after hps_io has lowered sd_ack.
-wire in_sd_rd = ((xst == X_SD_RD_GO) || (xst == X_SD_RD_ACK)) &&
+wire in_sd_rd = ((xst == X_SD_RD_GO) || (xst == X_SD_RD_ACK) ||
+                 (xst == X_WIN_GO) || (xst == X_WIN_ACK)) &&
                 (sd_ack || sd_read_owned);
-wire in_sd_wr = (xst == X_SD_WR_GO) || (xst == X_SD_WR_ACK);
+wire in_sd_wr = (xst == X_SD_WR_GO) || (xst == X_SD_WR_ACK) ||
+                (xst == X_CMD_GO) || (xst == X_CMD_ACK);
+assign sd_busy = sd_rd | sd_wr | sd_read_owned | in_sd_wr | win_act;
 
 reg        eng_we;
 reg  [8:0] eng_addr;
@@ -408,55 +421,6 @@ assign sd_buff_din = db_q;
 //----------------------------------------------------------------------------
 // response byte tables
 //----------------------------------------------------------------------------
-
-function automatic [7:0] inq_byte;
-	input [7:0] i;
-	begin
-		case (i)
-			// byte 0: peripheral device type - 0x05 CD-ROM, else 0x00 disk
-			8'd00: inq_byte = (t_lun != 0) ? 8'h7F :
-			                  t_is_cd ? 8'h05 : 8'h00;
-			// byte 1: RMB (removable) set for the CD-ROM
-			8'd01: inq_byte = t_is_cd ? 8'h80 : 8'h00;
-			8'd02: inq_byte = 8'h01;   // ANSI SCSI-1
-			8'd03: inq_byte = 8'h01;   // SCSI-1 response format
-			8'd04: inq_byte = 8'h31;   // additional length
-			8'd07: inq_byte = 8'h1C;   // sync, linked
-			8'd08: inq_byte = "P"; 8'd09: inq_byte = "r"; 8'd10: inq_byte = "e";
-			8'd11: inq_byte = "v"; 8'd12: inq_byte = "i"; 8'd13: inq_byte = "o";
-			8'd14: inq_byte = "u"; 8'd15: inq_byte = "s";
-			// product id: "CD-ROM" for the optical target, "HDD" otherwise
-			8'd16: inq_byte = t_is_cd ? "C" : "H";
-			8'd17: inq_byte = t_is_cd ? "D" : "D";
-			8'd18: inq_byte = t_is_cd ? "-" : "D";
-			8'd19: inq_byte = t_is_cd ? "R" : " ";
-			8'd20: inq_byte = t_is_cd ? "O" : " ";
-			8'd21: inq_byte = t_is_cd ? "M" : " ";
-			8'd32: inq_byte = t_is_cd ? "1" : "B";
-			default: inq_byte = (i >= 8'd16 && i <= 8'd31) ? " " : 8'h00;
-		endcase
-	end
-endfunction
-
-wire [31:0] last_lba = img_blocks - 32'd1;
-// The CD-ROM reports the CD-ROM device type for the install-media scan, but
-// is read as 512-byte blocks like a disk: the NeXT boot/installer reads SCSI
-// targets with a 512-byte block size, and a CD ISO on a 512-byte target reads
-// back correctly (ISO9660's 2048-byte logical block is four host blocks).
-
-function automatic [7:0] cap_byte;
-	input [7:0] i;
-	begin
-		case (i)
-			8'd0: cap_byte = last_lba[31:24];
-			8'd1: cap_byte = last_lba[23:16];
-			8'd2: cap_byte = last_lba[15:8];
-			8'd3: cap_byte = last_lba[7:0];
-			8'd6: cap_byte = 8'h02;    // blocksize 512
-			default: cap_byte = 8'h00;
-		endcase
-	end
-endfunction
 
 function automatic [7:0] sense_byte;
 	input [7:0] i;
@@ -490,116 +454,16 @@ function automatic [3:0] key_of;
 	end
 endfunction
 
-// Mode pages provided by the reference disk target.
-function automatic [7:0] page_len;
-	input [7:0] p;
-	begin
-		case (p)
-			8'h00: page_len = 8'd4;
-			8'h01: page_len = 8'd4;
-			8'h03: page_len = 8'd24;
-			8'h04: page_len = 8'd20;
-			8'h3F: page_len = 8'd52;
-			default: page_len = 8'd0;
-		endcase
-	end
-endfunction
-
-function automatic [7:0] page0_byte;
-	input [7:0] i;
+// the CDB as the command block carries it (bytes 496..505 of dbuf)
+function automatic [7:0] cdb_byte;
+	input [3:0] i;
 	begin
 		case (i)
-			8'd1: page0_byte = 8'h02;
-			8'd2: page0_byte = 8'h80;
-			default: page0_byte = 8'h00;
-		endcase
-	end
-endfunction
-
-function automatic [7:0] page1_byte;
-	input [7:0] i;
-	begin
-		case (i)
-			8'd0: page1_byte = 8'h01;
-			8'd1: page1_byte = 8'h02;
-			8'd3: page1_byte = 8'h1B;
-			default: page1_byte = 8'h00;
-		endcase
-	end
-endfunction
-
-function automatic [7:0] page3_byte;
-	input [7:0] i;
-	begin
-		case (i)
-			8'd0: page3_byte = 8'h03;
-			8'd1: page3_byte = 8'h16;
-			8'd11: page3_byte = 8'd32;
-			8'd12: page3_byte = 8'h02;
-			8'd15: page3_byte = 8'h01;
-			8'd20: page3_byte = 8'h80;
-			default: page3_byte = 8'h00;
-		endcase
-	end
-endfunction
-
-function automatic [7:0] page4_byte;
-	input [7:0] i;
-	begin
-		case (i)
-			8'd0: page4_byte = 8'h04;
-			8'd1: page4_byte = 8'h12;
-			8'd2: page4_byte = geo_cyl[23:16];
-			8'd3: page4_byte = geo_cyl[15:8];
-			8'd4: page4_byte = geo_cyl[7:0];
-			8'd5: page4_byte = 8'd4;   // heads
-			default: page4_byte = 8'h00;
-		endcase
-	end
-endfunction
-
-function automatic [7:0] mode_byte;
-	input [7:0] i;
-	reg [7:0] off;
-	begin
-		if (i < {3'd0, ms_hdr}) begin
-			// header and block descriptor
-			case (i)
-				8'd0: mode_byte = ms_total - 8'd1;
-				8'd2: mode_byte = (disk_ro || t_is_cd) ? 8'h80 : 8'h00;
-				8'd3: mode_byte = 8'h08; // reference retains this even with DBD
-				8'd5: mode_byte = img_blocks[23:16];
-				8'd6: mode_byte = img_blocks[15:8];
-				8'd7: mode_byte = img_blocks[7:0];
-				8'd10: mode_byte = 8'h02;  // blocksize 512
-				default: mode_byte = 8'h00;
-			endcase
-		end
-		else begin
-			off = i - {3'd0, ms_hdr};
-			if (ms_page == 8'h3F)
-				mode_byte = (off < 8'd4)  ? page1_byte(off) :
-				            (off < 8'd28) ? page3_byte(off - 8'd4) :
-				            (off < 8'd48) ? page4_byte(off - 8'd28) :
-				                            page0_byte(off - 8'd48);
-			else if (ms_page == 8'h00) mode_byte = page0_byte(off);
-			else if (ms_page == 8'h01) mode_byte = page1_byte(off);
-			else if (ms_page == 8'h03) mode_byte = page3_byte(off);
-			else if (ms_page == 8'h04) mode_byte = page4_byte(off);
-			else mode_byte = 8'h00;
-		end
-	end
-endfunction
-
-function automatic [7:0] resp_byte;
-	input [1:0] kind;
-	input [8:0] i;
-	begin
-		case (kind)
-			R_INQ:   resp_byte = inq_byte(i[7:0]);
-			R_CAP:   resp_byte = cap_byte(i[7:0]);
-			R_SENSE: resp_byte = sense_byte(i[7:0]);
-			R_MODE:  resp_byte = mode_byte(i[7:0]);
+			4'd0: cdb_byte = cdb0; 4'd1: cdb_byte = cdb1; 4'd2: cdb_byte = cdb2;
+			4'd3: cdb_byte = cdb3; 4'd4: cdb_byte = cdb4; 4'd5: cdb_byte = cdb5;
+			4'd6: cdb_byte = cdb6; 4'd7: cdb_byte = cdb7; 4'd8: cdb_byte = cdb8;
+			4'd9: cdb_byte = cdb9;
+			default: cdb_byte = 8'h00;
 		endcase
 	end
 endfunction
@@ -700,6 +564,8 @@ task automatic esp_disconnect_reset;
 		sd_rd <= 0;
 		sd_wr <= 0;
 		sd_read_owned <= 0;
+		win_act <= 0;
+		msel <= 0;
 	end
 endtask
 
@@ -736,6 +602,8 @@ task automatic hard_reset;
 		sd_rd <= 0;
 		sd_wr <= 0;
 		sd_read_owned <= 0;
+		win_act <= 0;
+		msel <= 0;
 	end
 endtask
 
@@ -1090,8 +958,9 @@ always @(posedge clk) begin
 		d_next <= 0; d_limit <= 0; d_start <= 0; d_stop <= 0;
 		s_next <= 0; s_limit <= 0; s_start <= 0; s_stop <= 0;
 		buf_pos <= 0; buf_limit <= 0; buf_disk <= 0;
-		fill_idx <= 0; fill_kind <= R_INQ;
-		ms_page <= 0; ms_ctl <= 0; ms_hdr <= 0; ms_total <= 0;
+		fill_idx <= 0;
+		win_lba <= 0; win_alloc <= 0; win_len <= 0; win_act <= 0;
+		msel <= 0; fwd_ret <= X_IDLE; cd_fwd_stb <= 0;
 		xst <= X_IDLE;
 		sel_atn <= 0;
 		cdb0 <= 0; cdb1 <= 0; cdb2 <= 0; cdb3 <= 0; cdb4 <= 0;
@@ -1122,6 +991,12 @@ always @(posedge clk) begin
 		tickcnt <= tick ? 1'd0 : tickcnt + 1'd1;
 		eng_we <= 0;
 		flp_done <= 0;
+		cd_fwd_stb <= 0;
+		// the response length rides in the block's last two bytes
+		if (in_sd_rd && win_act && sd_buff_wr) begin
+			if (sd_buff_addr == 9'd510) win_len[15:8] <= sd_buff_dout;
+			if (sd_buff_addr == 9'd511) win_len[7:0]  <= sd_buff_dout;
+		end
 		if (tick && gap_us != 0) gap_us <= gap_us - 1'd1;
 
 		// A FLUSH write is synchronous in Previous, but this memory port can
@@ -1227,19 +1102,15 @@ always @(posedge clk) begin
 			xst <= X_POSTCMD;
 			case (cdb0)
 				8'h12: begin                 // INQUIRY (lun independent)
-					fill_kind <= R_INQ;
-					buf_limit <= (cdb4 > 8'd54) ? 10'd54 : {2'd0, cdb4};
-					buf_pos <= 0;
+					win_lba <= WIN_RESP | {8'd0, 1'b0, t_unit, 20'd0} |
+					           ((cmd_lun != 3'd0) ? 32'h0008_0000 : 32'd0) | 32'h1200;
+					win_alloc <= {2'd0, cdb4};
 					buf_disk <= 0;
-					fill_idx <= 0;
-					t_status <= STAT_GOOD;
-					phase <= PHASE_DI;
 					sense_code[t_unit] <= SC_NO_ERROR;
 					sense_valid[t_unit] <= 0;
-					xst <= X_FILL;
+					xst <= X_WIN_GO;
 				end
 				8'h03: begin                 // REQUEST SENSE (lun independent)
-					fill_kind <= R_SENSE;
 					buf_limit <= (cdb4 == 0) ? 10'd4 :
 					             (cdb4 > 8'd22) ? 10'd22 : {2'd0, cdb4};
 					buf_pos <= 0;
@@ -1264,16 +1135,12 @@ always @(posedge clk) begin
 							phase <= PHASE_ST;
 						end
 						8'h25: begin         // READ CAPACITY
-							fill_kind <= R_CAP;
-							buf_limit <= 10'd8;
-							buf_pos <= 0;
+							win_lba <= WIN_RESP | {8'd0, 1'b0, t_unit, 20'd0} | 32'h2500;
+							win_alloc <= 10'd8;
 							buf_disk <= 0;
-							fill_idx <= 0;
-							t_status <= STAT_GOOD;
-							phase <= PHASE_DI;
 							sense_code[t_unit] <= SC_NO_ERROR;
 							sense_valid[t_unit] <= 0;
-							xst <= X_FILL;
+							xst <= X_WIN_GO;
 						end
 						8'h08, 8'h28: begin  // READ (6) / READ (10)
 							lba <= (cdb0 == 8'h08) ? {11'd0, cdb1[4:0], cdb2, cdb3}
@@ -1315,8 +1182,7 @@ always @(posedge clk) begin
 							end
 						end
 						8'h1A: begin         // MODE SENSE
-							if (cdb2[7:6] == 2'd1 || cdb2[7:6] == 2'd3 ||
-							    page_len({2'd0, cdb2[5:0]}) == 0) begin
+							if (cdb2[7:6] == 2'd1 || cdb2[7:6] == 2'd3) begin
 								t_status <= STAT_CHECK_COND;
 								sense_code[t_unit] <= (cdb2[7:6] == 2'd3) ?
 								                          SC_SAVE_UNSUPP : SC_INVALID_CDB;
@@ -1324,21 +1190,101 @@ always @(posedge clk) begin
 								phase <= PHASE_ST;
 							end
 							else begin
-								fill_kind <= R_MODE;
-								ms_page <= {2'd0, cdb2[5:0]};
-								ms_ctl <= cdb2[7:6];
-								ms_hdr <= cdb1[3] ? 5'd4 : 5'd12;
-								ms_total <= (cdb1[3] ? 8'd4 : 8'd12)
-								          + page_len({2'd0, cdb2[5:0]});
-								buf_limit <= {2'd0, cdb4};
-								buf_pos <= 0;
+								// flags[0] = DBD; an unknown page comes back as length 0
+								win_lba <= WIN_RESP | {8'd0, 1'b0, t_unit, 20'd0} |
+								           {15'd0, cdb1[3], 16'd0} | 32'h1A00 | {24'd0, cdb2};
+								win_alloc <= {2'd0, cdb4};
 								buf_disk <= 0;
-								fill_idx <= 0;
-								t_status <= STAT_GOOD;
-								phase <= PHASE_DI;
 								sense_code[t_unit] <= SC_NO_ERROR;
 								sense_valid[t_unit] <= 0;
-								xst <= X_FILL;
+								xst <= X_WIN_GO;
+							end
+						end
+						8'h43: begin         // READ TOC (CD-ROM only)
+							if (!t_is_cd) begin
+								t_status <= STAT_CHECK_COND;
+								sense_code[t_unit] <= SC_INVALID_CMD;
+								sense_valid[t_unit] <= 0;
+								phase <= PHASE_ST;
+							end
+							else begin
+								// flags[0] = MSF, flags[2:1] = format (MMC byte 2, else byte 9)
+								win_lba <= WIN_RESP | {8'd0, 1'b0, t_unit, 20'd0} |
+								           {15'd0, cdb1[1], 16'd0} |
+								           ((cdb2[2:0] != 3'd0) ? {14'd0, cdb2[1:0], 16'd0}
+								                                : {14'd0, cdb9[7:6], 16'd0}) |
+								           32'h4300 | {24'd0, cdb6};
+								win_alloc <= ({cdb7, cdb8} > 16'd512) ? 10'd512 : {cdb7[1:0], cdb8};
+								buf_disk <= 0;
+								sense_code[t_unit] <= SC_NO_ERROR;
+								sense_valid[t_unit] <= 0;
+								xst <= X_WIN_GO;
+							end
+						end
+						8'h42: begin         // READ SUB-CHANNEL (CD-ROM only)
+							if (!t_is_cd) begin
+								t_status <= STAT_CHECK_COND;
+								sense_code[t_unit] <= SC_INVALID_CMD;
+								sense_valid[t_unit] <= 0;
+								phase <= PHASE_ST;
+							end
+							else begin
+								// flags[0] = MSF, flags[1] = SubQ; a = the sub-channel format
+								win_lba <= WIN_RESP | {8'd0, 1'b0, t_unit, 20'd0} |
+								           {14'd0, cdb2[6], cdb1[1], 16'd0} |
+								           32'h4200 | {24'd0, cdb3};
+								win_alloc <= ({cdb7, cdb8} > 16'd512) ? 10'd512 : {cdb7[1:0], cdb8};
+								buf_disk <= 0;
+								sense_code[t_unit] <= SC_NO_ERROR;
+								sense_valid[t_unit] <= 0;
+								xst <= X_WIN_GO;
+							end
+						end
+						// CD audio transport: PLAY AUDIO (10/12/MSF/TRACK), PAUSE/RESUME,
+						// STOP PLAY, REZERO, SEEK (6/10): the HPS playhead runs them
+						8'h45, 8'h47, 8'h48, 8'h4B, 8'h4E, 8'hA5, 8'h01, 8'h0B, 8'h2B: begin
+							if (!t_is_cd) begin
+								t_status <= STAT_CHECK_COND;
+								sense_code[t_unit] <= SC_INVALID_CMD;
+								sense_valid[t_unit] <= 0;
+								phase <= PHASE_ST;
+							end
+							else begin
+								win_lba <= WIN_CMD | {8'd0, 1'b0, t_unit, 20'd0} | {16'd0, cdb0, 8'd0};
+								fwd_ret <= X_POSTCMD;
+								fill_idx <= 0;
+								t_status <= STAT_GOOD;
+								sense_code[t_unit] <= SC_NO_ERROR;
+								sense_valid[t_unit] <= 0;
+								phase <= PHASE_ST;
+								xst <= X_CMD_FILL;
+							end
+						end
+						8'h15: begin         // MODE SELECT (CD-ROM: the audio ports page)
+							if (!t_is_cd) begin
+								t_status <= STAT_CHECK_COND;
+								sense_code[t_unit] <= SC_INVALID_CMD;
+								sense_valid[t_unit] <= 0;
+								phase <= PHASE_ST;
+							end
+							else begin
+								win_lba <= WIN_CMD | {8'd0, 1'b0, t_unit, 20'd0} | 32'h1500;
+								t_status <= STAT_GOOD;
+								sense_code[t_unit] <= SC_NO_ERROR;
+								sense_valid[t_unit] <= 0;
+								buf_disk <= 0;
+								buf_pos <= 0;
+								if (cdb4 == 0) begin
+									fwd_ret <= X_POSTCMD;
+									fill_idx <= 0;
+									phase <= PHASE_ST;
+									xst <= X_CMD_FILL;
+								end
+								else begin
+									buf_limit <= {2'd0, cdb4};
+									msel <= 1;
+									phase <= PHASE_DO;
+								end
 							end
 						end
 						8'h07: begin         // REASSIGN BLOCKS: reference no-op
@@ -1347,11 +1293,17 @@ always @(posedge clk) begin
 							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
 						end
-						8'h1B: begin         // START/STOP (ship)
+						8'h1B: begin         // START/STOP (ship); the CD-ROM's stops audio
 							t_status <= STAT_GOOD;
 							sense_code[t_unit] <= SC_NO_ERROR;
 							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
+							if (t_is_cd) begin
+								win_lba <= WIN_CMD | {8'd0, 1'b0, t_unit, 20'd0} | 32'h1B00;
+								fwd_ret <= X_POSTCMD;
+								fill_idx <= 0;
+								xst <= X_CMD_FILL;
+							end
 						end
 						8'h04: begin         // FORMAT DRIVE
 							t_status <= STAT_GOOD;
@@ -1370,21 +1322,87 @@ always @(posedge clk) begin
 			endcase
 		end
 
-		// fill the buffer with a response table
+		// fill the buffer with the sense data
 		X_FILL: begin
 			if ({1'b0, fill_idx} < buf_limit) begin
 				eng_we <= 1;
 				eng_addr <= fill_idx;
-				eng_wd <= resp_byte(fill_kind, fill_idx);
+				eng_wd <= sense_byte(fill_idx[7:0]);
 				fill_idx <= fill_idx + 1'd1;
 			end
 			else begin
-				// the total length is clamped to the allocation; a zero
-				// length answer goes straight to status phase
-				if (fill_kind == R_MODE && buf_limit > {2'd0, ms_total})
-					buf_limit <= {2'd0, ms_total};
 				if (buf_limit == 0) phase <= PHASE_ST;
 				xst <= X_POSTCMD;
+			end
+		end
+
+		// fetch a response block from the HPS window into the buffer
+		X_WIN_GO: begin
+			if (sd_ack) begin
+				sd_rd <= 0;
+				sd_read_owned <= 1;
+				xst <= X_WIN_ACK;
+			end
+			else if (!sd_hold && !win_act) begin
+				sd_rd <= 1;
+				win_act <= 1;
+				win_len <= 0;
+			end
+		end
+
+		X_WIN_ACK: begin
+			if (!sd_ack) begin
+				sd_read_owned <= 0;
+				win_act <= 0;
+				xst <= X_WIN_DONE;
+			end
+		end
+
+		// the length landed with the last write strobe of the block
+		X_WIN_DONE: begin
+			buf_pos <= 0;
+			if (win_len == 0) begin
+				t_status <= STAT_CHECK_COND;
+				sense_code[t_unit] <= SC_INVALID_CDB;
+				sense_valid[t_unit] <= 0;
+				phase <= PHASE_ST;
+			end
+			else begin
+				t_status <= STAT_GOOD;
+				phase <= (win_alloc == 0) ? PHASE_ST : PHASE_DI;
+				buf_limit <= ({6'd0, win_alloc} < win_len) ? win_alloc :
+				             (win_len > 16'd512) ? 10'd512 : win_len[9:0];
+			end
+			xst <= X_POSTCMD;
+		end
+
+		// forward a command: the CDB into bytes 496.., then the block write
+		X_CMD_FILL: begin
+			if (fill_idx < 9'd10) begin
+				eng_we <= 1;
+				eng_addr <= 9'd496 + fill_idx;
+				eng_wd <= cdb_byte(fill_idx[3:0]);
+				fill_idx <= fill_idx + 1'd1;
+			end
+			else xst <= X_CMD_GO;
+		end
+
+		X_CMD_GO: begin
+			if (sd_ack) begin
+				sd_wr <= 0;
+				xst <= X_CMD_ACK;
+			end
+			else if (!sd_hold && !win_act) begin
+				sd_wr <= 1;
+				win_act <= 1;
+			end
+		end
+
+		X_CMD_ACK: begin
+			if (!sd_ack) begin
+				win_act <= 0;
+				cd_fwd_stb <= 1;
+				xst <= fwd_ret;
 			end
 		end
 
@@ -1823,6 +1841,7 @@ always @(posedge clk) begin
 					counter <= counter - 1'd1;
 					if (buf_pos + 1'd1 == buf_limit) begin
 						if (buf_disk) xst <= X_WR_SECT;
+						else if (msel) begin msel <= 0; fill_idx <= 0; fwd_ret <= X_DO_CHK; phase <= PHASE_ST; xst <= X_CMD_FILL; end
 						else begin phase <= PHASE_ST; xst <= X_DO_CHK; end
 					end
 				end
@@ -1848,6 +1867,7 @@ always @(posedge clk) begin
 				counter <= counter - 1'd1;
 				if (buf_pos + 1'd1 == buf_limit) begin
 					if (buf_disk) xst <= X_WR_SECT;
+					else if (msel) begin msel <= 0; fill_idx <= 0; fwd_ret <= X_DO_CHK; phase <= PHASE_ST; xst <= X_CMD_FILL; end
 					else begin
 						phase <= PHASE_ST;
 						xst <= X_DO_CHK;
@@ -1935,6 +1955,7 @@ always @(posedge clk) begin
 				if (mode_dma) counter <= counter - 1'd1;
 				if (buf_pos + 1'd1 == buf_limit) begin
 					if (buf_disk) xst <= X_WR_SECT;
+					else if (msel) begin msel <= 0; fill_idx <= 0; fwd_ret <= X_FDO; phase <= PHASE_ST; xst <= X_CMD_FILL; end
 					else begin
 						phase <= PHASE_ST;
 						xst <= X_FDO;

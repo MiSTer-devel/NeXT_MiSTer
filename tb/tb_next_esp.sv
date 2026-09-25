@@ -40,7 +40,7 @@ next_scsi #(.CLK_HZ(1000000)) dut
 	.int_scsi_dma(),
 	.img_mounted(6'b000000), .img_readonly(1'b0), .img_size(64'd0),
 	.sd_unit(),
-	.sd_lba(), .sd_rd(), .sd_wr(), .sd_ack(1'b0),
+	.sd_lba(), .sd_rd(), .sd_wr(), .sd_ack_in(1'b0), .sd_hold(1'b0),
 	.sd_buff_addr(9'd0), .sd_buff_dout(8'd0), .sd_buff_din(),
 	.sd_buff_wr(1'b0)
 );

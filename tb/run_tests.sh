@@ -43,14 +43,29 @@ CPUSRC="$CPU/ap040_tg68k_compat.v $CPU/ap040_core.v $CPU/ap040_bus16_adapter.v \
 NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
-         $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_enet_dma.sv \
-         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_snd_in.sv $RTL/next_audio_adc.sv $RTL/next_rs.sv \
+         $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_cd_audio.sv $RTL/next_enet_dma.sv \
+         $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_snd_in.sv $RTL/next_audio_adc.sv \
          $RTL/next_floppy.sv $RTL/next_printer.sv \
          $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
          $RTL/next_enet_bridge.sv $RTL/next_exception_mailbox.sv $RTL/next_exception_trigger.sv $RTL/dpram.v"
 
 echo "== converting boot ROM =="
 python3 rom2hex.py "$ROM" "$WORK/rom.hex"
+
+# The SCSI target responses, the CD audio playhead and the MO's Reed-Solomon
+# codec run on the HPS (Main_MiSTer support/next).  The benches co-simulate
+# the real sources through DPI-C, and a native test checks them alone.
+echo "== syncing the Main-served SCSI/MO code =="
+sh host/sync_main.sh "$WORK/host" || exit 1
+HOSTSRC="host/next_host_dpi.cpp host/shim_impl.cpp \
+         $WORK/host/support/next/next_scsi.cpp $WORK/host/support/next/next_cdrom.cpp \
+         $WORK/host/support/next/next_cdrom_resp.cpp $WORK/host/support/next/next_cdrom_play.cpp \
+         $WORK/host/support/next/next_mo.cpp $WORK/host/support/next/next_rs.cpp"
+HOSTINC="-CFLAGS -I$(pwd)/$WORK/host"
+echo "== building the native host test =="
+g++ -O1 -Wall -I"$WORK/host" -o "$WORK/host/test_next_host" host/test_next_host.cpp host/shim_impl.cpp \
+    "$WORK"/host/support/next/*.cpp > "$WORK/host/build.log" 2>&1 || {
+	echo "*** host test build FAILED (see tb/$WORK/host/build.log)"; exit 1; }
 
 vbuild() {
 	top=$1; shift
@@ -68,13 +83,11 @@ vbuild tb_next_scc       tb_next_scc.sv $RTL/next_scc.sv
 vbuild tb_next_esp       tb_next_esp.sv $RTL/next_scsi.sv
 vbuild tb_next_floppy    tb_next_floppy.sv $RTL/next_floppy.sv
 vbuild tb_next_flpdma    tb_next_flpdma.sv $RTL/next_floppy.sv $RTL/next_scsi.sv
-vbuild tb_next_scsi      tb_next_scsi.sv $RTL/next_scsi.sv
-vbuild tb_next_scsi_geometry tb_next_scsi_geometry.sv $RTL/next_scsi.sv
+vbuild tb_next_scsi      tb_next_scsi.sv $RTL/next_scsi.sv $HOSTSRC $HOSTINC
 vbuild tb_next_enet      tb_next_enet.sv $RTL/next_enet_dma.sv
 vbuild tb_next_bridge    tb_next_bridge.sv $RTL/next_enet_dma.sv $RTL/next_enet_bridge.sv
 vbuild tb_next_ddram_arb tb_next_ddram_arb.sv $RTL/next_ddram_arb.sv
-vbuild tb_next_rs        tb_next_rs.sv $RTL/next_rs.sv
-vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $RTL/next_rs.sv
+vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $HOSTSRC $HOSTINC
 vbuild tb_next_snd       tb_next_snd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_snd_in    tb_next_snd_in.sv $RTL/next_snd_in.sv $RTL/next_kms_snd.sv
 vbuild tb_next_audio_adc tb_next_audio_adc.sv $RTL/next_audio_adc.sv ../sys/ltc2308.sv
@@ -84,7 +97,7 @@ vbuild tb_next_printer   tb_next_printer.sv $RTL/next_printer.sv
 vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
-vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC
+vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC $HOSTSRC $HOSTINC
 vbuild tb_next_recording -I"$CPU" tb_next_recording.sv $NEXTSRC $CPUSRC
 
 # The emu top is only ever compiled by Quartus, so a duplicate
@@ -116,18 +129,17 @@ run() {
 	fi
 }
 
+run test_host    "$WORK/host/test_next_host" rs_vectors.hex
 run tb_rtc       "$WORK/vl_tb_next_rtc/tb_next_rtc"
 run tb_bmap      "$WORK/vl_tb_next_bmap/tb_next_bmap"
 run tb_scc       "$WORK/vl_tb_next_scc/tb_next_scc"
 run tb_esp       "$WORK/vl_tb_next_esp/tb_next_esp"
 run tb_scsi      "$WORK/vl_tb_next_scsi/tb_next_scsi"
-run tb_scsi_geometry "$WORK/vl_tb_next_scsi_geometry/tb_next_scsi_geometry"
 run tb_floppy    "$WORK/vl_tb_next_floppy/tb_next_floppy"
 run tb_flpdma    "$WORK/vl_tb_next_flpdma/tb_next_flpdma"
 run tb_enet      "$WORK/vl_tb_next_enet/tb_next_enet"
 run tb_bridge    "$WORK/vl_tb_next_bridge/tb_next_bridge"
 run tb_ddram_arb "$WORK/vl_tb_next_ddram_arb/tb_next_ddram_arb"
-run tb_rs        "$WORK/vl_tb_next_rs/tb_next_rs"
 run tb_mo        "$WORK/vl_tb_next_mo/tb_next_mo"
 run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
 run tb_snd_in    "$WORK/vl_tb_next_snd_in/tb_next_snd_in"
