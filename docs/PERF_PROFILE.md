@@ -220,19 +220,31 @@ Hardware (2026-09-25, `NeXT_20260924.rbf`, Main next-fixes 7f34486): the
 POST passes (the ROM's own delay check), NeXTSTEP 3.3 boots to the login
 window, NWBench Run All:
 
-| NWBench | 1/2 pacing (2026-09-24) | DBcc floor |
-|---|---|---|
-| Dhrystone | 4,286 | **6,591** (4.18 guest MIPS), x1.54 |
-| Graphics V/V, D/V | 28.5, 31.6 | 20.5, 24.3 |
-| Compile | - | 416.5 s |
-| Webster | - | 296.0 s |
-| Disk | - | 525.3 KB/s |
-| Ethernet | - | 8.47 KB/s |
+NWBench reports guest units. The guest second is `CLK_HZ` clocks on the
+28 MHz clock: 1.786 real s on the old-CPU build (`CLK_HZ` 50 MHz), 0.893
+real s on the Quadra-CPU builds (25 MHz). Real-time figures below convert
+that way (rates x 0.56 / x 1.12, times x 1.786 / x 0.893).
 
-The Dhrystone gain is 1.54x, not the 2x of a purely cached loop: the
-profile's run D said the same for the busy kernel mix (about 20% more work
-per clock), and Dhrystone as NWBench builds it evidently spends a third of
-its clocks on the bus.
+| NWBench | old CPU, build 0914 (2026-09-24 17:12) | Quadra CPU, 1/2 pacing (2026-09-24) | Quadra CPU, DBcc floor (2026-09-25) |
+|---|---|---|---|
+| Dhrystone (guest) | 7,812 (4.96 MIPS) | 4,286 (2.72 MIPS) | **6,591** (4.18 MIPS) |
+| Dhrystone, real | 4,375/s | 4,800/s | **7,382/s** (x1.69 over 0914) |
+| Graphics V/V, D/V (guest s) | 16.1, 18.4 | 28.5, 31.6 | 20.5, 24.3 |
+| Graphics V/V, D/V, real s | 28.7, 32.9 | 25.4, 28.2 | **18.3, 21.7** |
+| Compile (guest s / real s) | 315.9 / 564 | - | 416.5 / **372** |
+| Webster (guest s / real s) | 232.5 / 415 | - | 296.0 / **264** |
+| Disk (guest KB/s / real) | 930.7 / 521 | - | 525.3 / 588 |
+| Ethernet (guest KB/s / real) | 14.5 / 8.1 | - | 8.47 / 9.5 |
+
+So the 1/2-paced Quadra build was about 10% faster than 0914 in real
+Dhrystone time but slower on the graphics tests, and looked much slower in
+guest units because its guest clock runs twice as fast. With the DBcc
+floor the machine is 1.69x the 0914 build on Dhrystone, 1.5x on Compile
+and 1.57x on Webster in real time; the disk and ethernet rates are within
+15% either way. The Dhrystone gain over the paced build is 1.54x, not the
+2x of a purely cached loop: the profile's run D said the same for the busy
+kernel mix (about 20% more work per clock), and Dhrystone as NWBench
+builds it evidently spends a third of its clocks on the bus.
 
 ## Area work: the HPS-served SCSI responses, CD audio and MO ECC (2026-09-25)
 
