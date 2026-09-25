@@ -3,7 +3,8 @@
 //  MiSTer DDRAM handshake) and the ethernet bridge mailbox (port B,
 //  simple req/ack), serialized onto the single DDRAM interface.
 //
-//  Both masters issue single-beat operations.  Port A has priority;
+//  Port A's reads are bursts (a_burst beats, the line fill of next_ddram);
+//  port B's operations are single beats.  Port A has priority;
 //  while port B owns the bus, port A sees BUSY and holds its request,
 //  which is exactly the DDRAM contract next_ddram already follows.
 //============================================================================
@@ -48,6 +49,7 @@ localparam G_A = 2'd0, G_B_ISSUE = 2'd1, G_B_READ = 2'd2;
 
 reg [1:0] gst;
 reg       a_read_pending;
+reg [7:0] a_beats;          // beats of port A's read still to come
 
 // port A owns the bus by default; B gets it only when A is idle
 wire a_active = a_rd | a_we | a_read_pending;
@@ -75,14 +77,21 @@ always @(posedge clk) begin
 	if (reset) begin
 		gst <= G_A;
 		a_read_pending <= 0;
+		a_beats <= 0;
 		b_rdata <= 0;
 	end
 	else begin
 		// track port A's outstanding read so B never steals the bus
-		// between acceptance and data return
+		// between acceptance and the LAST beat of the data return
 		if (!b_owns) begin
-			if (a_rd && !DDRAM_BUSY) a_read_pending <= 1;
-			if (DDRAM_DOUT_READY) a_read_pending <= 0;
+			if (a_rd && !DDRAM_BUSY) begin
+				a_read_pending <= 1;
+				a_beats <= (a_burst == 0) ? 8'd1 : a_burst;
+			end
+			else if (DDRAM_DOUT_READY && a_read_pending) begin
+				if (a_beats <= 8'd1) a_read_pending <= 0;
+				a_beats <= a_beats - 1'd1;
+			end
 		end
 
 		case (gst)

@@ -87,6 +87,7 @@ vbuild tb_next_scsi      tb_next_scsi.sv $RTL/next_scsi.sv $HOSTSRC $HOSTINC
 vbuild tb_next_enet      tb_next_enet.sv $RTL/next_enet_dma.sv
 vbuild tb_next_bridge    tb_next_bridge.sv $RTL/next_enet_dma.sv $RTL/next_enet_bridge.sv
 vbuild tb_next_ddram_arb tb_next_ddram_arb.sv $RTL/next_ddram_arb.sv
+vbuild tb_next_ddram     tb_next_ddram.sv $RTL/next_ddram.sv
 vbuild tb_next_mo        tb_next_mo.sv $RTL/next_mo.sv $HOSTSRC $HOSTINC
 vbuild tb_next_snd       tb_next_snd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_snd_in    tb_next_snd_in.sv $RTL/next_snd_in.sv $RTL/next_kms_snd.sv
@@ -140,6 +141,7 @@ run tb_flpdma    "$WORK/vl_tb_next_flpdma/tb_next_flpdma"
 run tb_enet      "$WORK/vl_tb_next_enet/tb_next_enet"
 run tb_bridge    "$WORK/vl_tb_next_bridge/tb_next_bridge"
 run tb_ddram_arb "$WORK/vl_tb_next_ddram_arb/tb_next_ddram_arb"
+run tb_ddram     "$WORK/vl_tb_next_ddram/tb_next_ddram"
 run tb_mo        "$WORK/vl_tb_next_mo/tb_next_mo"
 run tb_snd       "$WORK/vl_tb_next_snd/tb_next_snd"
 run tb_snd_in    "$WORK/vl_tb_next_snd_in/tb_next_snd_in"
