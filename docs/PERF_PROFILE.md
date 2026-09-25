@@ -384,7 +384,7 @@ each unpaced, `+pace`, `+pace +paceshift`, `+dbccfloor=4`: all pass;
 boot bench `+loopdump` 4.0; the device suites and smoke boots pass (the
 pre-existing `tb_rtc` and OSD-check failures only); the POST passes
 (`delay(1000)` measured 1008 us).  The kernel-phase profile boots are in
-"Stage 3 profile" below when they finish.
+"Stage 3 profile" below.
 
 Fit, `NEXT_FIT_QUADRA=1`: seed 9, 38,798 ALMs (93%, +143 over stage 2's
 38,655), 478 M10K, CPU-clock setup +0.84 ns, HDMI PLL domain -0.148 ns
@@ -414,6 +414,26 @@ store from ~22 to ~14 (one beat instead of two sub-cycles with a gap).
 NWBench and NXBench on this build: not yet run (the board was handed
 back).
 
+### Stage 3 profile (simulation, `+bootsd` to 2,400M clocks, kernel phase ~1,955M clocks)
+
+| | stage 2, lat 6 | stage 3, lat 6 | stage 3, lat 12 |
+|---|---|---|---|
+| cache fills avg | 55 clocks | **34.4** | 40.5 |
+| ram wait | 11% | **6.7%** | 8.4% |
+| bus total | - | 15.9% | 17.6% |
+| internal run (core enabled, bus idle) | - | 84.1% | 82.4% |
+| cache pass (uncached) clocks | - | 7.5% | 7.7% |
+| RAM port transactions | - | 33.9M (writes 14.3M) | 34.0M |
+
+ALL PASS at both latencies.  The RAM-port latency histogram has its
+peaks at 2 and 3 clocks (retained-line hits, 27.8M of 33.9M requests)
+and at 11-12 clocks (the DDR miss at latency 6; 17-18 at latency 12): the
+beat port halved the transaction count and took the adapter gaps out
+("subcycle gap" 0.0%), and with the core running through bus waits the
+"internal gated" share is 0 (the DBcc floor's stalls are inside
+"internal run" now, they gate idle clocks only).  The fill avg of 34.4
+matches the hardware's ~32.
+
 ### HDMI PLL domain: the seed walk is the recipe
 
 `quartus_sta` on the seed-9 stage-2 database (`report_timing -to_clock
@@ -436,5 +456,37 @@ far: the CPU suite on the 32-bit bench with the bench-side line provider
 (`+lineprov`, up to 612 fill words copied per program) under all four
 clock-enable policies passes; device suites and smoke boots pass; POST
 passes.  Fit: seed 10, 38,726 ALMs (92%), 478 M10K, timing closed (HDMI
-+0.019 ns): `releases/NeXT_20260925_stage3_2b.rbf`, release-gated, not yet
-on hardware; its kernel-phase profile boot is pending.
++0.019 ns): `releases/NeXT_20260925_stage3_2b.rbf`, release-gated.
+
+### Stage 2b profile (simulation, `+bootsd` to 2,400M clocks, kernel phase ~1,955M clocks)
+
+| | stage 3, lat 6 | stage 3 + 2b, lat 6 | stage 3 + 2b, lat 12 |
+|---|---|---|---|
+| cache fills avg | 34.4 clocks | **19.4** | 25.4 |
+| fill words from the retained line | - | 3.00 of 4 per fill | 3.00 of 4 |
+| ram wait | 6.7% | **5.2%** | 6.8% |
+| bus total | 15.9% | 11.4% | 13.0% |
+| RAM port transactions | 33.9M | **19.1M** | 19.2M |
+
+ALL PASS at both latencies.  Every fill takes its first beat over the bus
+and the other three from the sideband, so the RAM port sees one
+transaction per fill and the 2-clock "line hit" peak of the latency
+histogram is gone (34k instead of 14.7M).
+
+### Stage 2b on hardware (2026-09-25 10:45, `NeXT_20260925_stage3_2b.rbf`)
+
+POST, NeXTSTEP boot, root login, `tb/hw/memlat.c` (guest us = 25 clocks):
+
+| access | stage 2, clocks | stage 3, clocks | stage 3 + 2b, guest ns | clocks |
+|---|---|---|---|---|
+| cached longword load loop | 8.0 | 7.9 | 307.3 | 7.7 |
+| stride-4 byte read (4 per line) | 25.2 | 18.6 | 611.7 | **15.3** |
+| stride-16 byte read (one line fill each) | 63.8 | 39.6 | 1,129.8 | **28.2** (fill ~20) |
+| stride-64 byte read | 66.5 | 41.1 | 1,164.5 | 29.1 |
+| stride-16 longword read | 67.8 | 43.6 | 1,212.8 | 30.3 |
+| sequential longword store | 29.8 | 21.9 | 862.1 | 21.6 |
+
+The fill is now ~20 clocks on hardware (one DDR round trip plus three
+1-clock copies), a third of the 56 it cost on the stage 2 build and less
+than a sixth of the 130-145 of the 0914 build; the store is unchanged
+from stage 3, as expected.  NWBench / NXBench on this build: not yet run.
