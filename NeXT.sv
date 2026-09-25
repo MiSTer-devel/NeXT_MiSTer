@@ -243,14 +243,18 @@ wire [511:0] dbg_exception;
 // CLK_HZ sets the machine's microsecond tick: with the 28 MHz system
 // clock this is a virtual microsecond (the machine runs at 112 percent
 // of real time, uniformly), chosen to satisfy the boot ROM's CPU-speed
-// calibration invariant (see CPU_PACE_* in next_system.sv).  The Quadra
-// 800 AP68040 tree runs the ROM's cached DBF delay() loop in 2 clocks
-// per iteration (measured, docs/CPU_NEXT_PORT.md); paced to 1 of every
-// 2 clocks that is 4, so 6.25 iterations per microsecond need 25 clocks.
+// calibration invariant (see DBCC_FLOOR in next_system.sv):
+//     (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR
+// The ROM's delay() loop is a bare dbf, which the Quadra 800 AP68040
+// tree runs in 2 clocks per iteration (measured, docs/CPU_NEXT_PORT.md);
+// the host keeps consecutive DBcc executions 4 enabled clocks apart, as
+// on a real 68040, so 6.25 iterations per microsecond need 25 clocks.
+// Nothing else is slowed (CPU_PACE 1/1).
 next_system #(
 	.CLK_HZ(25000000),
+	.DBCC_FLOOR(4),
 	.CPU_PACE_NUM(1),
-	.CPU_PACE_DEN(2),
+	.CPU_PACE_DEN(1),
 	.CLK_REAL_HZ(28000000),   // the real clk_sys, so the clock keeps time
 	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
 ) system

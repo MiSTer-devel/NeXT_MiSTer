@@ -51,8 +51,11 @@ wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
 // exactly the FPGA parameterization: virtual microsecond of 25 clocks,
-// CPU paced 1 of 2 (the physical simulation clock rate is immaterial,
-// the clock ratios are what the ROM's calibration checks measure)
+// DBcc period floor of 4 enabled clocks, no pacing (the physical
+// simulation clock rate is immaterial, the clock ratios are what the
+// ROM's calibration checks measure).  -DNEXT_TB_CLK_HZ=, -DNEXT_TB_DBCC_FLOOR=
+// and -DNEXT_TB_PACE_DEN= override the three for experiments (the old
+// configuration is FLOOR 0, DEN 2).
 `ifdef NEXT_PROFILE
 // bench-side cycle accounting (tb/next_profile_monitor.sv), -DNEXT_PROFILE
 next_profile_monitor prof();
@@ -64,11 +67,16 @@ next_system #(
 `else
 	.CLK_HZ(25000000),
 `endif
+`ifdef NEXT_TB_DBCC_FLOOR
+	.DBCC_FLOOR(`NEXT_TB_DBCC_FLOOR),
+`else
+	.DBCC_FLOOR(4),
+`endif
 	.CPU_PACE_NUM(1),
 `ifdef NEXT_TB_PACE_DEN
 	.CPU_PACE_DEN(`NEXT_TB_PACE_DEN),
 `else
-	.CPU_PACE_DEN(2),
+	.CPU_PACE_DEN(1),
 `endif
 	.ROM_INIT_EN(1),
 	.ROM_INIT("build/rom.hex"),

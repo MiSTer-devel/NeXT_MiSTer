@@ -25,23 +25,38 @@
 //============================================================================
 
 module next_system #(
-	parameter CLK_HZ      = 100000000,
-	// Internal (cached) CPU cycles advance NUM of every DEN clocks
-	// (bus cycles are never gated).  The boot ROM's delay() is a
-	// calibrated DBF loop, self-checked by the POST event counter test
+	parameter CLK_HZ      = 25000000,
+	// CPU speed calibration.  The boot ROM's delay() is a calibrated
+	// bare "dbf d0,*" loop, self-checked by the POST event counter test
 	// against a 899..1100 us window for delay(1000): 6.25 loop
-	// iterations per microsecond TICK of this module.  The core runs a
-	// cached DBF-taken in ~8 clocks (measured in full-POST simulation),
-	// so the calibration invariant is
-	//     (CLK_HZ / 1e6) * (CPU_PACE_NUM / CPU_PACE_DEN) = 50
-	// clocks per microsecond tick.  CLK_HZ defines the microsecond of
-	// every timer in this system, so it may be a VIRTUAL microsecond:
-	// the FPGA build runs the 32 MHz clock with CLK_HZ = 50 MHz and
-	// pacing off, making the machine uniformly 64 percent of real time
-	// but internally consistent with the calibration.  The defaults
-	// below (100 MHz, 1/2) satisfy the same invariant.
+	// iterations per microsecond TICK of this module, i.e. the ROM
+	// assumes a real 68040's 4 clocks per taken DBcc.  The AP68040 runs
+	// that loop in 2 clocks through its DBcc fast path, so the host
+	// prices DBcc the way the real chip (and Previous's 68040 timing
+	// model, gencpu.c adjust_cycles: DBcc = 4 cycles) does: consecutive
+	// executions of DBcc are kept at least DBCC_FLOOR enabled clocks
+	// apart by gating the core's clock enable on idle clocks only, and
+	// no other instruction is slowed.  The calibration invariant is
+	//     (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR
+	// clocks per microsecond tick (25 MHz for a floor of 4).  CLK_HZ
+	// defines the microsecond of every timer in this system, so it may
+	// be a VIRTUAL microsecond: the FPGA build runs the 28 MHz clock with
+	// CLK_HZ = 25 MHz, making the machine uniformly 112 percent of real
+	// time but internally consistent with the calibration.
+	//
+	// DBCC_FLOOR is the count of enabled clocks between entries into the
+	// core's S_DBCC1 state (read from debug_status[231:224]; the encoding
+	// 8'd53 must be re-checked on every CPU drop, docs/CPU_NEXT_PORT.md);
+	// 0 turns the floor off.  A DBcc followed by a bus cycle hides its
+	// stall under the bus wait, so memcpy-shaped loops are not affected.
+	parameter DBCC_FLOOR   = 4,
+	// The older, coarser calibration: internal (cached) CPU cycles
+	// advance NUM of every DEN clocks (bus cycles are never gated), i.e.
+	// the whole CPU is slowed.  1/1 = off, the default; 1/2 with a floor
+	// of 0 is the previous 25 MHz configuration, kept selectable for
+	// comparison.
 	parameter CPU_PACE_NUM = 1,
-	parameter CPU_PACE_DEN = 2,
+	parameter CPU_PACE_DEN = 1,
 	// physical clock rate, for the battery backed time of day
 	parameter CLK_REAL_HZ = CLK_HZ,
 	parameter ROM_INIT_EN = 0,
@@ -234,16 +249,50 @@ wire [15:0] pr_rdata;
 
 wire  [2:0] ipl_level;
 
-// fractional pacing of internal cycles (see CPU_PACE_* above)
-reg [$clog2(CPU_PACE_DEN)-1:0] pace_acc = 0;
+// fractional pacing of internal cycles (see CPU_PACE_* above; 1/1 = off)
+localparam PACE_W = (CPU_PACE_DEN > 1) ? $clog2(CPU_PACE_DEN) : 1;
+reg [PACE_W-1:0] pace_acc = 0;
 wire pace = pace_acc < CPU_PACE_NUM;
 always @(posedge clk)
 	pace_acc <= (pace_acc == CPU_PACE_DEN-1) ? 1'd0 : pace_acc + 1'd1;
 
-wire clkena = ((busstate == 2'b01) & pace) | mem_ready | berr_hold;
-
 wire [255:0] debug_status;
 assign dbg_pc  = debug_status[31:0];
+
+// DBcc period floor (see DBCC_FLOOR above): consecutive entries into the
+// core's S_DBCC1 state are kept DBCC_FLOOR ENABLED clocks apart.  The
+// entry is seen one clock after the core took the state (debug_status
+// carries the state register), so the owed stall lands on the state
+// after it; only idle clocks are gated, exactly as CPU_PACE gates them.
+// dbcc_since counts enabled clocks, the entry clock included, since the
+// last entry, saturating at the floor: a stall must not count toward
+// the next interval, or the loop settles below the floor.
+localparam DBCC_S = 8'd53;      // ap040_core.v S_DBCC1: re-check on every CPU drop
+localparam [2:0] DBCC_FLOOR_W = DBCC_FLOOR;
+wire       in_dbcc    = (debug_status[231:224] == DBCC_S);
+reg        dbcc_prev  = 0;      // in_dbcc last clock
+reg  [2:0] dbcc_since = DBCC_FLOOR_W;
+reg  [2:0] dbcc_left  = 0;      // stall clocks still owed
+wire       dbcc_entry = in_dbcc & ~dbcc_prev;
+wire       dbcc_stall = (dbcc_left != 0);
+
+wire clkena = ((busstate == 2'b01) & pace & ~dbcc_stall) | mem_ready | berr_hold;
+
+always @(posedge clk) begin
+	dbcc_prev <= in_dbcc;
+	if (reset) begin
+		dbcc_left  <= 0;
+		dbcc_since <= DBCC_FLOOR_W;
+	end
+	else if (dbcc_entry) begin
+		dbcc_left  <= (dbcc_since < DBCC_FLOOR_W) ? DBCC_FLOOR_W - dbcc_since : 3'd0;
+		dbcc_since <= clkena ? 3'd1 : 3'd0;
+	end
+	else begin
+		if (dbcc_left != 0) dbcc_left <= dbcc_left - 1'd1;
+		if (clkena && dbcc_since != DBCC_FLOOR_W) dbcc_since <= dbcc_since + 1'd1;
+	end
+end
 assign dbg_ipl = ipl_level;
 
 ap040_tg68k_compat #(

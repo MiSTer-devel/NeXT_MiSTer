@@ -91,8 +91,32 @@ always @(posedge clk) begin
 		dbcc_left <= dbcc_left - 1;
 	dbcc_prev <= dut.core.state;
 end
-wire        dbcc_ok = (dbcc_left == 0);
+// +dbccfloor=N: the NeXT host's gate pattern verbatim (rtl/next/next_system.sv
+// DBCC_FLOOR): consecutive entries into S_DBCC1 are kept at least N ENABLED
+// clocks apart, the entry clock included, with only idle clocks gated.  A
+// regression leg of the suite (alongside +pace / +pace +paceshift).
+integer     dbcc_floor_n = 0;
+integer     dbcc_since = 0;
+integer     dbcc_owed = 0;
+reg         dbcc_in_prev = 0;
+initial if ($value$plusargs("dbccfloor=%d", dbcc_floor_n)) dbcc_since = dbcc_floor_n;
+wire        dbcc_in    = (dut.core.state == 8'd53);
+wire        dbcc_entry = dbcc_in & ~dbcc_in_prev;
+wire        dbcc_ok = (dbcc_left == 0) && (dbcc_owed == 0);
 wire        clkena_in = ((busstate == 2'b01) & pace_en & dbcc_ok) | mem_ready | berr;
+always @(posedge clk) begin
+	dbcc_in_prev <= dbcc_in;
+	if (dbcc_floor_n != 0) begin
+		if (dbcc_entry) begin
+			dbcc_owed  <= (dbcc_since < dbcc_floor_n) ? dbcc_floor_n - dbcc_since : 0;
+			dbcc_since <= clkena_in ? 1 : 0;
+		end
+		else begin
+			if (dbcc_owed != 0) dbcc_owed <= dbcc_owed - 1;
+			if (clkena_in && dbcc_since != dbcc_floor_n) dbcc_since <= dbcc_since + 1;
+		end
+	end
+end
 
 reg   [2:0] ipl_lvl;
 reg  [15:0] ipl_delay = 0;   // $F148: delayed level-2 IPL countdown

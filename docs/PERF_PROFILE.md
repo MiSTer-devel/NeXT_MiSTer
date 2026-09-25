@@ -189,3 +189,27 @@ validation path: the CPU suite with a `+dbccstall` leg next to
 about 1,007 us), the `+bootsd` boot, then NWBench on hardware. Option 2
 (line retention in `next_ddram`) is the natural second step and is
 independent of it.
+
+## Stage 1 result: DBcc period floor (2026-09-24, simulation)
+
+`DBCC_FLOOR` 4 in place of `CPU_PACE` 1/2 (docs/PERF_PLAN.md stage 1),
+same `CLK_HZ` 25 MHz. Gates: CPU suite (14 programs) passes unpaced,
+`+pace`, `+pace +paceshift`, `+dbccstall=2` and `+dbccfloor=4`;
+`bench_dbf` loop A 2.0 -> 4.0 clocks per iteration under the floor (5.0
+under a floor of 5), loops B and C unchanged at 16.2 / 7.0; `+loopdump`
+(clocks(1000) - clocks(100)) / 5625 = 4.000; the POST measures
+delay(1000) = **1009 us** (was 1015 under 1/2 pacing) and passes; the
+NS3.3 `+bootsd` boot to 2,400M clocks: ALL PASS. Kernel-phase profile
+at `+ddrlat=6`, against run B (1/2 pacing):
+
+| kernel phase | run B (1/2 pacing) | stage 1 (floor 4) |
+|---|---|---|
+| internal step taken | 31.0% | 60.8% |
+| internal step lost to gating | 26.8% | 0.0% (a few bins at 14-16%: delay loops) |
+| bus, RAM wait | 33.1% | 30.2% |
+| bus, arb/decode | 8.8% | 8.4% |
+| cache fills | 5.40M x 123.4 clocks | 5.30M x 118.1 clocks |
+
+The kernel phase got 1,845M clocks against B's 1,705M (the ROM phase is
+shorter: 555M vs ~695M) and executed about twice the internal steps in
+them. Hardware run: pending.

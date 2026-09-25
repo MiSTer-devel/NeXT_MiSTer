@@ -44,37 +44,62 @@ the checklist at the end.
 | `rtl/next/dpram.v`, `ap040_cache.v` | `NEXT_RAM_PESSIMISTIC` (Verilator only) | The simulation models of the tag/ATC RAMs and the cache data arrays behave like the silicon: garbage on a mixed-port collision, NEW data on a same-port write-then-read, every collision counted and the first few printed (`-DNEXT_RAM_PESSIMISTIC` on the verilator line). Used to rule RAM semantics out for bug 5: NeXTSTEP boots under it. |
 | `files.qip` | `rtl/AP68040/` -> `rtl/ap68040/` | Directory case; only matters on a case-sensitive filesystem. |
 | `files.qip` | `NEXT_FIT_QUADRA=1` fitter recipe block | See "Fitting" below. Opt-in until made the project default. |
-| `NeXT.sv`, `tb/tb_next_boot.sv` | `CLK_HZ` 50 MHz -> **25 MHz**, `CPU_PACE` 2/2 -> **1/2** | CPU speed calibration, see below. |
+| `NeXT.sv`, `tb/tb_next_boot.sv`, `rtl/next/next_system.sv` | `CLK_HZ` 50 MHz -> **25 MHz**, `DBCC_FLOOR` **4**, `CPU_PACE` 1/1 (the 1/2 pacing was the first version) | CPU speed calibration, see below. |
 | `NeXT.sv` | `VIDEO_ARX/ARY` "Original" = 35:26 | 1120x832 is not 4:3; at 1x integer scaling the 4:3 declaration squeezed 1120 columns into 1109 and blurred the font. |
 | `NeXT.sv`, `next_system.sv`, `NeXT.qsf` | `reset` / `dev_reset` registered and routed on global networks; `next_rom` 96 KB; `next_scsi` `SCSI_UNITS=4` | Fit: -32 M10Ks, the two ~5,000-fanout nets off local routing ("Fitting" below). |
 | `tb/run_tests.sh` | `CPU=../rtl/ap68040/rtl` | Directory case. |
 | `tb/tb_next_boot.sv` | `+loopdump`, `+exctrace` probes; `POST_STORES` from `-DNEXT_POST_STORES` | Diagnostics used below. |
-| `rtl/ap68040/tb/tb_ap040_program.v` | `+pace` (gate `clkena` every other clock), `+paceshift` (the other phase), walker ack level-held, `+mmutrace`, `+pftrace` | The paced CPU suite; `asm/t_xline.s` (cases 12-15: the two lines in different ways, the bug-5 reproduction), `asm/t_xline_mmu.s` added. Run every test `+pace` and `+pace +paceshift`. |
+| `rtl/ap68040/tb/tb_ap040_program.v` | `+pace` (gate `clkena` every other clock), `+paceshift` (the other phase), `+dbccfloor=N` (the host's DBcc period floor, verbatim), `+dbccstall=N` (fixed stall per DBcc, measurement only), walker ack level-held, `+mmutrace`, `+pftrace` | The gated CPU suite; `asm/t_xline.s` (cases 12-15: the two lines in different ways, the bug-5 reproduction), `asm/t_xline_mmu.s`, `asm/bench_dbf.s` (clocks per DBcc iteration) added. Run every test unpaced, `+pace`, `+pace +paceshift` and `+dbccfloor=4`. |
 
 ## CPU speed calibration (the "System test failed" after RTC)
 
 The boot ROM's `delay(n)` (at `$010024CC`) spins `(n-3)*6.25` iterations
-of a single `dbf d0,*` from the instruction cache, and the POST checks that
-loop against the hardware timers (RTC: waits 1100 ms for a seconds tick;
-Timer and Event counter: `delay(1000)` must measure 899..1100 us). The
-machine's microsecond is `CLK_HZ/1e6` clocks, so the invariant is
+of a single `dbf d0,*` (at `$010024F0`) from the instruction cache, and
+the POST checks that loop against the hardware timers (RTC: waits 1100 ms
+for a seconds tick; Timer and Event counter: `delay(1000)` must measure
+899..1100 us). The ROM's constant is a real 68040's 4 clocks per taken
+DBcc at 25 MHz. The machine's microsecond is `CLK_HZ/1e6` clocks.
 
-    (CLK_HZ / 1e6) * (CPU_PACE_NUM / CPU_PACE_DEN) = 6.25 * clocks per DBF iteration
+This tree runs that loop in **2** clocks per iteration through its DBcc
+fast path (`S_DBCC1` self-loop). With the old constant the ROM's 1100 ms
+RTC wait lasted 275 real ms and POST failed at RTC on hardware and in
+simulation. The host (`rtl/next/next_system.sv`, `DBCC_FLOOR`) prices the
+instruction the way the real chip does, which is also what Previous does
+(`src/cpu/gencpu.c` `adjust_cycles`: `i_DBcc: cycles = 4`, "special cases
+for timing loops, ROM POST depend on these"): consecutive entries into the
+core's `S_DBCC1` state (`debug_status[231:224] == 8'd53`) are kept at
+least `DBCC_FLOOR` enabled clocks apart by holding `clkena` low on idle
+clocks, and nothing else is slowed. The invariant is
 
-The old CPU took 8 clocks per iteration (50 clocks/us, `CLK_HZ` 50 MHz,
-unpaced). This tree takes **2** (measured in the boot bench with
-`+loopdump`: `delay(1000)` = 12,536 clocks, `delay(100)` = 1,286, i.e.
-11,250 clocks for 5,625 iterations). With the wrong constant the ROM's
-1100 ms RTC wait lasted 275 real ms and POST failed at RTC on hardware and
-in simulation. `CLK_HZ/1e6` is an integer divider everywhere, so 12.5
-clocks/us is done as `CLK_HZ` 25 MHz with the CPU paced 1 of 2: the ROM
-then measures `delay(1000)` = 1015 us and the full POST passes
-(`tb/run_tests.sh post`, and on hardware). At the real 28 MHz clock the
-machine runs at 112% of real time (it was 56%).
+    (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR
 
-**Re-measure on every CPU drop**: `tb_next_boot +mcycles=1400 +loopdump`,
-take the `n=1000` and `n=100` lines, clocks per iteration =
-(clocks(1000) - clocks(100)) / 5625.
+so `CLK_HZ` 25 MHz with a floor of 4. The ROM then measures
+`delay(1000)` = ~1,007 us and the full POST passes (`tb/run_tests.sh
+post`, and on hardware). At the real 28 MHz clock the machine runs at
+112% of real time. (The first version of this port used `CPU_PACE` 1/2,
+gating every other internal clock: the same calibration, at half the
+speed on everything that is not a DBcc; it is still selectable with
+`DBCC_FLOOR` 0 and `CPU_PACE_DEN` 2.)
+
+Measured with `rtl/ap68040/tb/asm/bench_dbf.s` (clocks per iteration):
+the bare aligned `dbf` 2.0 unpaced, 4.0 under `+dbccfloor=4`; a
+memcpy-shaped `move.l (a0)+,(a1)+ / dbf` loop 16.2 either way (the stall
+hides under the bus cycle); a `subq / bne` loop 7.0 either way. Under
+`CPU_PACE` 1/2 those read 4.0 / 28.4 / 14.0.
+
+**Re-measure on every CPU drop**, two ways:
+
+1. `bench_dbf` under the Verilator or iverilog CPU bench, unpaced and
+   `+dbccfloor=4`: loop A (`STAMP tag=0a01`) must read 2.0 and 4.0 clocks
+   per iteration (6,250 iterations); loops B and C must not change
+   between the two.
+2. `tb_next_boot +mcycles=600 +loopdump`, take the `n=1000` and `n=100`
+   lines: clocks per iteration = (clocks(1000) - clocks(100)) / 5625,
+   must be 4.0 (2.0 with the floor off).
+
+If the core's fast path changes speed, or its `S_DBCC1` encoding moves
+(see the checklist), the floor silently stops calibrating and the POST
+fails at the timer test, which is loud.
 
 ## dpram (the CPU's ctag_ram and atc_ram)
 
@@ -92,7 +117,8 @@ VRAM's `dpram_dc` is this core's own and is unchanged.
 ## Five bugs under a gated clock enable (NeXTSTEP 3.3 double fault and panic, 2026-09-23)
 
 Both the Quadra core and the old NeXT integration run the CPU unpaced
-(`ce` = 1 except bus waits). NeXT now paces it 1 of 2 (calibration above),
+(`ce` = 1 except bus waits). NeXT gates it (the DBcc floor above, and the
+1-of-2 pacing the port started with),
 and five sequences that read a RAM (or sample a pulse) on one enabled
 clock and consume the result on the next break when an un-enabled clock
 sits in between:
@@ -204,15 +230,19 @@ thousands of times while you read the window), and keep the capture small
 
 ## Checklist for a new CPU drop
 
-0. Re-measure the DBF loop speed and update `CLK_HZ`/`CPU_PACE_*` (above).
+0. Re-measure the DBF loop speed (above) and update `CLK_HZ`/`DBCC_FLOOR`.
+   **S_DBCC1 encoding**: `localparam S_DBCC1` in `ap040_core.v` must equal
+   `DBCC_S` in `next_system.sv` (8'd53 today), and `debug_status[231:224]`
+   must still carry `state`; otherwise the floor never fires.
 1. Apply the patch (or the edits above).
 2. Wrapper interface: every port and parameter `next_system.sv` names on
    `ap040_tg68k_compat` exists. New wrapper outputs can stay unconnected;
    new inputs need a tie-off.
 3. IPL sampling is still not under `ce` (change 3).
 4. The post-store window (`AP040_POST_LO/HI`) still exists in the wrapper.
-5. **Run the CPU suite paced, on both phases**: `vvp build/tb_prog.vvp
-   +prog=... +pace` and `+pace +paceshift` for every test as well as unpaced. Anything that only fails paced is a `ce`
+5. **Run the CPU suite under every clock-enable policy**: `vvp build/tb_prog.vvp
+   +prog=... +pace`, `+pace +paceshift` and `+dbccfloor=4` for every test
+   as well as unpaced. Anything that only fails gated is a `ce`
    hazard of the kind above. `t_xline`, `t_xline_mmu`, `t_atcprobe` are the
    directed tests.
 6. NeXT-relevant CPU fixes are present, by their directed tests in
