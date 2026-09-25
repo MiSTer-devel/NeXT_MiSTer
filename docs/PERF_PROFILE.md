@@ -216,3 +216,43 @@ them. Fit (`NEXT_FIT_QUADRA=1`): seed 1 was still placing after 85 min and
 was killed; `NEXT_SEED=2` closed in 20 min at 39,467 ALMs (94%), 470 M10K,
 worst setup +0.014 ns (HDMI PLL); `releases/NeXT_20260924.rbf`. Hardware
 run: pending.
+
+## Area work: the HPS-served SCSI responses, CD audio and MO ECC (2026-09-25)
+
+Target: below 90% ALMs (37,719) for stages 2 and 3, without touching the
+CPU, the FPU or the framework. Per-entity ALMs from the fit reports:
+
+| entity | before (stage 1 build) | after (docs/HPS_SCSI_MO.md) |
+|---|---:|---:|
+| whole design | 39,467 (94%) | 38,348 (92%), seed 2 |
+| next_mo (incl. next_rs) | 2,220 (1,219 in next_rs) | 995 (next_rs gone) |
+| next_scsi | 2,268 | 2,247 |
+| next_cd_audio (new) | - | under 100 (the frame RAM is M10K) |
+| next_kms_snd / sound output | 802 | 789 |
+| next_enet_dma + bridge | 1,073 | 1,059 |
+| next_scr | 575 | 573 |
+| next_floppy | 498 | 502 |
+| M10K | 470 / 553 | 470 / 553 |
+| peak interconnect (V) | 91.7% | 94.4% (seed 2) |
+
+What the numbers say: the whole gain is the Reed-Solomon codec. The
+target's response tables that the port doc had estimated at ~500 ALMs
+cost almost nothing in the fitted design (Quartus had already reduced the
+constant tables to a few dozen ALMs); the window fetch/forward states put
+back what the tables took out. So the "Main-served SCSI" half of the
+change buys CD audio and the cue/bin/chd images, not area.
+
+Levers assessed for the remaining ~630 ALMs to 90%:
+
+- A third SCSI hard disk (`SCSI_UNITS` 4 -> 3): 86 ALMs by
+  synthesis-only comparison (37,978 -> 37,892 estimated), and since units
+  are indexed by target it removes target 3, the CD-ROM. Not applied.
+- `next_scr`'s combinational NVRAM checksum (15 x 16-bit adds): ~100 if
+  made sequential.
+- The audio chain (`next_kms_snd` 517 own + sound output 273 + `next_snd_in`
+  341 + ADC 279): a build-time option for the sound input would save ~620,
+  the printer ~157; both are features, not offered as defaults.
+- `next_scsi` (2,247) and the MO drive model (`next_mo` 995) are the only
+  blocks left with real weight; both are cycle-level device models whose
+  restructuring is a project of its own (the stage 3 bus rewrite touches
+  next_scsi anyway).
