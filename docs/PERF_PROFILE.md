@@ -212,4 +212,7 @@ at `+ddrlat=6`, against run B (1/2 pacing):
 
 The kernel phase got 1,845M clocks against B's 1,705M (the ROM phase is
 shorter: 555M vs ~695M) and executed about twice the internal steps in
-them. Hardware run: pending.
+them. Fit (`NEXT_FIT_QUADRA=1`): seed 1 was still placing after 85 min and
+was killed; `NEXT_SEED=2` closed in 20 min at 39,467 ALMs (94%), 470 M10K,
+worst setup +0.014 ns (HDMI PLL); `releases/NeXT_20260924.rbf`. Hardware
+run: pending.

@@ -278,6 +278,7 @@ where the Quadra sits at 88%, and the few hundred ALMs this tree costs over
 | `NEXT_FIT_QUADRA=1` (BALANCED mode and technique, register duplication off, aggressive routability: MacQuadra800's recipe), seed 1 | **routes and meets timing**, 32 min: 39,213 ALMs (94%), 502/553 RAM blocks; worst setup +0.080 ns (HDMI PLL), CPU clock setup +3.406 ns |
 | + registered `reset`/`dev_reset` on global networks, `next_rom` 96 KB, `SCSI_UNITS=4` (2026-09-23) | 39,449 ALMs (94%), **470/553** RAM blocks, route-throughs 4,275 -> 4,105, peak vertical interconnect 95.5% -> 91.7%, the two reset nets gone from the high-fanout list; worst setup +0.34 ns |
 | + `dpram` = altsyncram wrapper | 39,358 ALMs, 470 M10K, worst setup +0.22 ns (HDMI); ctag_ram / atc_ram now explicit ALTSYNCRAM instances |
+| + `DBCC_FLOOR` 4 in place of `CPU_PACE` 1/2 (2026-09-24) | seed 1 still placing after 85 min, killed; **seed 2** closes in 20 min: 39,467 ALMs (94%), 470 M10K, worst setup +0.014 ns (HDMI PLL) |
 
 The MiSTer framework (`sys/` and its feature macros) stays stock. Further
 room has to come from this core's own RTL: `next_scsi` (2,299 ALMs) and
