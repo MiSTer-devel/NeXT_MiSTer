@@ -224,7 +224,7 @@ CPU, the FPU or the framework. Per-entity ALMs from the fit reports:
 
 | entity | before (stage 1 build) | after (docs/HPS_SCSI_MO.md) |
 |---|---:|---:|
-| whole design | 39,467 (94%) | 38,348 (92%), seed 2 |
+| whole design | 39,467 (94%) | 38,348 (92%) seed 2 (setup miss on the HDMI PLL domain); **38,615 (92%) seed 5, timing closed** (`releases/NeXT_20260925.rbf`; seed 3 left a 17 ps hold, seed 4 did not finish in 50 min) |
 | next_mo (incl. next_rs) | 2,220 (1,219 in next_rs) | 995 (next_rs gone) |
 | next_scsi | 2,268 | 2,247 |
 | next_cd_audio (new) | - | under 100 (the frame RAM is M10K) |
