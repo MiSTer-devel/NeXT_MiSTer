@@ -434,6 +434,28 @@ beat port halved the transaction count and took the adapter gaps out
 "internal run" now, they gate idle clocks only).  The fill avg of 34.4
 matches the hardware's ~32.
 
+## Area work, second round (2026-09-25 afternoon): 92% -> 90%
+
+The eject-fix netlist (stage 3 + 2b + `next_scsi` eject) would not place
+within the 45-minute build limit on seeds 10, 11 and 12 and took seed 9
+(38,698 ALMs, 92%).  Four cuts, all outside the CPU (commit 11c4185):
+
+| change | ALMs (estimate) | notes |
+|---|---:|---|
+| sound input as a build option, off by default (`NEXT_SND_IN`) | ~620 | `next_snd_in` + `next_audio_adc` gone; the registers read 0 |
+| two SCSI disks: target 2 unpopulated, per-unit state for 3 units | ~90 | OSD slot = target numbering kept, Main unchanged |
+| ESP FIFO as a circular buffer (pointers) instead of a shift register | ~50 | same timing, empty reads 0 |
+| NVRAM boot checksum one add per clock instead of 15 adders | ~100 | written ~16 clocks after the policy, far inside the ROM's first RTC access |
+
+Seed 9: **37,906 ALMs (90.4%)**, 478 M10K, fitter 18 minutes, timing
+closed with the HDMI PLL domain at **+0.233 ns** (every earlier build of
+the day sat within 0.03 ns of the edge): `releases/NeXT_20260925_area_seed9.rbf`.
+On hardware: POST, NeXTSTEP boot with the CD at target 3, Workspace
+Eject clean.  Not moved: the 16-byte DMA channel buffer and the FIFO into
+M10K (both are read combinationally on consecutive clocks by the command
+FSM, so a registered-address RAM needs a same-clock pop signal fed into
+its address; a redesign of the data path for ~150 ALMs, not done).
+
 ### HDMI PLL domain: the seed walk is the recipe
 
 `quartus_sta` on the seed-9 stage-2 database (`report_timing -to_clock
