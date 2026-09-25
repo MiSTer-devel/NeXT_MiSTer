@@ -69,7 +69,11 @@ module next_system #(
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex",
 	parameter DEBUG_EXCEPTIONS = 0,
-	parameter POST_STORES = 0
+	parameter POST_STORES = 0,
+	// 0 leaves the sound input (the codec input DMA channel and its
+	// registers) out of the build: ~340 ALMs here plus the ADC in the emu
+	// top.  The registers then read as zero and the channel never runs.
+	parameter SND_IN_EN = 1
 )
 (
 	input         clk,            // system clock: CPU, devices, RAM
@@ -1073,18 +1077,34 @@ wire signed [16:0] mix_r = {kms_r[15], kms_r} + {cd_r[15], cd_r};
 assign audio_l = (mix_l[16] != mix_l[15]) ? (mix_l[16] ? 16'h8000 : 16'h7FFF) : mix_l[15:0];
 assign audio_r = (mix_r[16] != mix_r[15]) ? (mix_r[16] ? 16'h8000 : 16'h7FFF) : mix_r[15:0];
 
-next_snd_in #(.CLK_REAL_HZ(CLK_REAL_HZ)) snd_in
-(
-	.clk(clk), .reset(dev_reset),
-	.active(sndin_active), .clear_status(sndin_clear),
-	.audio_in(audio_in),
-	.request_status(sndin_request), .overrun(sndin_overrun),
-	.sel_csr(io_si_csr), .sel_sptr(io_si_sptr), .sel_ptr(io_si_ptr), .sel_ini(io_si_ini),
-	.addr(io_off[3:0]), .we(is_write), .be(lanes), .wdata(cpu_dout), .rdata(sndin_rdata),
-	.int_dma(int_snd_in_dma),
-	.m_req(si_m_req), .m_we(si_m_we), .m_addr(si_m_addr), .m_be(si_m_be), .m_din(si_m_din),
-	.m_ack(si_m_ack), .m_err(si_m_err)
-);
+generate if (SND_IN_EN != 0) begin : g_snd_in
+	next_snd_in #(.CLK_REAL_HZ(CLK_REAL_HZ)) snd_in
+	(
+		.clk(clk), .reset(dev_reset),
+		.active(sndin_active), .clear_status(sndin_clear),
+		.audio_in(audio_in),
+		.request_status(sndin_request), .overrun(sndin_overrun),
+		.sel_csr(io_si_csr), .sel_sptr(io_si_sptr), .sel_ptr(io_si_ptr), .sel_ini(io_si_ini),
+		.addr(io_off[3:0]), .we(is_write), .be(lanes), .wdata(cpu_dout), .rdata(sndin_rdata),
+		.int_dma(int_snd_in_dma),
+		.m_req(si_m_req), .m_we(si_m_we), .m_addr(si_m_addr), .m_be(si_m_be), .m_din(si_m_din),
+		.m_ack(si_m_ack), .m_err(si_m_err)
+	);
+end
+else begin : g_no_snd_in
+	// no sound input: its registers read as zero, no DMA, no interrupt
+	assign sndin_rdata    = 16'd0;
+	assign sndin_request  = 1'b0;
+	assign sndin_overrun  = 1'b0;
+	assign int_snd_in_dma = 1'b0;
+	assign si_m_req  = 1'b0;
+	assign si_m_we   = 1'b0;
+	assign si_m_addr = 30'd0;
+	assign si_m_be   = 4'd0;
+	assign si_m_din  = 32'd0;
+	wire unused_snd_in = sndin_active | sndin_clear | (|audio_in) | si_m_ack | si_m_err;
+end
+endgenerate
 
 // Laser printer interface and its memory-to-device DMA channel
 next_printer #(.CLK_HZ(CLK_HZ)) printer

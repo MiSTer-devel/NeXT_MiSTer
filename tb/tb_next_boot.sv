@@ -85,6 +85,9 @@ next_system #(
 	.DBCC_FLOOR(4),
 `endif
 	.CPU_PACE_NUM(1),
+`ifdef NEXT_TB_SND_IN
+	.SND_IN_EN(`NEXT_TB_SND_IN),
+`endif
 `ifdef NEXT_TB_PACE_DEN
 	.CPU_PACE_DEN(`NEXT_TB_PACE_DEN),
 `else

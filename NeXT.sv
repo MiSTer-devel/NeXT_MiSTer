@@ -70,7 +70,6 @@ localparam CONF_STR = {
 	"F1,BINROM,Boot ROM;",
 	"SC0,VHDIMG,SCSI Disk 0;",
 	"SC1,VHDIMG,SCSI Disk 1;",
-	"SC2,VHDIMG,SCSI Disk 2;",
 	"S3,ISOCUEBINCHD,CD-ROM;",
 	"S4,IMGIMAFLPVFDFD ,Floppy;",
 	"S5,IMGMO OD ,Magneto-optical;",
@@ -209,11 +208,21 @@ always @(posedge clk_sys) if (rom_download) rom_loaded <= 1;
 reg  reset = 1;
 always @(posedge clk_sys) reset <= RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
 
+// The sound input (codec input DMA channel and the board's ADC) is a
+// build option: NEXT_SND_IN=1 in the qsf's VERILOG_MACRO list puts it in
+// (~620 ALMs); the default build leaves it out for the fitter's sake at
+// 92% ALMs.  The "Audio input" OSD option is then without effect.
 wire signed [15:0] adc_audio_in;
+`ifdef NEXT_SND_IN
+localparam SND_IN_EN = 1;
 next_audio_adc #(.CLK_REAL_HZ(28000000)) adc_input
 (
 	.clk(clk_sys), .reset(reset), .ADC_BUS(ADC_BUS), .audio_in(adc_audio_in)
 );
+`else
+localparam SND_IN_EN = 0;
+assign adc_audio_in = 16'sd0;
+`endif
 
 ///////////////////////   SYSTEM    //////////////////////////////
 
@@ -261,7 +270,8 @@ next_system #(
 	.CPU_PACE_NUM(1),
 	.CPU_PACE_DEN(1),
 	.CLK_REAL_HZ(28000000),   // the real clk_sys, so the clock keeps time
-	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
+	.SND_IN_EN(SND_IN_EN)
 ) system
 (
 	.clk(clk_sys),

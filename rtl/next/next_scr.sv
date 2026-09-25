@@ -237,26 +237,16 @@ function automatic [7:0] boot_byte;
 endfunction
 
 // Previous's nvram_checksum(): 16-bit one's-complement sum over bytes
-// 0-29, complemented.  Bytes 0-17 come from the live battery-backed
-// image; bytes 18-29 are the command being applied on this reset.
-function automatic [15:0] boot_checksum;
-	input [2:0] dev;
-	input [1:0] cdu;
-	integer k;
-	reg [19:0] sum;
-	reg [16:0] fold1, fold2;
-	begin
-		sum = 20'd0;
-		for (k = 0; k < 18; k = k + 2)
-			sum = sum + {4'd0, nvram[k], nvram[k+1]};
-		for (k = 18; k < 30; k = k + 2)
-			sum = sum + {4'd0, boot_byte(k[4:0], dev, cdu),
-			                   boot_byte(k[4:0] + 5'd1, dev, cdu)};
-		fold1 = {1'b0, sum[15:0]} + {13'd0, sum[19:16]};
-		fold2 = {1'b0, fold1[15:0]} + fold1[16];
-		boot_checksum = ~fold2[15:0];
-	end
-endfunction
+// 0-29, complemented.  Computed one 16-bit add per clock over the live
+// image after the command bytes have landed (15 clocks plus the fold,
+// far inside the ROM's first RTC access); the combinational version was
+// fifteen adders for a value written once per reset.
+reg         ck_run = 1'b0;
+reg   [4:0] ck_k = 5'd0;
+reg  [19:0] ck_sum = 20'd0;
+wire [16:0] ck_f1  = {1'b0, ck_sum[15:0]} + {13'd0, ck_sum[19:16]};
+wire [16:0] ck_f2  = {1'b0, ck_f1[15:0]} + {16'd0, ck_f1[16]};
+wire [15:0] ck_out = ~ck_f2[15:0];
 
 // Full defaults exist only at FPGA configuration, just as battery-backed
 // storage acquires an initial image only when the core itself starts.
@@ -332,13 +322,23 @@ always @(posedge clk) begin
 	// command, and checksum the resulting live image.
 	//------------------------------------------------------------
 	boot_init <= 1'b0;
-	if (boot_init || config_reset) begin : apply_boot_policy
-		reg [15:0] checksum;
-		checksum = boot_checksum(bootdev, cd_unit);
+	if (boot_init || config_reset) begin
 		for (i = 18; i < 30; i = i + 1)
 			nvram[i] <= boot_byte(i[4:0], bootdev, cd_unit);
-		nvram[30] <= checksum[15:8];
-		nvram[31] <= checksum[7:0];
+		ck_run <= 1'b1;
+		ck_k   <= 5'd0;
+		ck_sum <= 20'd0;
+	end
+	else if (ck_run) begin
+		if (ck_k < 5'd30) begin
+			ck_sum <= ck_sum + {4'd0, nvram[ck_k], nvram[ck_k + 5'd1]};
+			ck_k   <= ck_k + 5'd2;
+		end
+		else begin
+			nvram[30] <= ck_out[15:8];
+			nvram[31] <= ck_out[7:0];
+			ck_run <= 1'b0;
+		end
 	end
 
 	// The time of day keeps counting across a reset.  dev_reset carries
