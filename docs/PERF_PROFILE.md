@@ -285,3 +285,28 @@ Levers assessed for the remaining ~630 ALMs to 90%:
   blocks left with real weight; both are cycle-level device models whose
   restructuring is a project of its own (the stage 3 bus rewrite touches
   next_scsi anyway).
+
+## Stage 2 result: the retained DDR line (2026-09-25, simulation)
+
+`next_ddram` fetches the aligned 16-byte line as one 2-beat burst and
+serves the other words of the fill from the copy (docs/PERF_PLAN.md stage
+2). Gates: `tb_next_ddram` (miss 12 clocks, hit 2 at DDR latency 6),
+`tb_next_ddram_arb` burst cases, the device suite, the POST (which now
+finishes ~25M clocks sooner) and the NS3.3 boot to 2,400M clocks at both
+DDR latencies, ALL PASS. Kernel phase, against the stage 1 build:
+
+| kernel phase | stage 1 (`+ddrlat=6`) | stage 2, `+ddrlat=6` | stage 2, `+ddrlat=12` |
+|---|---|---|---|
+| internal step taken | 60.8% | **79.9%** | 77.9% |
+| bus, RAM wait | 30.2% | **11.4%** | 13.3% |
+| bus, arb/decode | 8.4% | 8.2% | 8.2% |
+| cache fills | 5.30M x 118.1 clocks | 5.02M x **54.5** | 5.08M x 60.6 |
+| core instruction access, avg | 5.2 clocks (run B) | **2.79** | 2.94 |
+| core data read, avg | 4.2 | 2.30 | 2.41 |
+| core write, avg | 21.4 | 16.1 | 16.2 |
+
+The plan had estimated fills of ~60 clocks and a RAM-wait share of ~15%;
+both came in better because the second word of every longword also hits
+the line. Fit: 38,561 ALMs (92%), seed 6, timing closed
+(`releases/NeXT_20260925a.rbf`, before the NeXT.sv buffer-address fix; the
+fixed build follows). Hardware: pending.
