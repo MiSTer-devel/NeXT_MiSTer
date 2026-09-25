@@ -2235,6 +2235,81 @@ initial begin
 	check(sts == 8'h02, "play audio on a disk target: CHECK CONDITION");
 
 	//------------------------------------------------------------
+	// Eject.  NeXTSTEP's Workspace "Eject" sends PREVENT ALLOW MEDIUM
+	// REMOVAL (allow) and START STOP UNIT with LoEj; the medium must then
+	// be gone (NOT READY, medium not present) while the drive stays on
+	// the bus, until the OSD mounts an image again.  An OSD unmount is
+	// the same removal.
+	//------------------------------------------------------------
+	select_atn6_target(3'd3, 8'h1E, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd prevent/allow medium removal: good status");
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd test unit ready with medium: good status");
+	select_atn6_target(3'd3, 8'h1B, 8'h00, 8'h00, 8'h00, 8'h02, 8'h00);   // LoEj, stop
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd eject: good status");
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "cd test unit ready after eject: CHECK CONDITION");
+	select_atn6_target(3'd3, 8'h03, 8'h00, 8'h00, 8'h00, 8'd22, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd22, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 2) == 8'h02, "cd sense after eject: not ready key");
+	check(ram_byte(BUF + 12) == 8'h3A, "cd sense after eject: medium not present");
+	finish_command(sts);
+	check(sts == 8'h00, "cd request sense after eject: good status");
+	select_atn10_target(3'd3, 8'h28, 8'h00, 8'h00, 8'h00, 8'h00, 8'h04,
+	                    8'h00, 8'h00, 8'h01, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "cd read after eject: CHECK CONDITION");
+	select_atn10_target(3'd3, 8'h43, 8'h02, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'd12, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "cd read toc after eject: CHECK CONDITION");
+	select_atn6_target(3'd3, 8'h12, 8'h00, 8'h00, 8'h00, 8'd54, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd54, BUF, BUF + 32'd64);
+	read_intr(intr);
+	flush_dma_in_words(14);
+	check(ram_byte(BUF + 0) == 8'h05, "cd inquiry after eject: still a CD-ROM");
+	finish_command(sts);
+	check(sts == 8'h00, "cd inquiry after eject: good status");
+	// the OSD mounts an image again: the medium is back
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd test unit ready after remount: good status");
+	// an OSD unmount: the drive stays on the bus, the medium is gone
+	img_size = 0;
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3, "cd unmounted: the drive still answers selection (status phase)");
+	finish_command(sts);
+	check(sts == 8'h02, "cd test unit ready after unmount: CHECK CONDITION");
+	img_size = CD_SECTORS * 2048;
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd test unit ready after the second mount: good status");
+
+	//------------------------------------------------------------
 	// NeXTSTEP 3.3 raw-device WRITE(10), driven exactly as sdmach's
 	// sc driver does it (disassembled from the install CD kernel):
 	// newfs writes from an unaligned static buffer, so dma_list shifts

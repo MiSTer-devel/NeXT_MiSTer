@@ -489,4 +489,25 @@ POST, NeXTSTEP boot, root login, `tb/hw/memlat.c` (guest us = 25 clocks):
 The fill is now ~20 clocks on hardware (one DDR round trip plus three
 1-clock copies), a third of the 56 it cost on the stage 2 build and less
 than a sixth of the 130-145 of the 0914 build; the store is unchanged
-from stage 3, as expected.  NWBench / NXBench on this build: not yet run.
+from stage 3, as expected.
+
+NWBench Run All on the same build (12:08-12:27), guest units as NWBench
+prints them, real time with the 0.893 s guest second:
+
+| NWBench | 0914 (old CPU), real | stage 2, real | stage 3 + 2b, guest | stage 3 + 2b, real | vs stage 2 | vs 0914 |
+|---|---|---|---|---|---|---|
+| Dhrystone | 4,375/s | 7,482/s | 8,537 (5.42 MIPS) | **9,560/s** | +28% | x2.19 |
+| Graphics V/V, D/V | 28.7, 32.9 s | 12.9, 13.6 s | 9.70, 9.36 s | **8.66, 8.36 s** | -33%, -39% | x3.3, x3.9 |
+| Ethernet | 8.1 KB/s | 17.0 KB/s | 28.3 KB/s | 31.7 KB/s | +86% | x3.9 |
+| Disk | 521 KB/s | 849 KB/s | 974.2 KB/s | **1,091 KB/s** | +29% | x2.1 |
+| Webster | 415 s | 170 s | 113.9 s | **101.7 s** | -40% | x4.1 |
+| Compile | 564 s | 258 s | 191.1 s | **170.7 s** | -34% | x3.3 |
+
+Dhrystone moved this time (+28%): the plan expected it flat because its
+loop is cached, but Dhrystone 2.1's working set and the OS around it
+still miss (the 2b profile shows 4.8M fills in the kernel phase), and
+each miss is a third of what it was.  Compile and Webster took another
+third to 40% off; against the 0914 build the machine is 2.2x on
+Dhrystone and 3.3-4.1x on the miss-heavy tests.  NXBench (the user's
+NeXTSTEP Benchmark Suite) Dhrystone 2.1 on the stage-2 build was 6,669
+dhrystones/s = 4.23 VAX MIPS; not yet run on this build.

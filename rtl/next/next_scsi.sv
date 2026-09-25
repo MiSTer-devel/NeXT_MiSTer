@@ -122,7 +122,7 @@ localparam STAT_GOOD = 8'h00, STAT_CHECK_COND = 8'h02;
 localparam SC_NO_ERROR      = 8'h00, SC_INVALID_CMD = 8'h20,
 	       SC_INVALID_LBA   = 8'h21, SC_INVALID_LUN = 8'h25,
 	       SC_INVALID_CDB   = 8'h24, SC_SAVE_UNSUPP = 8'h39,
-	       SC_WRITE_PROTECT = 8'h27;
+	       SC_WRITE_PROTECT = 8'h27, SC_NOT_READY   = 8'h3A;  // medium not present
 
 //----------------------------------------------------------------------------
 // ESP registers
@@ -172,6 +172,15 @@ integer mk;                      // mount scan index
 integer sk;                      // reset scan index
 
 reg  [5:0] disk_present_v = 0;
+// A CD-ROM's medium can be gone while the drive is still on the bus:
+// after START STOP UNIT with LoEj (the eject NeXTSTEP's Workspace sends
+// for "Eject"), or after the OSD unmounted the image.  The drive then
+// answers selection, INQUIRY, REQUEST SENSE and MODE SENSE as before and
+// every medium command with NOT READY / medium not present, until the
+// OSD mounts an image again.  Without this the eject reported GOOD but
+// the medium stayed, and NeXTSTEP kept asking the user to eject it.
+reg  [5:0] ejected_v = 0;        // ejected by START STOP UNIT
+reg  [5:0] cd_seen_v = 0;        // a CD unit that has had an image this session
 reg  [5:0] disk_ro_v = 0;
 reg [31:0] img_blocks_v [0:SCSI_UNITS-1];   // disk size in 512 byte blocks
 reg  [2:0] t_unit = 0;           // target the connected command addresses
@@ -180,6 +189,7 @@ assign sd_unit = win_act ? 3'd3 : t_unit;   // windows live on the CD-ROM slot
 // The engine was written for one disk; keeping these names as views of
 // the connected target leaves every user of them unchanged.
 wire        disk_present = disk_present_v[t_unit];
+wire        t_ejected    = ejected_v[t_unit] || (CD_UNITS[t_unit] && !disk_present);
 wire        disk_ro      = disk_ro_v[t_unit];
 wire [31:0] img_blocks   = img_blocks_v[t_unit];
 // A CD-ROM target reports the CD-ROM INQUIRY device type (0x05) so the
@@ -332,6 +342,8 @@ always @(posedge clk) begin
 			disk_present_v[mk] <= (img_size != 0);
 			disk_ro_v[mk] <= img_readonly;
 			img_blocks_v[mk] <= img_size[40:9];
+			ejected_v[mk] <= 0;
+			if (img_size != 0 && CD_UNITS[mk]) cd_seen_v[mk] <= 1;
 		end
 	end
 end
@@ -444,7 +456,8 @@ function automatic [3:0] key_of;
 	begin
 		case (code)
 			SC_NO_ERROR:      key_of = 4'h0;  // no sense
-			8'h04:            key_of = 4'h2;  // not ready
+			8'h04, SC_NOT_READY:
+			                  key_of = 4'h2;  // not ready
 			8'h03, SC_INVALID_CMD, SC_INVALID_LBA, SC_INVALID_CDB,
 			SC_INVALID_LUN, SC_SAVE_UNSUPP:
 			                  key_of = 4'h5;  // illegal request
@@ -833,7 +846,7 @@ task automatic start_command;
 				msg_len_pending <= 0; msg_reject <= 0; msg_left <= 0;
 				cdb_n <= 0;
 				if ((selectbusid[2:0] >= SCSI_UNITS) ||
-				    !disk_present_v[selectbusid[2:0]]) begin
+				    (!disk_present_v[selectbusid[2:0]] && !cd_seen_v[selectbusid[2:0]])) begin
 					// esp_select() clears both command ranks on timeout.
 					intstatus <= INTR_DC;
 					command0 <= 0;
@@ -1127,6 +1140,14 @@ always @(posedge clk) begin
 						sense_valid[t_unit] <= 0;
 						phase <= PHASE_ST;
 					end
+					else if (t_ejected && cdb0 != 8'h1A && cdb0 != 8'h1B && cdb0 != 8'h1E) begin
+						// no medium: TEST UNIT READY, the reads, the CD
+						// audio commands all report NOT READY
+						t_status <= STAT_CHECK_COND;
+						sense_code[t_unit] <= SC_NOT_READY;
+						sense_valid[t_unit] <= 0;
+						phase <= PHASE_ST;
+					end
 					else case (cdb0)
 						8'h00: begin         // TEST UNIT READY
 							t_status <= STAT_GOOD;
@@ -1298,12 +1319,20 @@ always @(posedge clk) begin
 							sense_code[t_unit] <= SC_NO_ERROR;
 							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
+							// LoEj: stop ejects the medium, start loads it again
+							if (t_is_cd && cdb4[1]) ejected_v[t_unit] <= !cdb4[0];
 							if (t_is_cd) begin
 								win_lba <= WIN_CMD | {8'd0, 1'b0, t_unit, 20'd0} | 32'h1B00;
 								fwd_ret <= X_POSTCMD;
 								fill_idx <= 0;
 								xst <= X_CMD_FILL;
 							end
+						end
+						8'h1E: begin         // PREVENT ALLOW MEDIUM REMOVAL: accepted, no lock
+							t_status <= STAT_GOOD;
+							sense_code[t_unit] <= SC_NO_ERROR;
+							sense_valid[t_unit] <= 0;
+							phase <= PHASE_ST;
 						end
 						8'h04: begin         // FORMAT DRIVE
 							t_status <= STAT_GOOD;
