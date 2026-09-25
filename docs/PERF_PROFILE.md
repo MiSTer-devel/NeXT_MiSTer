@@ -214,8 +214,25 @@ The kernel phase got 1,845M clocks against B's 1,705M (the ROM phase is
 shorter: 555M vs ~695M) and executed about twice the internal steps in
 them. Fit (`NEXT_FIT_QUADRA=1`): seed 1 was still placing after 85 min and
 was killed; `NEXT_SEED=2` closed in 20 min at 39,467 ALMs (94%), 470 M10K,
-worst setup +0.014 ns (HDMI PLL); `releases/NeXT_20260924.rbf`. Hardware
-run: pending.
+worst setup +0.014 ns (HDMI PLL); `releases/NeXT_20260924.rbf`.
+
+Hardware (2026-09-25, `NeXT_20260924.rbf`, Main next-fixes 7f34486): the
+POST passes (the ROM's own delay check), NeXTSTEP 3.3 boots to the login
+window, NWBench Run All:
+
+| NWBench | 1/2 pacing (2026-09-24) | DBcc floor |
+|---|---|---|
+| Dhrystone | 4,286 | **6,591** (4.18 guest MIPS), x1.54 |
+| Graphics V/V, D/V | 28.5, 31.6 | 20.5, 24.3 |
+| Compile | - | 416.5 s |
+| Webster | - | 296.0 s |
+| Disk | - | 525.3 KB/s |
+| Ethernet | - | 8.47 KB/s |
+
+The Dhrystone gain is 1.54x, not the 2x of a purely cached loop: the
+profile's run D said the same for the busy kernel mix (about 20% more work
+per clock), and Dhrystone as NWBench builds it evidently spends a third of
+its clocks on the bus.
 
 ## Area work: the HPS-served SCSI responses, CD audio and MO ECC (2026-09-25)
 
