@@ -152,11 +152,191 @@ index dfa1e05..e17aae5 100644
  			end
  
  			// PTEST proper, after its pre-flush sweep
+diff --git a/rtl/ap040.qip b/rtl/ap040.qip
+index f1cf769..e83f81d 100644
+--- a/rtl/ap040.qip
++++ b/rtl/ap040.qip
+@@ -3,6 +3,7 @@ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap0
+ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_alu.v ]
+ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_muldiv.v ]
+ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_bus16_adapter.v ]
++set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_bus32_adapter.v ]
+ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_bus_timeout.v ]
+ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_walker_cdc.v ]
+ set_global_assignment -name VERILOG_FILE     [file join $::quartus(qip_path) ap040_mmu.v ]
+diff --git a/rtl/ap040_bus32_adapter.v b/rtl/ap040_bus32_adapter.v
+new file mode 100644
+index 0000000..ac8c6f3
+--- /dev/null
++++ b/rtl/ap040_bus32_adapter.v
+@@ -0,0 +1,162 @@
++//--------------------------------------------------------------------------//
++// AP040 - MC68040 compatible CPU                                           //
++//                                                                          //
++// ap040_bus32_adapter.v - splits the post-cache transactions (right-       //
++// aligned data, any alignment) into aligned longword beats with byte       //
++// enables: the shape a 32-bit host bus consumes.  The MacQuadra800_MiSTer  //
++// wombat_bus32.sv beat contract, with the instruction/FC attributes        //
++// carried along for hosts that decode them (NeXT_MiSTer: docs/PERF_PLAN.md //
++// stage 3).                                                                //
++//                                                                          //
++// Beat contract:                                                           //
++//  - b_req is level-held per beat; the 2nd beat of a split follows with a  //
++//    new address while b_req stays high, so consumers accept on            //
++//    "b_req && !their-own-registered-ack" (never on a req edge).           //
++//  - b_ack: single-cycle pulse, b_rdata valid with it.                     //
++//  - b_be[3] = byte at b_addr+0 = b_wdata[31:24] (big-endian lanes);       //
++//    be is valid for reads too (narrow device registers decode it).        //
++//  - t_berr aborts the in-flight transaction: no ack, request dropped;     //
++//    the CPU core samples the same signal and builds the fault frame.      //
++//  - b_busy: a beat is in flight, or a transaction was requested last      //
++//    clock (registered, for the host's clock-enable policy: a host that    //
++//    gates idle clocks only keeps ce high while this is set).              //
++//                                                                          //
++// Core side (the ap040_bus16_adapter contract): t_req is held by the       //
++// requester until t_ack, a single-cycle pulse with t_rdata valid; the      //
++// requester drops t_req in the ack cycle.  During a cache line fill t_req  //
++// stays high across the four beats with t_addr changing.                   //
++//--------------------------------------------------------------------------//
++
++`include "ap040_defs.svh"
++
++module ap040_bus32_adapter
++(
++	input             clk,
++	input             nreset,
++	input             ce,
++
++	// transaction side
++	input             t_req,
++	input             t_write,
++	input             t_instr,
++	input       [1:0] t_size,     // AP040_SZ_B/W/L = 0/1/2
++	input      [31:0] t_addr,
++	input      [31:0] t_wdata,    // right-aligned by size
++	input       [2:0] t_fc,
++	input             t_berr,
++	output reg        t_ack,
++	output reg [31:0] t_rdata,    // right-aligned by size, valid at t_ack
++	output            t_active,
++
++	// beat side: aligned longwords with byte lanes
++	output reg        b_req,
++	output reg        b_write,
++	output reg        b_instr,
++	output reg [31:2] b_addr,
++	output reg  [3:0] b_be,
++	output reg [31:0] b_wdata,
++	output reg  [2:0] b_fc,
++	input             b_ack,
++	input      [31:0] b_rdata,
++	output            b_busy
++);
++
++// operand byte count and left-aligned write stream of a new transaction
++wire [2:0] f_bytes = (t_size == `AP040_SZ_B) ? 3'd1 : (t_size == `AP040_SZ_W) ? 3'd2 : 3'd4;
++wire [31:0] f_wsh  = (t_size == `AP040_SZ_B) ? {t_wdata[7:0],  24'd0} :
++                     (t_size == `AP040_SZ_W) ? {t_wdata[15:0], 16'd0} : t_wdata;
++wire  [1:0] f_off  = t_addr[1:0];
++wire  [2:0] f_end  = {1'b0, f_off} + f_bytes;      // 1..7; >4 means split
++wire  [2:0] f_n0   = (f_end > 3'd4) ? (3'd4 - {1'b0, f_off}) : f_bytes;
++
++// be mask covering `count` bytes starting at longword offset `start`
++function [3:0] lanes;
++	input [1:0] start;
++	input [2:0] count;
++	lanes = (4'b1111 << (3'd4 - count)) >> start;
++endfunction
++
++reg        active;
++reg        second;      // a split's 2nd beat is (or will be) in flight
++reg        req_r;       // t_req last clock (free-running)
++reg  [1:0] r_off;
++reg  [2:0] r_bytes;
++reg  [2:0] r_end;
++reg [31:0] r_wsh;
++reg [31:0] r_stream;    // beat-0 read bytes, left-aligned at the top
++
++wire [31:0] rd_stream0 = b_rdata << {r_off, 3'd0};
++wire  [2:0] r_n0       = 3'd4 - {1'b0, r_off};
++
++assign t_active = active;
++assign b_busy   = active | req_r;
++
++always @(posedge clk) req_r <= nreset & t_req;
++
++always @(posedge clk) begin
++	if (!nreset) begin
++		active  <= 0;
++		second  <= 0;
++		t_ack   <= 0;
++		t_rdata <= 0;
++		b_req   <= 0;
++		b_write <= 0;
++		b_instr <= 0;
++		b_addr  <= 0;
++		b_be    <= 0;
++		b_wdata <= 0;
++		b_fc    <= 0;
++		r_off   <= 0;
++		r_bytes <= 0;
++		r_end   <= 0;
++		r_wsh   <= 0;
++		r_stream <= 0;
++	end
++	else if (ce) begin
++		t_ack <= 0;
++
++		if (active && t_berr) begin
++			active <= 0;
++			second <= 0;
++			b_req  <= 0;
++		end
++		else if (!active) begin
++			if (t_req && !t_ack) begin
++				active  <= 1;
++				second  <= 0;
++				r_off   <= f_off;
++				r_bytes <= f_bytes;
++				r_end   <= f_end;
++				r_wsh   <= f_wsh;
++				b_req   <= 1;
++				b_write <= t_write;
++				b_instr <= t_instr;
++				b_addr  <= t_addr[31:2];
++				b_be    <= lanes(f_off, f_n0);
++				b_wdata <= f_wsh >> {f_off, 3'd0};
++				b_fc    <= t_fc;
++			end
++		end
++		else if (b_ack) begin
++			if (!second && r_end > 3'd4) begin
++				// split: issue the tail beat at the next longword
++				second   <= 1;
++				r_stream <= rd_stream0;
++				b_addr   <= b_addr + 1'b1;
++				b_be     <= lanes(2'd0, r_end - 3'd4);
++				b_wdata  <= r_wsh << {r_n0, 3'd0};
++			end
++			else begin
++				active <= 0;
++				second <= 0;
++				b_req  <= 0;
++				t_ack  <= 1;
++				// tail bytes below the operand fall off in the final shift
++				t_rdata <= (second ? (r_stream | (b_rdata >> {r_n0, 3'd0}))
++				                   : rd_stream0) >> {(3'd4 - r_bytes), 3'd0};
++			end
++		end
++	end
++end
++
++endmodule
 diff --git a/rtl/ap040_tg68k_compat.v b/rtl/ap040_tg68k_compat.v
-index 910208c..f3e708e 100644
+index 910208c..b3baaff 100644
 --- a/rtl/ap040_tg68k_compat.v
 +++ b/rtl/ap040_tg68k_compat.v
-@@ -20,12 +20,22 @@ module ap040_tg68k_compat
+@@ -20,12 +20,30 @@ module ap040_tg68k_compat
  	parameter AP040_FAST_SIM     = 0,
  	// Post stores to on-board RAM (the MiSTer wrapper's behaviour).  A bench
  	// that bus-errors a RAM write to test the fault path sets it to 0.
@@ -170,7 +350,15 @@ index 910208c..f3e708e 100644
 +	// passed through to the core; the exception diagnostics are not carried
 +	// by this tree, so only 0 elaborates.
 +	parameter [7:0] AP040_FPU_REVISION = 8'h41,
-+	parameter AP040_DEBUG_EXCEPTIONS = 0
++	parameter AP040_DEBUG_EXCEPTIONS = 0,
++	// 1: the post-cache transactions leave as aligned 32-bit beats with
++	// byte enables (ap040_bus32_adapter, MacQuadra800's wombat_bus32
++	// contract) on the b32_* port and the TG68K-style 16-bit port above
++	// stays idle; the host may also offer a retained physical RAM line
++	// to the cache's fills (cache_line_*).  0: the 16-bit port, as the
++	// Minimig build and the CPU bench use it (NeXT_MiSTer docs/PERF_PLAN.md
++	// stage 3).
++	parameter AP040_BUS32 = 0
  )
  (
  	input         clk,
@@ -180,14 +368,31 @@ index 910208c..f3e708e 100644
  
  	// Physical cacheability windows for the internal caches when no MMU
  	// translation supplies CM attributes: only configured fast RAM may be
-@@ -88,9 +98,20 @@ module ap040_tg68k_compat
+@@ -88,9 +106,37 @@ module ap040_tg68k_compat
  	output        debug_fault,
  	output        debug_halted,
  	output [255:0] debug_status,
 -	output [127:0] debug_status2
 +	output [127:0] debug_status2,
 +	output         debug_exception_valid,
-+	output [511:0] debug_exception
++	output [511:0] debug_exception,
++
++	// AP040_BUS32 = 1: the beat port (see ap040_bus32_adapter.v for the
++	// contract) and the host's retained-line sideband; with 0 the outputs
++	// are idle and the inputs ignored.
++	output         b32_req,
++	output         b32_write,
++	output         b32_instr,
++	output  [31:2] b32_addr,
++	output   [3:0] b32_be,
++	output  [31:0] b32_wdata,
++	output   [2:0] b32_fc,
++	input          b32_ack,
++	input   [31:0] b32_rdata,
++	output         b32_busy,      // a beat in flight or a transaction requested last clock
++	input          cache_line_valid,
++	input   [31:4] cache_line_tag,
++	input  [127:0] cache_line_data
  );
  
 +// NeXT port compatibility (docs/CPU_NEXT_PORT.md): no exception diagnostics here.
@@ -202,7 +407,7 @@ index 910208c..f3e708e 100644
  // core to MMU
  wire        mem_req;
  wire        mem_write;
-@@ -169,6 +190,7 @@ wire  [2:0] pf_fcw;
+@@ -169,6 +215,7 @@ wire  [2:0] pf_fcw;
  ap040_core #(
  	.AP040_HAS_MMU(AP040_HAS_MMU),
  	.AP040_HAS_FPU(AP040_HAS_FPU),
@@ -210,7 +415,7 @@ index 910208c..f3e708e 100644
  	.AP040_ENABLE_CACHE(AP040_ENABLE_CACHE),
  	.AP040_FAST_SIM(AP040_FAST_SIM)
  ) core (
-@@ -407,10 +429,10 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
+@@ -407,10 +454,10 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
  		// target at $F140 among them) and are never posted.
  		// Tied low until 2026-09-19, which left every posted-store path
  		// unexercised by the suite.
@@ -223,3 +428,131 @@ index 910208c..f3e708e 100644
  		.s_stb(snp_stb),
  		.s_addr(snp_addr),
  		.c_ack(mm_ack),
+@@ -431,9 +478,11 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
+ 		.m_fc(b_fc),
+ 		.m_ack(b_ack),
+ 		.m_rdata(b_rdata),
+-		.m_line_valid(1'b0),
+-		.m_line_tag(28'd0),
+-		.m_line_data(128'd0),
++		// the host's retained physical line (a 32-bit host only; the
++		// exact tag compare in the cache makes a foreign line harmless)
++		.m_line_valid((AP040_BUS32 != 0) && cache_line_valid),
++		.m_line_tag(cache_line_tag),
++		.m_line_data(cache_line_data),
+ 		.m_err(berr)
+ 	);
+ end
+@@ -462,32 +511,86 @@ else begin : g_nocache
+ end
+ endgenerate
+ 
+-ap040_bus16_adapter bus16 (
+-	.clk(clk),
+-	.nreset(nreset),
+-	.clkena_in(clkena_in),
+-
+-	.mem_req(b_req),
+-	.mem_berr(berr),
+-	.mem_write(b_write),
+-	.mem_instr(b_instr),
+-	.mem_size(b_size),
+-	.mem_addr(b_addr),
+-	.mem_wdata(b_wdata),
+-	.mem_fc(b_fc),
+-	.mem_ack(b_ack),
+-	.mem_rdata(b_rdata),
+-
+-	.data_in(data_in),
+-	.addr_out(addr_out),
+-	.data_write(data_write),
+-	.nwr(nwr),
+-	.nuds(nuds),
+-	.nlds(nlds),
+-	.busstate(busstate),
+-	.longword(longword),
+-	.fc(fc)
+-);
++generate
++if (AP040_BUS32 == 0) begin : g_bus16
++	ap040_bus16_adapter bus16 (
++		.clk(clk),
++		.nreset(nreset),
++		.clkena_in(clkena_in),
++
++		.mem_req(b_req),
++		.mem_berr(berr),
++		.mem_write(b_write),
++		.mem_instr(b_instr),
++		.mem_size(b_size),
++		.mem_addr(b_addr),
++		.mem_wdata(b_wdata),
++		.mem_fc(b_fc),
++		.mem_ack(b_ack),
++		.mem_rdata(b_rdata),
++
++		.data_in(data_in),
++		.addr_out(addr_out),
++		.data_write(data_write),
++		.nwr(nwr),
++		.nuds(nuds),
++		.nlds(nlds),
++		.busstate(busstate),
++		.longword(longword),
++		.fc(fc)
++	);
++	assign b32_req   = 1'b0;
++	assign b32_write = 1'b0;
++	assign b32_instr = 1'b0;
++	assign b32_addr  = 30'd0;
++	assign b32_be    = 4'd0;
++	assign b32_wdata = 32'd0;
++	assign b32_fc    = 3'd0;
++	assign b32_busy  = 1'b0;
++	wire unused_b32 = b32_ack | (|b32_rdata) | cache_line_valid |
++	                  (|cache_line_tag) | (|cache_line_data);
++end
++else begin : g_bus32
++	ap040_bus32_adapter bus32 (
++		.clk(clk),
++		.nreset(nreset),
++		.ce(clkena_in),
++
++		.t_req(b_req),
++		.t_write(b_write),
++		.t_instr(b_instr),
++		.t_size(b_size),
++		.t_addr(b_addr),
++		.t_wdata(b_wdata),
++		.t_fc(b_fc),
++		.t_berr(berr),
++		.t_ack(b_ack),
++		.t_rdata(b_rdata),
++		.t_active(),
++
++		.b_req(b32_req),
++		.b_write(b32_write),
++		.b_instr(b32_instr),
++		.b_addr(b32_addr),
++		.b_be(b32_be),
++		.b_wdata(b32_wdata),
++		.b_fc(b32_fc),
++		.b_ack(b32_ack),
++		.b_rdata(b32_rdata),
++		.b_busy(b32_busy)
++	);
++	// the 16-bit port idles
++	assign addr_out   = 32'd0;
++	assign data_write = 16'd0;
++	assign nwr        = 1'b1;
++	assign nuds       = 1'b1;
++	assign nlds       = 1'b1;
++	assign busstate   = `AP040_BUS_IDLE;
++	assign longword   = 1'b0;
++	assign fc         = 3'd0;
++	wire unused_b16 = |data_in;
++end
++endgenerate
+ 
+ assign mmu_addr_log = mem_addr;
+ assign cache_maint_req = cinv_req;

@@ -364,3 +364,77 @@ stride-16 access. The store did not stay unchanged either: ~30 -> ~22
 clocks, the write-through half-pairs go out faster now that the adapter is
 not waiting on read round trips in between. The cached loop's 34 -> 8
 clocks is the CPU swap plus the DBcc floor, not stage 2.
+
+## Stage 3: 32-bit host bus (2026-09-25)
+
+Built as docs/PERF_PLAN.md "Stage 3" describes: the CPU wrapper's
+`AP040_BUS32` beat port (`ap040_bus32_adapter.v`, the Quadra's
+`wombat_bus32` shape), `next_system` serving one `ram_*` transaction per
+beat and the 16-bit ROM/VRAM/BMAP/device side as one or two 16-bit
+sub-cycles, and the core's clock enable high through bus waits (only the
+DBcc floor gates idle clocks).  `next_rom` became an explicit altsyncram
+on the way: with the beat address muxed in front of it Quartus 17 no
+longer inferred the array ("uninferred due to asynchronous read logic")
+and 96 KB of registers overflowed the device.
+
+Simulation gates: the CPU suite (17 programs) on the 16-bit bench and on
+the 32-bit bench (`tb_prog32.vvp`, the bench shim `tb_bus32_host16.v`),
+each unpaced, `+pace`, `+pace +paceshift`, `+dbccfloor=4`: all pass;
+`bench_dbf` loop A 2.0 / 4.0 clocks per iteration on the 32-bit bench, the
+boot bench `+loopdump` 4.0; the device suites and smoke boots pass (the
+pre-existing `tb_rtc` and OSD-check failures only); the POST passes
+(`delay(1000)` measured 1008 us).  The kernel-phase profile boots are in
+"Stage 3 profile" below when they finish.
+
+Fit, `NEXT_FIT_QUADRA=1`: seed 9, 38,798 ALMs (93%, +143 over stage 2's
+38,655), 478 M10K, CPU-clock setup +0.84 ns, HDMI PLL domain -0.148 ns
+(the `ascal`/OSD framework paths, see "HDMI PLL domain" below), staged
+ungated as `releases/NeXT_20260925c_stage3_seed9_hdmi-0.15ns.rbf`.
+
+### Stage 3 on hardware (2026-09-25, seed-9 build)
+
+Halted the guest, loaded the seed-9 RBF: POST passes, the NVRAM boot
+command takes the kernel up to the network prompt, Control-C, login
+window, root login, Terminal.  `tb/hw/memlat.c` (`cc -O`, guest us = 25
+clocks):
+
+| access | stage 2, guest ns | stage 2, clocks | stage 3, guest ns | stage 3, clocks |
+|---|---|---|---|---|
+| cached longword load loop | 321.0 | 8.0 | 315.2 | 7.9 |
+| stride-4 byte read (4 per line) | 1,008.8 | 25.2 | 743.1 | **18.6** |
+| stride-16 byte read (one line fill each) | 2,552.2 | 63.8 | 1,584.0 | **39.6** (fill ~32) |
+| stride-64 byte read | 2,660.5 | 66.5 | 1,642.5 | 41.1 |
+| stride-16 longword read | 2,713.9 | 67.8 | 1,742.9 | 43.6 |
+| sequential longword store | 1,192.6 | 29.8 | 875.9 | **21.9** (store ~14) |
+
+The fill went from ~56 to ~32 clocks (one DDR round trip for the first
+beat, the other three beats served from the retained line through the
+32-bit port at ~6 clocks each instead of two 16-bit sub-cycles each), the
+store from ~22 to ~14 (one beat instead of two sub-cycles with a gap).
+NWBench and NXBench on this build: not yet run (the board was handed
+back).
+
+### HDMI PLL domain: the seed walk is the recipe
+
+`quartus_sta` on the seed-9 stage-2 database (`report_timing -to_clock
+<HDMI clock> -npaths 40`, slow 85C and slow 0C): every one of the 40
+worst endpoints is in the framework, `ascal:ascal|*` (o_vcpt_pre2 ->
+o_state.sHSYNC, o_hcpt -> o_pev, o_div -> o_hfrac, the v_poly pipeline)
+and `osd:hdmi_osd|h_cnt -> multiscan`; nothing of this core's is on the
+list.  `sys/` stays stock, so the recipe for a miss there remains the
+seed walk (seed 9 closed at +0.027 ns for stage 2, seed 10 at +0.019 ns
+for stage 3 + 2b).
+
+## Stage 2b: the cache line sideband (2026-09-25, simulation)
+
+`next_ddram` exports its retained line (`ram_line_valid/tag/data`, valid
+only while whole: dropped for the duration of a burst), `next_system`
+latches the CPU's physical line address on each RAM read beat and offers
+`cache_line_valid/tag/data` to the wrapper; the cache copies the other
+beats of a fill from it (`fill_line_match`) in one clock each.  Gates so
+far: the CPU suite on the 32-bit bench with the bench-side line provider
+(`+lineprov`, up to 612 fill words copied per program) under all four
+clock-enable policies passes; device suites and smoke boots pass; POST
+passes.  Fit: seed 10, 38,726 ALMs (92%), 478 M10K, timing closed (HDMI
++0.019 ns): `releases/NeXT_20260925_stage3_2b.rbf`, release-gated, not yet
+on hardware; its kernel-phase profile boot is pending.

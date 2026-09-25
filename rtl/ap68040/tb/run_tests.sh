@@ -14,7 +14,7 @@ RTL=../rtl
 WORK=build
 mkdir -p "$WORK"
 
-SRC="$RTL/ap040_tg68k_compat.v $RTL/ap040_core.v $RTL/ap040_bus16_adapter.v \
+SRC="$RTL/ap040_tg68k_compat.v $RTL/ap040_core.v $RTL/ap040_bus16_adapter.v $RTL/ap040_bus32_adapter.v \
      $RTL/ap040_bus_timeout.v $RTL/ap040_regfile.v $RTL/ap040_alu.v \
      $RTL/ap040_muldiv.v $RTL/ap040_mmu.v $RTL/ap040_cache.v $RTL/ap040_fpu.v \
      $RTL/ap040_walker_cdc.v $RTL/primitives/dpram.v"
@@ -32,11 +32,16 @@ echo "== compiling benches =="
 iverilog -g2012 -I "$RTL" -s tb_ap040_regfile -o "$WORK/tb_regfile.vvp"  tb_ap040_regfile.v $RTL/ap040_regfile.v
 iverilog -g2012 -I "$RTL" -s tb_ap040_alu_arithmetic -o "$WORK/tb_alu_arithmetic.vvp"  tb_ap040_alu_arithmetic.v $RTL/ap040_alu.v
 iverilog -g2012 -I "$RTL" -s tb_ap040_fpu_normalize -o "$WORK/tb_fpu_normalize.vvp"  tb_ap040_fpu_normalize.v $RTL/ap040_fpu.v $RTL/ap040_regfile.v $RTL/primitives/dpram.v
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_prog.vvp"      tb_ap040_program.v $SRC
+iverilog -g2012 -I "$RTL" -o "$WORK/tb_prog.vvp"      tb_ap040_program.v tb_bus32_host16.v $SRC
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_reset.vvp"     tb_ap040_reset.v $SRC
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_dblflt.vvp"    tb_ap040_double_fault.v $SRC
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_walker.vvp"    tb_ap040_walker_cdc.v $RTL/ap040_walker_cdc.v
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_bus16.vvp"     tb_ap040_bus16_gap.v $RTL/ap040_bus16_adapter.v
+iverilog -g2012 -I "$RTL" -o "$WORK/tb_bus32.vvp"     tb_ap040_bus32.v $RTL/ap040_bus32_adapter.v
+# the program bench on the 32-bit beat port (NeXT_MiSTer's bus): the wrapper
+# built with AP040_BUS32 and tb_bus32_host16 serving the beats as the
+# 16-bit sub-cycles the bench's memory model speaks
+iverilog -g2012 -I "$RTL" -DAP040_TB_BUS32=1 -o "$WORK/tb_prog32.vvp" tb_ap040_program.v tb_bus32_host16.v $SRC
 iverilog -g2012 -I "$RTL" -o "$WORK/tb_timeout.vvp"   tb_ap040_bus_timeout.v $RTL/ap040_bus_timeout.v
 iverilog -g2012 -I "$RTL" -s tb_ap040_cache_snoop -o "$WORK/tb_snoop.vvp" \
 	tb_ap040_cache_snoop.v $RTL/ap040_cache.v $RTL/primitives/dpram.v
@@ -73,10 +78,16 @@ run fpu_normalize "$WORK/tb_fpu_normalize.vvp"
 run double_fault "$WORK/tb_dblflt.vvp"
 run walker_cdc   "$WORK/tb_walker.vvp"
 run bus16_gap    "$WORK/tb_bus16.vvp"
+run bus32        "$WORK/tb_bus32.vvp"
+run bus32_gated  "$WORK/tb_bus32.vvp" +gate
+run bus32_lat    "$WORK/tb_bus32.vvp" +lat=3 +gate
 run bus_timeout  "$WORK/tb_timeout.vvp"
 run cache_snoop  "$WORK/tb_snoop.vvp"
 for t in integer exceptions mmu bitfield_mmu bitfield_cache moves_fc movem_restart atcprobe fpu_frames fpu_resume cache fpu branch_early loops_irq; do
 	run "$t" "$WORK/tb_prog.vvp" "+prog=$WORK/t_$t.hex"
+done
+for t in integer exceptions mmu bitfield_mmu bitfield_cache moves_fc movem_restart atcprobe fpu_frames fpu_resume cache fpu branch_early loops_irq; do
+	run "${t}_bus32" "$WORK/tb_prog32.vvp" "+prog=$WORK/t_$t.hex"
 done
 
 if [ $fail -eq 0 ]; then echo "AP68040: ALL TESTS PASSED"; else echo "AP68040: FAILURES"; exit 1; fi

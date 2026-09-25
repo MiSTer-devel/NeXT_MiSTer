@@ -35,7 +35,7 @@ if [ "${EXCEPTION_DIAG:-0}" = 1 ]; then
 	VFLAGS="$VFLAGS $DIAG_FLAGS"
 fi
 
-CPUSRC="$CPU/ap040_tg68k_compat.v $CPU/ap040_core.v $CPU/ap040_bus16_adapter.v \
+CPUSRC="$CPU/ap040_tg68k_compat.v $CPU/ap040_core.v $CPU/ap040_bus16_adapter.v $CPU/ap040_bus32_adapter.v \
         $CPU/ap040_bus_timeout.v $CPU/ap040_regfile.v $CPU/ap040_alu.v \
         $CPU/ap040_muldiv.v $CPU/ap040_mmu.v $CPU/ap040_cache.v $CPU/ap040_fpu.v \
         $CPU/ap040_walker_cdc.v"

@@ -112,9 +112,12 @@ longint s_int_run = 0, s_int_gate = 0, s_bus = 0, s_fill = 0, s_filln = 0,
         s_accW = 0, s_accWn = 0, s_ram = 0, s_ramn = 0, s_dma = 0, s_gap = 0,
         s_rom = 0, s_walk = 0, s_dmae = 0, s_arb = 0;
 
-wire        idle    = (`DUT.busstate == 2'b01);
-wire        busy    = !idle;
-wire [1:0]  hst     = `DUT.state;
+// the beat port: busy while a beat is in flight (or was requested last
+// clock); the core's clock enable is high throughout a beat, so int_gated
+// counts only the DBcc floor's stalls now
+wire        busy    = `DUT.b_busy;
+wire        idle    = !busy;
+wire [2:0]  hst     = `DUT.state;
 wire        cinstr  = `DUT.cpu.mem_instr;
 wire        cwrite  = `DUT.cpu.mem_write;
 
@@ -130,19 +133,21 @@ always @(posedge `TB.clk) if (!`TB.reset) begin : count
 	end
 	else begin
 		case (hst)
-			2'd0: bus_arb[ph]  = bus_arb[ph] + 1;
-			2'd1: bus_int[ph]  = bus_int[ph] + 1;
-			2'd2: bus_ram[ph]  = bus_ram[ph] + 1;
-			2'd3: bus_dmae[ph] = bus_dmae[ph] + 1;
+			3'd0: bus_arb[ph]  = bus_arb[ph] + 1;
+			3'd1: bus_int[ph]  = bus_int[ph] + 1;
+			3'd2: bus_ram[ph]  = bus_ram[ph] + 1;
+			3'd3: bus_dmae[ph] = bus_dmae[ph] + 1;
+			3'd4: bus_int[ph]  = bus_int[ph] + 1;   // S_GAP between the halves
+			default: ;
 		endcase
 	end
-	if (`DUT.cpu.bus16.subcycle_gap) gap_clk[ph] = gap_clk[ph] + 1;
+	if (hst == 3'd4) gap_clk[ph] = gap_clk[ph] + 1;
 	if (`DUT.walker_busy) walker_clk[ph] = walker_clk[ph] + 1;
 	if (`DUT.cpu.cache_posting) post_clk[ph] = post_clk[ph] + 1;
 	if (`TB.dbg_pc[31:24] == 8'h01 || `TB.dbg_pc[31:17] == 15'd0) pc_rom[ph] = pc_rom[ph] + 1;
 
-	// 16-bit bus cycle completions by target
-	if (`DUT.mem_ready) begin
+	// beat completions by target
+	if (`DUT.b_ack) begin
 		if (`DUT.is_write) cyc_wr[ph] = cyc_wr[ph] + 1;
 		if (`DUT.d_ram)       cyc_ram[ph]  = cyc_ram[ph] + 1;
 		else if (`DUT.d_rom)  cyc_rom[ph]  = cyc_rom[ph] + 1;

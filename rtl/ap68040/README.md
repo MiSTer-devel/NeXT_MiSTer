@@ -27,6 +27,7 @@ rtl/                    the core, and nothing else
   ap040_mmu.v           MMU: ATCs, TTRs, hardware table walker
   ap040_cache.v         4-way split I/D cache
   ap040_bus16_adapter.v 32-bit core to 16-bit host bus
+  ap040_bus32_adapter.v 32-bit core to 32-bit host bus (aligned beats with byte enables; NeXT)
   ap040_bus_timeout.v   bus watchdog
   ap040_walker_cdc.v    table-walk port clock crossing
   primitives/dpram.v    inferred true-dual-port RAM -- substitutable

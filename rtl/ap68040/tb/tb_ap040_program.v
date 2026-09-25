@@ -36,6 +36,34 @@ wire  [1:0] busstate;
 wire        longword;
 wire        nresetout;
 wire  [2:0] fc;
+// -DAP040_TB_BUS32=1 builds the wrapper with its 32-bit beat port
+// (AP040_BUS32, NeXT_MiSTer's bus) and tb_bus32_host16 serves the beats as
+// the 16-bit sub-cycles this bench's memory model and magic registers
+// speak; the 16-bit port then idles and the bench's bus wires come from the
+// shim.  0 (the default) drives the 16-bit port directly.
+`ifndef AP040_TB_BUS32
+`define AP040_TB_BUS32 0
+`endif
+localparam TB_BUS32 = `AP040_TB_BUS32;
+wire [31:0] d16_addr_out, h16_addr_out;
+wire [15:0] d16_data_write, h16_data_write;
+wire        d16_nwr, d16_nuds, d16_nlds, h16_nwr, h16_nuds, h16_nlds;
+wire  [1:0] d16_busstate, h16_busstate;
+wire        d16_longword, h16_longword;
+wire  [2:0] d16_fc, h16_fc;
+wire        b32_req, b32_write, b32_instr, b32_busy, b32_ack;
+wire [31:2] b32_addr;
+wire  [3:0] b32_be;
+wire [31:0] b32_wdata, b32_rdata;
+wire  [2:0] b32_fc;
+assign addr_out   = TB_BUS32 ? h16_addr_out   : d16_addr_out;
+assign data_write = TB_BUS32 ? h16_data_write : d16_data_write;
+assign nwr        = TB_BUS32 ? h16_nwr        : d16_nwr;
+assign nuds       = TB_BUS32 ? h16_nuds       : d16_nuds;
+assign nlds       = TB_BUS32 ? h16_nlds       : d16_nlds;
+assign busstate   = TB_BUS32 ? h16_busstate   : d16_busstate;
+assign longword   = TB_BUS32 ? h16_longword   : d16_longword;
+assign fc         = TB_BUS32 ? h16_fc         : d16_fc;
 wire [31:0] cacr_out, vbr_out;
 wire        debug_busy, debug_fault, debug_halted;
 wire [255:0] debug_status;
@@ -103,7 +131,13 @@ initial if ($value$plusargs("dbccfloor=%d", dbcc_floor_n)) dbcc_since = dbcc_flo
 wire        dbcc_in    = (dut.core.state == 8'd53);
 wire        dbcc_entry = dbcc_in & ~dbcc_in_prev;
 wire        dbcc_ok = (dbcc_left == 0) && (dbcc_owed == 0);
-wire        clkena_in = ((busstate == 2'b01) & pace_en & dbcc_ok) | mem_ready | berr;
+// 16-bit port: the TG68K contract, the enable is dropped through a bus
+// wait and pulsed by the completion.  Beat port: the enable stays high
+// while a beat is in flight or was requested last clock (b32_busy) and
+// only idle clocks are gated -- NeXT_MiSTer's next_system policy.
+wire        clkena_in = TB_BUS32
+	? (b32_busy | berr | (pace_en & dbcc_ok))
+	: (((busstate == 2'b01) & pace_en & dbcc_ok) | mem_ready | berr);
 always @(posedge clk) begin
 	dbcc_in_prev <= dbcc_in;
 	if (dbcc_floor_n != 0) begin
@@ -214,7 +248,7 @@ end
 `define AP040_TB_CACHE 1
 `endif
 
-ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE)) dut
+ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE), .AP040_BUS32(TB_BUS32)) dut
 (
 	.clk(clk),
 	.nreset(nreset),
@@ -231,15 +265,29 @@ ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE)) dut
 	.ipl_autovector(1'b1),
 	.berr(berr),
 
-	.addr_out(addr_out),
-	.data_write(data_write),
-	.nwr(nwr),
-	.nuds(nuds),
-	.nlds(nlds),
-	.busstate(busstate),
-	.longword(longword),
+	.addr_out(d16_addr_out),
+	.data_write(d16_data_write),
+	.nwr(d16_nwr),
+	.nuds(d16_nuds),
+	.nlds(d16_nlds),
+	.busstate(d16_busstate),
+	.longword(d16_longword),
 	.nresetout(nresetout),
-	.fc(fc),
+	.fc(d16_fc),
+
+	.b32_req(b32_req),
+	.b32_write(b32_write),
+	.b32_instr(b32_instr),
+	.b32_addr(b32_addr),
+	.b32_be(b32_be),
+	.b32_wdata(b32_wdata),
+	.b32_fc(b32_fc),
+	.b32_ack(b32_ack),
+	.b32_rdata(b32_rdata),
+	.b32_busy(b32_busy),
+	.cache_line_valid(1'b0),
+	.cache_line_tag(28'd0),
+	.cache_line_data(128'd0),
 
 	.mmu_addr_log(),
 	.mmu_addr_phys(),
@@ -265,6 +313,32 @@ ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE)) dut
 	.debug_fault(debug_fault),
 	.debug_halted(debug_halted),
 	.debug_status(debug_status)
+);
+
+// the beat port's host (idle when the 16-bit port is in use)
+tb_bus32_host16 host16 (
+	.clk(clk),
+	.nreset(nreset),
+	.b_req(b32_req),
+	.b_write(b32_write),
+	.b_instr(b32_instr),
+	.b_addr(b32_addr),
+	.b_be(b32_be),
+	.b_wdata(b32_wdata),
+	.b_fc(b32_fc),
+	.b_ack(b32_ack),
+	.b_rdata(b32_rdata),
+	.busstate(h16_busstate),
+	.addr_out(h16_addr_out),
+	.data_write(h16_data_write),
+	.nwr(h16_nwr),
+	.nuds(h16_nuds),
+	.nlds(h16_nlds),
+	.fc(h16_fc),
+	.longword(h16_longword),
+	.data_in(data_in),
+	.mem_ready(mem_ready),
+	.berr(berr)
 );
 
 wire [31:0] dbg_pc = debug_status[31:0];

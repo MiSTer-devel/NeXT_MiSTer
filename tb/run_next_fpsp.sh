@@ -31,7 +31,7 @@ verilator --binary --timing -j 4 -O3 -Wno-fatal --top-module tb_next_fpsp \
     -I"$CPU" -Mdir "$WORK/vl" -o tb_next_fpsp tb_next_fpsp.sv \
     ../rtl/next/dpram.v \
     "$CPU/ap040_tg68k_compat.v" "$CPU/ap040_core.v" \
-    "$CPU/ap040_bus16_adapter.v" "$CPU/ap040_bus_timeout.v" \
+    "$CPU/ap040_bus16_adapter.v" "$CPU/ap040_bus32_adapter.v" "$CPU/ap040_bus_timeout.v" \
     "$CPU/ap040_regfile.v" "$CPU/ap040_alu.v" "$CPU/ap040_muldiv.v" \
     "$CPU/ap040_mmu.v" "$CPU/ap040_cache.v" "$CPU/ap040_fpu.v" \
     "$CPU/ap040_walker_cdc.v" > "$WORK/build.log" 2>&1

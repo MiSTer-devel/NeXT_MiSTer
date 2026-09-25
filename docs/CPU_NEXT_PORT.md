@@ -15,8 +15,9 @@ git apply -p1 --3way <NeXT_MiSTer>/docs/CPU_NEXT_PORT.patch
 ```
 
 The patch touches `rtl/ap040_tg68k_compat.v` (interface),
-`rtl/ap040_cache.v` and `rtl/ap040_mmu.v` (one bug fix each, below). If it
-no longer applies, make the changes by hand; they are small. Then go through
+`rtl/ap040_cache.v` and `rtl/ap040_mmu.v` (one bug fix each, below), and
+adds `rtl/ap040_bus32_adapter.v` (listed in `rtl/ap040.qip`). If it no
+longer applies, make the changes by hand; they are small. Then go through
 the checklist at the end.
 
 ## CPU-side changes
@@ -33,12 +34,15 @@ the checklist at the end.
 | 6 | `ap040_mmu.v`: the PFLUSH/PTEST sweep tracks which row `row_q` holds | **Bug under a gated `ce`** (see "Five bugs" below). |
 | 7 | `ap040_cache.v`: `xsnooped` (the crossing read's snoop guard) set free-running like `look_snooped`/`fill_snooped` | **Bug under a gated `ce`, hardware only** (see "Five bugs" below). |
 | 8 | `ap040_cache.v`: `tag_ridx` switches to the crossing read's second row only on the clock the FSM takes the `xlook_read` step (`ce && xlook_read`) | **Bug under a gated `ce`, hardware only** (bug 5 in "Five bugs" below): the un-qualified combinational `xlook_read` moved the tag row one clock early. |
+| 9 | wrapper: `parameter AP040_BUS32 = 0`; with 1 the post-cache transactions leave on the 32-bit beat port `b32_*` through the new `ap040_bus32_adapter.v` (MacQuadra800's `wombat_bus32` contract plus instr/FC and `b32_busy`) and the 16-bit port idles; inputs `cache_line_valid/tag/data` feed the cache's `m_line_*` sideband (gated by the parameter) | NeXT's 32-bit host bus (docs/PERF_PLAN.md stage 3) and, next, the retained-line sideband (stage 2b). With 0 the wrapper is the Minimig/CPU-bench one as before. |
 
 ## NeXT-side changes
 
 | file | change | why |
 |---|---|---|
 | `rtl/next/next_system.sv` | `POST_STORES` parameter (default 0), `.AP040_POST_LO/HI` = main RAM | With 0 no store is posted (the old CPU's behaviour); 1 posts stores to main RAM only. Both boot NeXTSTEP identically in simulation once the bugs below are fixed; the default stays 0 until the posted path has been run on hardware. |
+| `rtl/next/next_system.sv` | `.AP040_BUS32(1)`: the bus FSM consumes beats (one `ram_*` transaction per beat; the 16-bit ROM/VRAM/BMAP/device side served as one or two 16-bit sub-cycles, upper half first); `clkena = b_busy \| berr_hold \| (pace & ~dbcc_stall)` | docs/PERF_PLAN.md stage 3. The core's clock enable stays high through bus waits (the Quadra's mode, `MacQuadra800.sv` ties `ce` to 1); only idle clocks are gated. |
+| `rtl/ap68040/tb/tb_bus32_host16.v`, `tb_ap040_program.v` `-DAP040_TB_BUS32=1`, `tb_ap040_bus32.v` | the CPU suite on the 32-bit path: a bench shim serves the beats as the 16-bit sub-cycles the bench's memory model and magic registers speak; a directed adapter test | `run_tests.sh` builds `tb_prog32.vvp` and runs every program on both ports. |
 | `rtl/next/next_system.sv` | `walker_ack`/`walker_berr` held as a LEVEL until `walker_req` drops | **Bug under a gated `ce`** (see "Five bugs" below). The MMU only samples the ack under `ce`. |
 | `rtl/next/dpram.v` | `dpram` = MacQuadra800's `altsyncram` wrapper | Read-during-write semantics the CPU RAMs need on M10K (see "dpram" below). |
 | `rtl/next/dpram.v`, `ap040_cache.v` | `NEXT_RAM_PESSIMISTIC` (Verilator only) | The simulation models of the tag/ATC RAMs and the cache data arrays behave like the silicon: garbage on a mixed-port collision, NEW data on a same-port write-then-read, every collision counted and the first few printed (`-DNEXT_RAM_PESSIMISTIC` on the verilator line). Used to rule RAM semantics out for bug 5: NeXTSTEP boots under it. |
@@ -242,7 +246,9 @@ thousands of times while you read the window), and keep the capture small
 4. The post-store window (`AP040_POST_LO/HI`) still exists in the wrapper.
 5. **Run the CPU suite under every clock-enable policy**: `vvp build/tb_prog.vvp
    +prog=... +pace`, `+pace +paceshift` and `+dbccfloor=4` for every test
-   as well as unpaced. Anything that only fails gated is a `ce`
+   as well as unpaced, and the same on `build/tb_prog32.vvp` (the 32-bit
+   beat port NeXT uses; its `clkena` policy differs: high through bus
+   waits, idle clocks gated). Anything that only fails gated is a `ce`
    hazard of the kind above. `t_xline`, `t_xline_mmu`, `t_atcprobe` are the
    directed tests.
 6. NeXT-relevant CPU fixes are present, by their directed tests in

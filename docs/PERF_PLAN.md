@@ -320,12 +320,13 @@ does, which also gates valid with `!buffered_store_pending`; with
 `POST_STORES=0` there is no such thing here) and drive them from
 `next_ddram`'s retained line, translated through the host:
 
-- tag: the CPU's PHYSICAL address of the line, i.e. `cpu_addr[31:4]` at
+- tag: the CPU's PHYSICAL address of the line, i.e. `b_addr[31:4]` at
   the time of the fill, not `ram_addr`: the MWF mirrors at 0x10-0x1F map
   to the same RAM and the cache compares against the address it asked
-  for. Simplest: `next_system` latches `cpu_addr[31:4]` when it issues a
-  CPU RAM read and presents `{that, line_valid && (ram_addr line == the
-  latched line)}`.
+  for. Simplest: `next_system` latches `b_addr[31:4]` when it issues a
+  CPU RAM read beat and presents `{that, line_valid && (ram_addr line ==
+  the latched line)}`.  (The wrapper inputs `cache_line_valid/tag/data`
+  exist since stage 3.)
 - data: the retained line, word 0 in [127:96] (already that order).
 - valid must drop the clock a write lands in the line (a store from the
   same CPU is write-through and also updates the cache's own copy, but a
@@ -344,34 +345,104 @@ the same boot/post/profile/hardware sequence.
 
 ---------------------------------------------------------------------------
 
-## Stage 3 (outline): 32-bit host bus, Quadra style
+## Stage 3: 32-bit host bus, Quadra style (built 2026-09-25)
 
-Replace `ap040_bus16_adapter` (130 ALMs) with the Quadra's beat shape
-(`MacQuadra800_MiSTer/rtl/wombat_bus32.sv`: aligned longword beats with
-byte enables, `b_req` level-held per beat, `b_ack` one-clock pulse,
-`b_be[3]` = byte at addr+0 = `b_wdata[31:24]`, `t_berr` aborts), driven
-from the cache's `m_*` port the way `wombat_cpu.sv` does, and rewrite
-`next_system`'s bus FSM for 32-bit beats:
+### What and why
 
-- RAM: one `ram_*` transaction per beat (the port is already 32-bit with
-  byte enables) -> half the transactions of today for every RAM access.
-- Devices, ROM, VRAM, BMAP are 16-bit (`io_rdata`, `rom_q`, `vram_q`,
-  `bmap_rdata`, the `lanes`/`nuds`/`nlds` decode in every `next_*`
-  register file): keep them 16-bit behind a shim in `next_system` that
-  turns a beat with `be[3:2]` and/or `be[1:0]` into one or two
-  sequential 16-bit internal cycles (`S_INT` twice). Device semantics
-  that depend on access width (the ESP FIFO, the SCC, KMS data port)
-  need each 16-bit half presented as its own access exactly as today.
-- DMA snoop (`dma_snoop_addr`), `walker_*` (already 32-bit), the
-  `berr` path (`d_any`), `POST_STORES` window: unchanged in meaning.
-- Together with 2b the fill is one beat (~16 clocks) plus 3 copies.
+Every CPU access to RAM was two 16-bit sub-cycles of the TG68K-shaped
+bus (four for a misaligned longword), each a full `next_system` FSM
+round trip plus the adapter's gap clock, and the core's clock enable was
+dropped for the whole wait.  The Quadra's bus shape replaces that:
+aligned longword beats with byte enables, one `ram_*` transaction per
+beat, and the core kept running while a beat is in flight.
 
-Fit: net +100-200 ALMs. Gates: the whole list of stage 2 plus every
-device bench in `tb/run_tests.sh` (they drive the 16-bit register
-ports directly, so they will not see the shim; the boot benches do),
-`tb/run_audio_audit.sh`, and the hardware SCSI/floppy/ethernet/sound
-paths. This stage is specified in full only after stages 1 and 2 are
-measured on hardware.
+### Where
+
+- `rtl/ap68040/rtl/ap040_bus32_adapter.v` (new): the
+  `MacQuadra800_MiSTer/rtl/wombat_bus32.sv` splitter with the
+  instruction/FC attributes carried to the beat and a `b_busy` output.
+  Contract: `b_req` level-held per beat (the 2nd beat of a split follows
+  with a new address while `b_req` stays high, so the host accepts on
+  `b_req && !its-own-registered-ack`, never on an edge); `b_ack` a
+  one-clock pulse with `b_rdata`; `b_be[3]` = byte at `b_addr+0` =
+  `b_wdata[31:24]`, valid for reads too; `t_berr` aborts the transaction
+  (no ack, request dropped); `b_busy` = a beat in flight or a transaction
+  requested last clock.
+- `rtl/ap68040/rtl/ap040_tg68k_compat.v`: `parameter AP040_BUS32` (0: the
+  16-bit port as before, the CPU bench's default; 1: the beat port
+  `b32_*` and the 16-bit outputs idle), and the cache's line sideband
+  exposed as inputs `cache_line_valid/tag/data` (gated by the parameter,
+  tied to 0 by `next_system` until stage 2b).  Wrapper edit 9 in
+  `docs/CPU_NEXT_PORT.md`; the patch carries it.
+- `rtl/next/next_system.sv`: the bus FSM speaks beats.  RAM: `ram_be =
+  b_be`, `ram_din = b_wdata`, `b_rdata = ram_dout`, one transaction.
+  ROM/VRAM/BMAP/devices: the 16-bit shim: `cpu_addr = {b_addr, half,
+  1'b0}`, `lanes = half ? b_be[1:0] : b_be[3:2]`, `cpu_dout` the
+  matching half, `is_write = b_write`; the FSM runs `S_INT` for the upper
+  half (skipped when `b_be[3:2] == 0`), `S_GAP` (one idle clock, the
+  lower half's address settles for the ROM's and VRAM's synchronous
+  read), `S_INT` for the lower half, then `b_ack`.  Every device keeps
+  its 16-bit register file and sees the same accesses in the same order
+  as on the 16-bit bus (a longword read of the event counter still
+  latches on its first half).  `cpu_req = b_req && !b_ack && !berr_hold`.
+  `berr_hold` is set on `!d_any` and cleared when the adapter has
+  dropped the beat (`!b_req`): two clocks of `berr`, as before.  Walker,
+  DMA arbitration, `dma_snoop`, `POST_STORES`: unchanged.
+- Clock enable: `clkena = b_busy | berr_hold | (pace & ~dbcc_stall)`.
+  The core runs through bus waits (the mode the Quadra validated the
+  tree in, `MacQuadra800.sv` ties `ce` to 1), so the tail of a fill
+  overlaps execution once the requested word is in; only idle clocks are
+  gated, by the DBcc floor (and `CPU_PACE` if selected).  `b_busy`
+  includes "requested last clock", so a request that lands during a
+  stall starts at most one clock late and the rest of the stall hides
+  under the bus wait, keeping loop B of `bench_dbf` at its old cost.
+
+### Benches
+
+- `rtl/ap68040/tb/tb_ap040_bus32.v`: the adapter alone, every size at
+  every alignment read and write (data, beat count, byte enables), the
+  instruction/FC pass-through, a bus error on a first and on a tail beat
+  (no ack, dropped, the next transaction runs), a four-beat fill; run
+  plain, `+gate` (the host's ce policy: idle clocks gated), `+lat=N`.
+- `rtl/ap68040/tb/tb_bus32_host16.v` + `-DAP040_TB_BUS32=1` in
+  `tb_ap040_program.v`: the whole CPU suite on the 32-bit path.  The
+  shim serves the beats as the 16-bit sub-cycles the bench's memory
+  model, latency model, magic registers and bus-error injection speak
+  (the same split `next_system` makes), and `clkena_in` follows the
+  host policy.  `run_tests.sh` builds `tb_prog32.vvp` and runs every
+  program on both; the WSL legs script runs both under `+pace`,
+  `+pace +paceshift` and `+dbccfloor=4` too.
+- `tb/tb_next_boot.sv` and `tb/next_profile_monitor.sv` read the beat
+  port (`b_ack` per beat, `b_be`, 32-bit data); `+loopdump` takes `n`
+  from one longword beat.
+
+### Gates
+
+1. CPU suite: `tb_prog.vvp` (16-bit, unchanged behaviour) and
+   `tb_prog32.vvp`, unpaced, `+pace`, `+pace +paceshift`, `+dbccfloor=4`;
+   `bench_dbf` loop A 2.0 / 4.0 clocks per iteration on the 32-bit
+   bench, loops B and C unchanged between the two ce policies.
+2. `tb/run_tests.sh` (device suites, smoke boots) and `post`.
+3. `+bootsd` to 2,400M clocks ALL PASS; the profile at `+ddrlat=6` and
+   `+ddrlat=12`: kernel-phase fills and RAM wait (stage 2: 55 clocks,
+   11%).
+4. `run_next_fpsp.sh` / `run_fpu_revision_tests.sh` (they build the
+   16-bit wrapper directly, unchanged).
+5. Quartus `NEXT_FIT_QUADRA=1`, `release.sh`, then hardware: POST, `bsd`,
+   NWBench, `memlat` (stride-16 read, the fill, and the sequential store
+   are the numbers to move).
+
+### Stage 2b now
+
+With the wrapper ports in place, 2b is `next_ddram` exporting its
+retained line (`line_valid`, `line_tag[21:0]`, `line[127:0]`) through a
+new `ram_line_*` output group of the `ram_*` port, and `next_system`
+latching `b_addr[31:4]` on each CPU RAM read beat and presenting
+`cache_line_valid = line_valid && (line_tag == latched[25:4]) && latched
+is RAM && no DMA write to that line since`, `cache_line_tag = latched`,
+`cache_line_data = line`.  The cache's `fill_line_match` then copies
+beats 1-3 in one clock each: the fill becomes one beat plus three
+copies.
 
 ---------------------------------------------------------------------------
 

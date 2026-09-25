@@ -19,9 +19,16 @@
 //  The MWF mirrors are plain accesses for now (MWF0 = copy); the raster
 //  op write functions are a TODO documented in docs/PORTING.md.
 //
-//  The CPU bus follows the TG68K-shaped protocol of ap040_tg68k_compat
-//  (see rtl/AP68040/tb/tb_ap040_program.v): the host pulses mem_ready for
-//  one cycle to complete an access, clkena_in = idle | mem_ready | berr.
+//  The CPU bus is the 32-bit beat port of ap040_tg68k_compat with
+//  AP040_BUS32 (ap040_bus32_adapter.v: aligned longword beats with byte
+//  enables, b_req level-held per beat, b_ack a one-clock pulse, berr
+//  aborts).  Main RAM takes a beat as one ram_* transaction; the ROM,
+//  VRAM, BMAP and the device registers are 16-bit and take it as one or
+//  two 16-bit sub-cycles (upper half first), which is exactly the access
+//  sequence the old 16-bit CPU bus produced, so every device keeps its
+//  16-bit register file (docs/PERF_PLAN.md stage 3).  The core's clock
+//  enable stays high while a beat is in flight (the mode the CPU tree is
+//  validated in); only idle clocks are gated, by the DBcc floor below.
 //============================================================================
 
 module next_system #(
@@ -178,14 +185,15 @@ module next_system #(
 // CPU
 //----------------------------------------------------------------------------
 
-wire [15:0] cpu_din;
-wire [31:0] cpu_addr;
-wire [15:0] cpu_dout;
-wire        nwr, nuds, nlds;
-wire  [1:0] busstate;
-wire        longword;
+// the CPU's beat port (ap040_bus32_adapter.v for the contract)
+wire        b_req, b_write, b_instr, b_busy;
+wire [31:2] b_addr;
+wire  [3:0] b_be;
+wire [31:0] b_wdata;
+wire  [2:0] b_fc;
+reg         b_ack;
+reg  [31:0] b_rdata;
 wire        nresetout;
-wire  [2:0] fc;
 
 wire        walker_req, walker_we;
 wire [31:0] walker_addr, walker_wdat;
@@ -193,7 +201,6 @@ reg         walker_ack;
 reg  [31:0] walker_data;
 reg         walker_berr;
 
-reg         mem_ready;
 reg         berr_hold;
 
 // snoop pulse for DMA writes into main RAM (one per acknowledged write)
@@ -278,7 +285,10 @@ reg  [2:0] dbcc_left  = 0;      // stall clocks still owed
 wire       dbcc_entry = in_dbcc & ~dbcc_prev;
 wire       dbcc_stall = (dbcc_left != 0);
 
-wire clkena = ((busstate == 2'b01) & pace & ~dbcc_stall) | mem_ready | berr_hold;
+// b_busy: a beat in flight or a transaction requested last clock, so a
+// request arriving during a stall starts one clock later at most and the
+// rest of the stall hides under the bus wait, as it did on the 16-bit bus
+wire clkena = b_busy | berr_hold | (pace & ~dbcc_stall);
 
 always @(posedge clk) begin
 	dbcc_prev <= in_dbcc;
@@ -309,7 +319,8 @@ ap040_tg68k_compat #(
 	.AP040_POST_STORES(POST_STORES),
 	.AP040_POST_LO(32'h0400_0000),
 	.AP040_POST_HI(32'h0800_0000),
-	.AP040_DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
+	.AP040_DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
+	.AP040_BUS32(1)
 ) cpu
 (
 	.clk(clk),
@@ -332,20 +343,36 @@ ap040_tg68k_compat #(
 	.cache_z3_base1(4'd0),
 	.cache_z3_ena1(1'b0),
 
-	.data_in(cpu_din),
+	// the 16-bit port idles (AP040_BUS32)
+	.data_in(16'd0),
 	.ipl(~ipl_level),
 	.ipl_autovector(1'b1),
 	.berr(berr_hold),
 
-	.addr_out(cpu_addr),
-	.data_write(cpu_dout),
-	.nwr(nwr),
-	.nuds(nuds),
-	.nlds(nlds),
-	.busstate(busstate),
-	.longword(longword),
+	.addr_out(),
+	.data_write(),
+	.nwr(),
+	.nuds(),
+	.nlds(),
+	.busstate(),
+	.longword(),
 	.nresetout(nresetout),
-	.fc(fc),
+	.fc(),
+
+	.b32_req(b_req),
+	.b32_write(b_write),
+	.b32_instr(b_instr),
+	.b32_addr(b_addr),
+	.b32_be(b_be),
+	.b32_wdata(b_wdata),
+	.b32_fc(b_fc),
+	.b32_ack(b_ack),
+	.b32_rdata(b_rdata),
+	.b32_busy(b_busy),
+	// the retained-line sideband (docs/PERF_PLAN.md stage 2b): not yet
+	.cache_line_valid(1'b0),
+	.cache_line_tag(28'd0),
+	.cache_line_data(128'd0),
 
 	.mmu_addr_log(),
 	.mmu_addr_phys(),
@@ -387,8 +414,25 @@ always @(posedge clk) dev_reset <= reset | ~nresetout;
 // address decode
 //----------------------------------------------------------------------------
 
-wire is_write = (busstate == 2'b11);
-wire [1:0] lanes = {~nuds, ~nlds};
+localparam S_IDLE = 3'd0, S_INT = 3'd1, S_RAM = 3'd2, S_RAM_E = 3'd3, S_GAP = 3'd4;
+reg  [2:0] state;
+
+// The 16-bit view of the beat for the ROM, VRAM, BMAP and the device
+// registers: a beat is served to them as one or two 16-bit sub-cycles
+// (S_INT), the upper half (bytes 0-1, b_be[3:2]) first, then after an
+// idle clock (S_GAP) the lower half (b_be[1:0]); a half with no byte
+// enabled is skipped.  cpu_addr/lanes/cpu_dout/is_write are the same
+// signals the old 16-bit CPU bus drove, so the devices see the same
+// accesses in the same order (a longword read of the event counter still
+// latches on its first half, the ESP FIFO still sees one 16-bit access
+// per half).  The address is valid in the clock before S_INT for the
+// ROM's and the VRAM's synchronous read.
+reg         half_r;
+wire        half     = half_r | ((state == S_IDLE) && (b_be[3:2] == 2'b00));
+wire [31:0] cpu_addr = {b_addr, half, 1'b0};
+wire  [1:0] lanes    = half ? b_be[1:0] : b_be[3:2];
+wire [15:0] cpu_dout = half ? b_wdata[15:0] : b_wdata[31:16];
+wire        is_write = b_write;
 
 wire d_rom  = (cpu_addr[31:17] == 15'h0000) || (cpu_addr[31:17] == {8'h01, 7'd0});
 wire d_io   = (cpu_addr[31:24] == 8'h02) &&
@@ -405,15 +449,13 @@ wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
 // bus cycle state machine
 //----------------------------------------------------------------------------
 
-localparam S_IDLE = 2'd0, S_INT = 2'd1, S_RAM = 2'd2, S_RAM_E = 2'd3;
-
-reg  [1:0] state;
 localparam G_ENET = 3'd0, G_MO = 3'd1, G_SND = 3'd2, G_SCSI = 3'd3, G_PRINT = 3'd4, G_SNDIN = 3'd5;
 reg  [2:0] dma_grant;
 reg        sel_rom, sel_vram, sel_io, sel_bmap;
-reg [15:0] cyc_rdata;
 
-wire cpu_req = (busstate != 2'b01) && !mem_ready && !berr_hold;
+// a beat to serve: not the retire clock of the one just acknowledged (the
+// adapter still shows it under b_ack), not while a bus error is reported
+wire cpu_req = b_req && !b_ack && !berr_hold;
 
 // walker service (the core never runs walker and CPU bus cycles at the
 // same time, see tb_ap040_program.v)
@@ -424,8 +466,9 @@ reg  walker_busy;
 // internal read data mux (valid in cycle S_INT)
 wire [15:0] rom_q, vram_q, io_rdata, bmap_rdata;
 wire        bmap_tpe_select;
-
-assign cpu_din = cyc_rdata;
+wire [15:0] int_rdata = sel_rom  ? rom_q :
+                        sel_vram ? vram_q :
+                        sel_bmap ? bmap_rdata : io_rdata;
 
 assign en_m_ack = (state == S_RAM_E) && (dma_grant == G_ENET) && ram_ack;
 assign mo_m_ack = (state == S_RAM_E) && (dma_grant == G_MO) && ram_ack;
@@ -451,7 +494,7 @@ assign pr_m_err = pr_m_req && !pr_m_is_ram;
 assign si_m_err = si_m_req && !si_m_is_ram;
 
 always @(posedge clk) begin
-	mem_ready  <= 0;
+	b_ack <= 0;
 	// The walker's acknowledge is a LEVEL held until the MMU drops its
 	// request, not a one-clock pulse: the MMU samples it only under the
 	// CPU's clock enable, and with the core paced (CPU_PACE 1 of 2) a
@@ -473,9 +516,12 @@ always @(posedge clk) begin
 		ram_req <= 0;
 		walker_armed <= 1;
 		walker_busy <= 0;
+		half_r <= 0;
 	end
 	else begin
-		if (berr_hold && busstate == 2'b01) berr_hold <= 0;
+		// the adapter drops the faulted beat on the next enabled clock;
+		// berr stays up until it has (two clocks, as on the 16-bit bus)
+		if (berr_hold && !b_req) berr_hold <= 0;
 		if (!walker_req) walker_armed <= 1;
 
 		case (state)
@@ -560,33 +606,55 @@ always @(posedge clk) begin
 					state <= S_RAM_E;
 				end
 			end
-			else if (cpu_req && !berr_hold) begin
+			else if (cpu_req) begin
 				if (!d_any) berr_hold <= 1;
 				else if (d_ram) begin
+					// one 32-bit transaction per beat
 					ram_req  <= 1;
-					ram_we   <= is_write;
-					ram_be   <= cpu_addr[1] ? {2'b00, lanes} : {lanes, 2'b00};
-					ram_addr <= cpu_addr[25:2];
-					ram_din  <= {cpu_dout, cpu_dout};
+					ram_we   <= b_write;
+					ram_be   <= b_be;
+					ram_addr <= b_addr[25:2];
+					ram_din  <= b_wdata;
 					state    <= S_RAM;
 				end
 				else begin
+					// 16-bit target: first sub-cycle (the upper half unless
+					// it has no byte enabled)
 					sel_rom  <= d_rom;
 					sel_vram <= d_vram;
 					sel_io   <= d_io;
 					sel_bmap <= d_bmap;
+					half_r   <= half;
 					state    <= S_INT;
 				end
 			end
 		end
 
 		S_INT: begin
-			cyc_rdata <= sel_rom  ? rom_q :
-			             sel_vram ? vram_q :
-			             sel_bmap ? bmap_rdata : io_rdata;
-			mem_ready <= 1;
+			// the sub-cycle: the selected target sees sel/we/lanes/wdata
+			// in this clock and its read data is taken at the end of it
 			{sel_rom, sel_vram, sel_io, sel_bmap} <= 0;
-			state <= S_IDLE;
+			if (half_r) b_rdata[15:0]  <= int_rdata;
+			else        b_rdata[31:16] <= int_rdata;
+			if (!half_r && (b_be[1:0] != 2'b00)) begin
+				half_r <= 1;
+				state  <= S_GAP;
+			end
+			else begin
+				half_r <= 0;
+				b_ack  <= 1;
+				state  <= S_IDLE;
+			end
+		end
+
+		S_GAP: begin
+			// one idle clock between the two halves (the address of the
+			// lower half settles for the ROM's and the VRAM's read)
+			sel_rom  <= d_rom;
+			sel_vram <= d_vram;
+			sel_io   <= d_io;
+			sel_bmap <= d_bmap;
+			state    <= S_INT;
 		end
 
 		S_RAM: begin
@@ -598,8 +666,8 @@ always @(posedge clk) begin
 					walker_data <= ram_dout;
 				end
 				else begin
-					cyc_rdata <= cpu_addr[1] ? ram_dout[15:0] : ram_dout[31:16];
-					mem_ready <= 1;
+					b_rdata <= ram_dout;
+					b_ack   <= 1;
 				end
 				state <= S_IDLE;
 			end

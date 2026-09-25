@@ -403,15 +403,19 @@ end
 // bus monitor
 //----------------------------------------------------------------------------
 
-wire [31:0] cpu_addr  = dut.cpu_addr;
-wire  [1:0] busstate  = dut.busstate;
-wire        mem_ready = dut.mem_ready;
-wire [15:0] cpu_din   = dut.cpu_din;
-wire [15:0] cpu_dout  = dut.cpu_dout;
+// the CPU's beat port: mem_ready is one completion per aligned longword
+// beat (b_ack), with the address, byte enables and data of that beat
+wire [31:0] cpu_addr  = {dut.b_addr, 2'b00};
+wire  [3:0] cpu_be    = dut.b_be;
+wire        mem_ready = dut.b_ack;
+wire [31:0] cpu_din   = dut.b_rdata;
+wire [31:0] cpu_dout  = dut.b_wdata;
+wire        is_write  = dut.b_write;
 wire        berr_hold = dut.berr_hold;
+// the 16-bit half a narrow access carries (device registers are 16-bit)
+wire [15:0] cpu_data16 = (cpu_be[3:2] != 2'b00) ? (is_write ? cpu_dout[31:16] : cpu_din[31:16])
+                                                : (is_write ? cpu_dout[15:0]  : cpu_din[15:0]);
 
-// latch the address of the cycle being completed: mem_ready comes two
-// cycles after dispatch, while the CPU still holds addr_out
 integer access_count = 0;
 reg [31:0] first_addr [0:3];
 
@@ -428,7 +432,6 @@ integer iolog_n = 0;
 reg [63:0] iolog [0:1023];       // {we, addr[30:0], data[15:0], pc[15:0]}
 
 wire is_io_cyc = (cpu_addr[31:24] == 8'h02);
-wire is_write  = (busstate == 2'b11);
 
 always @(posedge clk) begin
 	if (!reset) begin
@@ -443,8 +446,8 @@ always @(posedge clk) begin
 			if ((cpu_addr[31:17] == 15'h0100 || cpu_addr[31:17] == 15'h0108) &&
 			    (cpu_addr[16:0] >= 17'h0c000 && cpu_addr[16:0] < 17'h0c004) && !is_write) begin
 				seen_scr1 <= 1;
-				if (!cpu_addr[1] && cpu_din == 16'h0001) scr1_ok <= 1;
-				if ( cpu_addr[1] && cpu_din == 16'h2052) scr1_ok <= 1;
+				if (cpu_be[3:2] != 2'b00 && cpu_din[31:16] == 16'h0001) scr1_ok <= 1;
+				if (cpu_be[1:0] != 2'b00 && cpu_din[15:0]  == 16'h2052) scr1_ok <= 1;
 			end
 
 			if ((cpu_addr[31:24] == 8'h02) &&
@@ -454,11 +457,10 @@ always @(posedge clk) begin
 			// which bit-bangs the RTC forever: recording that scrolls
 			// the conversation that caused the fault out of the ring.
 			if (is_io_cyc && berr_count < 2) begin
-				iolog[iolog_n % 1024] <= {is_write, cpu_addr[30:0], is_write ? cpu_dout : cpu_din, dbg_pc[15:0]};
+				iolog[iolog_n % 1024] <= {is_write, cpu_addr[30:0], cpu_data16, dbg_pc[15:0]};
 				iolog_n = iolog_n + 1;
 			end
 		end
-		if (berr_hold && busstate != 2'b01) ;
 		if (dbg_pc == 32'h0100001E) seen_entry <= 1;
 	end
 end
@@ -555,8 +557,8 @@ wire is_enet_cyc = (cpu_addr[31:24] == 8'h02) &&
 
 always @(posedge clk) begin
 	if (!reset && mem_ready && is_enet_cyc && $test$plusargs("entrace"))
-		$display("[%0t] EN %s %08x data=%04x pc=%08x",
-		         $time, is_write ? "WR" : "RD", cpu_addr,
+		$display("[%0t] EN %s %08x be=%b data=%08x pc=%08x",
+		         $time, is_write ? "WR" : "RD", cpu_addr, cpu_be,
 		         is_write ? cpu_dout : cpu_din, dbg_pc);
 end
 
@@ -588,8 +590,8 @@ always @(posedge clk) begin
 	// on every core (the front end need not present that PC), this does.
 	if ($test$plusargs("loopdump")) begin
 		if (dbg_pc == 32'h010024cc && loop_t0 == 0) begin loop_t0 = $time; loop_n = 0; loop_nw = 0; end
-		if (loop_t0 != 0 && mem_ready && !is_write && loop_nw < 2) begin
-			loop_n = {loop_n[15:0], cpu_din}; loop_nw = loop_nw + 1;
+		if (loop_t0 != 0 && mem_ready && !is_write && loop_nw < 1) begin
+			loop_n = cpu_din; loop_nw = loop_nw + 1;
 		end
 		if (dbg_pc == 32'h010024fc && loop_t0 != 0) begin
 			if (($time - loop_t0) / 10 > 40)   // n <= 3 returns before the loop

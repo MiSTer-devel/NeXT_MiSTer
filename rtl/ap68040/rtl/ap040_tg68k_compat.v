@@ -29,7 +29,15 @@ module ap040_tg68k_compat
 	// passed through to the core; the exception diagnostics are not carried
 	// by this tree, so only 0 elaborates.
 	parameter [7:0] AP040_FPU_REVISION = 8'h41,
-	parameter AP040_DEBUG_EXCEPTIONS = 0
+	parameter AP040_DEBUG_EXCEPTIONS = 0,
+	// 1: the post-cache transactions leave as aligned 32-bit beats with
+	// byte enables (ap040_bus32_adapter, MacQuadra800's wombat_bus32
+	// contract) on the b32_* port and the TG68K-style 16-bit port above
+	// stays idle; the host may also offer a retained physical RAM line
+	// to the cache's fills (cache_line_*).  0: the 16-bit port, as the
+	// Minimig build and the CPU bench use it (NeXT_MiSTer docs/PERF_PLAN.md
+	// stage 3).
+	parameter AP040_BUS32 = 0
 )
 (
 	input         clk,
@@ -100,7 +108,24 @@ module ap040_tg68k_compat
 	output [255:0] debug_status,
 	output [127:0] debug_status2,
 	output         debug_exception_valid,
-	output [511:0] debug_exception
+	output [511:0] debug_exception,
+
+	// AP040_BUS32 = 1: the beat port (see ap040_bus32_adapter.v for the
+	// contract) and the host's retained-line sideband; with 0 the outputs
+	// are idle and the inputs ignored.
+	output         b32_req,
+	output         b32_write,
+	output         b32_instr,
+	output  [31:2] b32_addr,
+	output   [3:0] b32_be,
+	output  [31:0] b32_wdata,
+	output   [2:0] b32_fc,
+	input          b32_ack,
+	input   [31:0] b32_rdata,
+	output         b32_busy,      // a beat in flight or a transaction requested last clock
+	input          cache_line_valid,
+	input   [31:4] cache_line_tag,
+	input  [127:0] cache_line_data
 );
 
 // NeXT port compatibility (docs/CPU_NEXT_PORT.md): no exception diagnostics here.
@@ -453,9 +478,11 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.m_fc(b_fc),
 		.m_ack(b_ack),
 		.m_rdata(b_rdata),
-		.m_line_valid(1'b0),
-		.m_line_tag(28'd0),
-		.m_line_data(128'd0),
+		// the host's retained physical line (a 32-bit host only; the
+		// exact tag compare in the cache makes a foreign line harmless)
+		.m_line_valid((AP040_BUS32 != 0) && cache_line_valid),
+		.m_line_tag(cache_line_tag),
+		.m_line_data(cache_line_data),
 		.m_err(berr)
 	);
 end
@@ -484,32 +511,86 @@ else begin : g_nocache
 end
 endgenerate
 
-ap040_bus16_adapter bus16 (
-	.clk(clk),
-	.nreset(nreset),
-	.clkena_in(clkena_in),
+generate
+if (AP040_BUS32 == 0) begin : g_bus16
+	ap040_bus16_adapter bus16 (
+		.clk(clk),
+		.nreset(nreset),
+		.clkena_in(clkena_in),
 
-	.mem_req(b_req),
-	.mem_berr(berr),
-	.mem_write(b_write),
-	.mem_instr(b_instr),
-	.mem_size(b_size),
-	.mem_addr(b_addr),
-	.mem_wdata(b_wdata),
-	.mem_fc(b_fc),
-	.mem_ack(b_ack),
-	.mem_rdata(b_rdata),
+		.mem_req(b_req),
+		.mem_berr(berr),
+		.mem_write(b_write),
+		.mem_instr(b_instr),
+		.mem_size(b_size),
+		.mem_addr(b_addr),
+		.mem_wdata(b_wdata),
+		.mem_fc(b_fc),
+		.mem_ack(b_ack),
+		.mem_rdata(b_rdata),
 
-	.data_in(data_in),
-	.addr_out(addr_out),
-	.data_write(data_write),
-	.nwr(nwr),
-	.nuds(nuds),
-	.nlds(nlds),
-	.busstate(busstate),
-	.longword(longword),
-	.fc(fc)
-);
+		.data_in(data_in),
+		.addr_out(addr_out),
+		.data_write(data_write),
+		.nwr(nwr),
+		.nuds(nuds),
+		.nlds(nlds),
+		.busstate(busstate),
+		.longword(longword),
+		.fc(fc)
+	);
+	assign b32_req   = 1'b0;
+	assign b32_write = 1'b0;
+	assign b32_instr = 1'b0;
+	assign b32_addr  = 30'd0;
+	assign b32_be    = 4'd0;
+	assign b32_wdata = 32'd0;
+	assign b32_fc    = 3'd0;
+	assign b32_busy  = 1'b0;
+	wire unused_b32 = b32_ack | (|b32_rdata) | cache_line_valid |
+	                  (|cache_line_tag) | (|cache_line_data);
+end
+else begin : g_bus32
+	ap040_bus32_adapter bus32 (
+		.clk(clk),
+		.nreset(nreset),
+		.ce(clkena_in),
+
+		.t_req(b_req),
+		.t_write(b_write),
+		.t_instr(b_instr),
+		.t_size(b_size),
+		.t_addr(b_addr),
+		.t_wdata(b_wdata),
+		.t_fc(b_fc),
+		.t_berr(berr),
+		.t_ack(b_ack),
+		.t_rdata(b_rdata),
+		.t_active(),
+
+		.b_req(b32_req),
+		.b_write(b32_write),
+		.b_instr(b32_instr),
+		.b_addr(b32_addr),
+		.b_be(b32_be),
+		.b_wdata(b32_wdata),
+		.b_fc(b32_fc),
+		.b_ack(b32_ack),
+		.b_rdata(b32_rdata),
+		.b_busy(b32_busy)
+	);
+	// the 16-bit port idles
+	assign addr_out   = 32'd0;
+	assign data_write = 16'd0;
+	assign nwr        = 1'b1;
+	assign nuds       = 1'b1;
+	assign nlds       = 1'b1;
+	assign busstate   = `AP040_BUS_IDLE;
+	assign longword   = 1'b0;
+	assign fc         = 3'd0;
+	wire unused_b16 = |data_in;
+end
+endgenerate
 
 assign mmu_addr_log = mem_addr;
 assign cache_maint_req = cinv_req;

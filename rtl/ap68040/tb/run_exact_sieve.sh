@@ -27,7 +27,7 @@ sha256sum "$rtl/ap040_core.v" build/bench_exact_sieve.bin build/exact_sieve.bin
     -DAP040_EXACT_SIEVE_MONITOR -DAP040_TB_CACHE=1 -I"$rtl" \
     tb_ap040_program.v exact_sieve_monitor.sv \
     "$rtl/ap040_tg68k_compat.v" "$rtl/ap040_core.v" \
-    "$rtl/ap040_bus16_adapter.v" "$rtl/ap040_bus_timeout.v" \
+    "$rtl/ap040_bus16_adapter.v" "$rtl/ap040_bus32_adapter.v" "$rtl/ap040_bus_timeout.v" \
     "$rtl/ap040_regfile.v" "$rtl/ap040_alu.v" "$rtl/ap040_muldiv.v" \
     "$rtl/ap040_mmu.v" "$rtl/ap040_cache.v" "$rtl/ap040_fpu.v" \
     "$rtl/ap040_walker_cdc.v" "$rtl/primitives/dpram.v" \
