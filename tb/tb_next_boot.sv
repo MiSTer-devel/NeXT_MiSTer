@@ -1116,6 +1116,19 @@ reg         sd_win = 0;
 reg  [12:0] sd_last = 13'd511;
 reg         osd_rd_act = 0, osd_wr_act = 0;
 integer     hr;
+// +hostlat=<clocks>: the HPS answers a window request only after this many
+// clocks (Main's poll cadence is milliseconds; the default answers at once)
+integer     hostlat = 0;
+integer     hl_cnt = 0;
+initial if ($value$plusargs("hostlat=%d", hostlat)) ;
+wire        hl_ok = (hl_cnt >= hostlat);
+always @(posedge clk) begin
+	if ((sd_rd && sd_lba >= 32'h7C00_0000) || (sd_wr && sd_lba >= 32'h7C00_0000) || osd_rd || osd_wr) begin
+		if (!sd_ack && !osd_ack && hl_cnt < hostlat) hl_cnt <= hl_cnt + 1;
+	end
+	else hl_cnt <= 0;
+	if (sd_ack || osd_ack) hl_cnt <= 0;
+end
 
 // the mounts, as user_io's mount hook reports them to the HPS
 always @(negedge clk) begin
@@ -1129,7 +1142,7 @@ end
 
 always @(posedge clk) begin
 	sd_buff_wr <= 0;
-	if (!sd_ack && !osd_ack && sd_rd) begin
+	if (!sd_ack && !osd_ack && sd_rd && (sd_lba < 32'h7C00_0000 || hl_ok)) begin
 		sd_ack <= 1;
 		sd_rd_act <= 1;
 		sd_buff_addr <= 0;
@@ -1163,7 +1176,7 @@ always @(posedge clk) begin
 			if (sd_buff_addr != sd_last) sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 	end
-	else if (!sd_ack && !osd_ack && sd_wr) begin
+	else if (!sd_ack && !osd_ack && sd_wr && (sd_lba < 32'h7C00_0000 || hl_ok)) begin
 		sd_ack <= 1;
 		sd_wr_act <= 1;
 		sd_buff_addr <= 0;
@@ -1190,7 +1203,7 @@ always @(posedge clk) begin
 		else sd_rphase <= 1;
 	end
 	// the MO slot's ECC exchange
-	else if (!sd_ack && !osd_ack && osd_rd) begin
+	else if (!sd_ack && !osd_ack && osd_rd && hl_ok) begin
 		osd_ack <= 1;
 		osd_rd_act <= 1;
 		sd_buff_addr <= 0;
@@ -1208,7 +1221,7 @@ always @(posedge clk) begin
 		end
 		else if (sd_buff_addr != sd_last) sd_buff_addr <= sd_buff_addr + 1'd1;
 	end
-	else if (!sd_ack && !osd_ack && osd_wr) begin
+	else if (!sd_ack && !osd_ack && osd_wr && hl_ok) begin
 		osd_ack <= 1;
 		osd_wr_act <= 1;
 		sd_buff_addr <= 0;
