@@ -304,7 +304,7 @@ next_system #(
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
-	.sd_buff_addr(sd_buff_addr[8:0]),
+	.sd_buff_addr(sd_buff_addr[12:0]),   // multi-block: the ECC exchange (3) and audio frames (5)
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr),

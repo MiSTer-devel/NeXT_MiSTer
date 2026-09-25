@@ -109,6 +109,13 @@ echo "== checking the OSD image slots =="
 python3 check_osd.py || exit 1
 
 echo "== linting the emu top =="
+# The boot bench instantiates next_system directly, so a narrowed port in the
+# emu top's instance is invisible to it (2026-09-25: sd_buff_addr[8:0] wrapped
+# every multi-block transfer on hardware while every bench passed).
+if ! grep -q "\.sd_buff_addr(sd_buff_addr\[12:0\])" ../NeXT.sv; then
+	echo "*** NeXT.sv must connect sd_buff_addr[12:0] to next_system (multi-block transfers)"
+	fail=1
+fi
 fail=0
 verilator --lint-only -Wno-fatal $DIAG_FLAGS \
 	-I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC \
