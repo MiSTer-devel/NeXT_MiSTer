@@ -309,4 +309,58 @@ The plan had estimated fills of ~60 clocks and a RAM-wait share of ~15%;
 both came in better because the second word of every longword also hits
 the line. Fit: 38,561 ALMs (92%), seed 6, timing closed
 (`releases/NeXT_20260925a.rbf`, before the NeXT.sv buffer-address fix; the
-fixed build follows). Hardware: pending.
+fixed build follows).
+
+### Stage 2 on hardware (2026-09-25)
+
+Build: `releases/NeXT_20260925b_seed7_hdmi-0.18ns.rbf` (aa19bc3 RTL: HPS-served
+SCSI/MO + stage 2, seed 7, 38,799 ALMs (93%), setup -0.18 ns on the HDMI PLL
+domain only, NOT release-gated), Main next-fixes 7f34486. The same RTL
+closed timing on seed 9 (38,655 ALMs, 92%, worst setup +0.027 ns on the
+HDMI PLL domain; seeds 6, 7, 8 missed that domain by 0.12-0.39 ns):
+`releases/NeXT_20260925_stage2.rbf`, release-gated, not yet on hardware. POST passes (the
+ROM's ECC self-test now runs through Main), `bsd` boots to the login window,
+NWBench Run All completes. Guest units as NWBench prints them, real time
+converted with the 0.893 s guest second as above:
+
+| NWBench | old CPU, build 0914 | stage 1 (DBcc floor) | stage 2 (retained line) | stage 2 vs stage 1 | stage 2 vs 0914 |
+|---|---|---|---|---|---|
+| Dhrystone (guest) | 7,812 (4.96 MIPS) | 6,591 (4.18 MIPS) | 6,680 (4.24 MIPS) | +1% | |
+| Dhrystone, real | 4,375/s | 7,382/s | **7,482/s** | +1% | x1.71 |
+| Graphics V/V, D/V (guest s) | 16.1, 18.4 | 20.5, 24.3 | 14.46, 15.28 | | |
+| Graphics V/V, D/V, real s | 28.7, 32.9 | 18.3, 21.7 | **12.9, 13.6** | -29%, -37% | x2.2, x2.4 |
+| Compile (guest s / real s) | 315.9 / 564 | 416.5 / 372 | 288.6 / **258** | -31% | x2.19 |
+| Webster (guest s / real s) | 232.5 / 415 | 296.0 / 264 | 190.9 / **170** | -35% | x2.43 |
+| Disk (guest KB/s / real) | 930.7 / 521 | 525.3 / 588 | 757.9 / **849** | +44% | x1.63 |
+| Ethernet (guest KB/s / real) | 14.5 / 8.1 | 8.47 / 9.5 | 15.17 / 17.0 | +79% | x2.1 |
+
+Reading it: Dhrystone is flat, exactly as the plan said (a cached loop never
+touches the retained line), so "CPU speed" measured that way did not move.
+Everything that misses the cache moved a lot more than the plan's -15-25%:
+Compile -31%, Webster -35%, the graphics tests -29/-37%. The disk and
+ethernet rates jumped because the kernel copies out of the DMA buffers
+through uncached (`C_PASS`) longword reads, and those now hit the retained
+line for the second half of every longword and for the next three
+longwords of each 16-byte line. The disk test's "10% real-time loss" of the
+paced build is gone with it (588 -> 849 KB/s real). Against the old-CPU
+0914 build the machine is now 1.7x on Dhrystone and 2.2-2.4x on the
+miss-heavy tests.
+
+`tb/hw/memlat.c` in the guest on the same build (`cc -O`, guest us = 25
+clocks here, 50 on the 0914 build; the loop overhead is the "cached" row):
+
+| access | 0914, guest ns | 0914, clocks | stage 2, guest ns | stage 2, clocks |
+|---|---|---|---|---|
+| cached longword load loop | 677 | 34 | 321.0 | **8.0** |
+| stride-4 byte read (4 per line) | - | - | 1,008.8 | 25.2 |
+| stride-16 byte read (one line fill each) | 3,299 | 165 | 2,552.2 | **63.8** (fill ~56) |
+| stride-64 byte read | - | - | 2,660.5 | 66.5 |
+| stride-16 longword read | 3,554 | 178 | 2,713.9 | 67.8 |
+| sequential longword store | 1,268 | 63 | 1,192.6 | **29.8** (store ~22) |
+
+The fill costs ~56 clocks on hardware, the same as the bench's 54.5 at
+`+ddrlat=6`, and better than the ~90-100 the plan had expected for the
+stride-16 access. The store did not stay unchanged either: ~30 -> ~22
+clocks, the write-through half-pairs go out faster now that the adapter is
+not waiting on read round trips in between. The cached loop's 34 -> 8
+clocks is the CPU swap plus the DBcc floor, not stage 2.
