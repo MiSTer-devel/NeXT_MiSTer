@@ -2156,6 +2156,85 @@ initial begin
 	finish_command(sts);
 
 	//------------------------------------------------------------
+	// CD audio through the HPS: the transport commands are forwarded
+	// through the command window, READ SUB-CHANNEL and READ TOC come
+	// back through the response window, so the playhead's state is read
+	// exactly as NeXTSTEP would read it.
+	//------------------------------------------------------------
+	// READ TOC, MSF, 32 bytes: one data track at 00:02:00, leadout 0xAA
+	select_atn10_target(3'd3, 8'h43, 8'h02, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h20, 8'h00);
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 8; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd32, BUF, BUF + 32'd64);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'd18 && ram_byte(BUF + 2) == 8'd1 && ram_byte(BUF + 3) == 8'd1,
+	      "cd read toc: header, tracks 1..1");
+	check(ram_byte(BUF + 6) == 8'd1 && ram_byte(BUF + 10) == 8'd2 && ram_byte(BUF + 11) == 8'd0,
+	      "cd read toc: track 1 starts at 00:02:00");
+	check(ram_byte(BUF + 14) == 8'hAA && ram_byte(BUF + 18) == 8'd2 && ram_byte(BUF + 19) == 8'd4,
+	      "cd read toc: lead-out 0xAA at 00:02:04 (16 blocks)");
+	finish_command(sts);
+	check(sts == 0, "cd read toc completes normally");
+
+	// PLAY AUDIO MSF 00:02:00 .. 00:05:00
+	select_atn10_target(3'd3, 8'h47, 8'h00, 8'h00, 8'h00, 8'h02, 8'h00,
+	                    8'h00, 8'h05, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 0, "cd play audio msf: forwarded, status GOOD");
+
+	// READ SUB-CHANNEL, MSF, SubQ, current position, 16 bytes: playing
+	select_atn10_target(3'd3, 8'h42, 8'h02, 8'h40, 8'h01, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h10, 8'h00);
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 4; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd16, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'h11 && ram_byte(BUF + 4) == 8'h01 && ram_byte(BUF + 6) == 8'd1,
+	      "cd read sub-channel: audio status 0x11 (playing), track 1");
+	finish_command(sts);
+
+	// PAUSE, then the status reads paused
+	select_atn10_target(3'd3, 8'h4B, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 0, "cd pause: forwarded, status GOOD");
+	select_atn10_target(3'd3, 8'h42, 8'h02, 8'h40, 8'h01, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h10, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd16, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'h12, "cd read sub-channel: audio status 0x12 (paused)");
+	finish_command(sts);
+
+	// STOP PLAY/SCAN, then the status reads idle
+	select_atn10_target(3'd3, 8'h4E, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 0, "cd stop play: forwarded, status GOOD");
+	select_atn10_target(3'd3, 8'h42, 8'h02, 8'h40, 8'h01, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h10, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd16, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'h15, "cd read sub-channel: audio status 0x15 (no status) after stop");
+	finish_command(sts);
+
+	// a transport command to a disk target is an invalid command
+	select_atn10_target(3'd0, 8'h47, 8'h00, 8'h00, 8'h00, 8'h02, 8'h00,
+	                    8'h00, 8'h05, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "play audio on a disk target: CHECK CONDITION");
+
+	//------------------------------------------------------------
 	// NeXTSTEP 3.3 raw-device WRITE(10), driven exactly as sdmach's
 	// sc driver does it (disassembled from the install CD kernel):
 	// newfs writes from an unaligned static buffer, so dma_list shifts
