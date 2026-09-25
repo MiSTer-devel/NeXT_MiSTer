@@ -181,6 +181,11 @@ reg  [5:0] disk_present_v = 0;
 // the medium stayed, and NeXTSTEP kept asking the user to eject it.
 reg  [5:0] ejected_v = 0;        // ejected by START STOP UNIT
 reg  [5:0] cd_seen_v = 0;        // a CD unit that has had an image this session
+// the command FSM's eject/load request (one driver per register: the
+// mount block owns ejected_v, the FSM toggles eject_tog)
+reg        eject_tog = 0, eject_tog_q = 0;
+reg        eject_val = 0;
+reg  [2:0] eject_unit = 0;
 reg  [5:0] disk_ro_v = 0;
 reg [31:0] img_blocks_v [0:SCSI_UNITS-1];   // disk size in 512 byte blocks
 reg  [2:0] t_unit = 0;           // target the connected command addresses
@@ -337,6 +342,8 @@ assign sd_lba = win_act ? win_lba : sd_lba_r;
 //----------------------------------------------------------------------------
 
 always @(posedge clk) begin
+	eject_tog_q <= eject_tog;
+	if (eject_tog != eject_tog_q) ejected_v[eject_unit] <= eject_val;
 	for (mk = 0; mk < SCSI_UNITS; mk = mk + 1) begin
 		if (img_mounted[mk]) begin
 			disk_present_v[mk] <= (img_size != 0);
@@ -1320,7 +1327,11 @@ always @(posedge clk) begin
 							sense_valid[t_unit] <= 0;
 							phase <= PHASE_ST;
 							// LoEj: stop ejects the medium, start loads it again
-							if (t_is_cd && cdb4[1]) ejected_v[t_unit] <= !cdb4[0];
+							if (t_is_cd && cdb4[1]) begin
+								eject_tog  <= ~eject_tog;
+								eject_unit <= t_unit;
+								eject_val  <= !cdb4[0];
+							end
 							if (t_is_cd) begin
 								win_lba <= WIN_CMD | {8'd0, 1'b0, t_unit, 20'd0} | 32'h1B00;
 								fwd_ret <= X_POSTCMD;
