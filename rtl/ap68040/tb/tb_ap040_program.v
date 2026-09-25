@@ -75,7 +75,24 @@ reg         pace_tog = 0;
 initial pace_tog = $test$plusargs("paceshift");
 always @(posedge clk) pace_tog <= ~pace_tog;
 wire        pace_en = !$test$plusargs("pace") || pace_tog;
-wire        clkena_in = ((busstate == 2'b01) & pace_en) | mem_ready | berr;
+// +dbccstall=N: hold the clock enable low for N clocks each time the core
+// enters S_DBCC1 (the DBcc execute state), the host-side equivalent of
+// Previous's 68040 timing model (gencpu.c adjust_cycles: DBcc = 4 cycles,
+// the count the NeXT ROM's delay() calibration assumes).  Measurement aid
+// for asm/bench_dbf.s; not a regression mode.
+integer     dbcc_stall_n = 0;
+integer     dbcc_left = 0;
+reg   [7:0] dbcc_prev = 0;
+initial if ($value$plusargs("dbccstall=%d", dbcc_stall_n)) ;
+always @(posedge clk) begin
+	if (dbcc_stall_n != 0 && dut.core.state == 8'd53 && dbcc_prev != 8'd53)
+		dbcc_left <= dbcc_stall_n;
+	else if (dbcc_left != 0)
+		dbcc_left <= dbcc_left - 1;
+	dbcc_prev <= dut.core.state;
+end
+wire        dbcc_ok = (dbcc_left == 0);
+wire        clkena_in = ((busstate == 2'b01) & pace_en & dbcc_ok) | mem_ready | berr;
 
 reg   [2:0] ipl_lvl;
 reg  [15:0] ipl_delay = 0;   // $F148: delayed level-2 IPL countdown

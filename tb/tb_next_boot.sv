@@ -53,10 +53,23 @@ wire [511:0] dbg_exception;
 // exactly the FPGA parameterization: virtual microsecond of 25 clocks,
 // CPU paced 1 of 2 (the physical simulation clock rate is immaterial,
 // the clock ratios are what the ROM's calibration checks measure)
+`ifdef NEXT_PROFILE
+// bench-side cycle accounting (tb/next_profile_monitor.sv), -DNEXT_PROFILE
+next_profile_monitor prof();
+`endif
+
 next_system #(
+	`ifdef NEXT_TB_CLK_HZ
+	.CLK_HZ(`NEXT_TB_CLK_HZ),
+`else
 	.CLK_HZ(25000000),
+`endif
 	.CPU_PACE_NUM(1),
+`ifdef NEXT_TB_PACE_DEN
+	.CPU_PACE_DEN(`NEXT_TB_PACE_DEN),
+`else
 	.CPU_PACE_DEN(2),
+`endif
 	.ROM_INIT_EN(1),
 	.ROM_INIT("build/rom.hex"),
 	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
@@ -291,6 +304,11 @@ function [31:0] bsw; input [31:0] x; bsw = {x[7:0], x[15:8], x[23:16], x[31:24]}
 reg  [7:0] d3_left = 0;
 reg [28:0] d3_addr = 0;
 reg  [5:0] d3_lat = 0;
+// +ddrlat=<n>: clocks from the read's acceptance to its first data word
+// (12 by default; the MiSTer DDRAM port answers in ~20 clocks at 100 MHz,
+// about 6 at 28 MHz, when the HPS leaves it alone)
+integer ddr_lat = 12;
+initial if ($value$plusargs("ddrlat=%d", ddr_lat)) ;
 reg [31:0] d3_lfsr = 32'h1234_5678;
 reg        d3_busy_r = 0;
 reg        d3_dv = 0;
@@ -336,7 +354,7 @@ always @(posedge clk) begin
 			else if (dr_rd) begin
 				d3_addr <= dr_addr;
 				d3_left <= dr_burst;
-				d3_lat  <= 6'd12;
+				d3_lat  <= ddr_lat[5:0];
 				if (in_mbox) mbox_reads = mbox_reads + 1;
 				else if (!in_ram && !in_vram) stray_ddr = stray_ddr + 1;
 			end
