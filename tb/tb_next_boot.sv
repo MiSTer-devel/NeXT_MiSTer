@@ -43,6 +43,9 @@ wire [23:0] ram_addr;
 wire [31:0] ram_din;
 wire [31:0] ram_dout;   // driven by next_ddram
 wire        ram_ack;
+wire        ram_line_valid;
+wire [21:0] ram_line_tag;
+wire [127:0] ram_line_data;
 
 wire        hsync, vsync, hblank, vblank;
 wire  [7:0] gray;
@@ -142,6 +145,9 @@ next_system #(
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid),
+	.ram_line_tag(ram_line_tag),
+	.ram_line_data(ram_line_data),
 
 	.led(led),
 	.audio_l(), .audio_r(),
@@ -235,6 +241,7 @@ next_ddram ddram
 	.ram_req(ram_req), .ram_we(ram_we), .ram_be(ram_be),
 	.ram_addr(ram_addr), .ram_din(ram_din),
 	.ram_dout(ram_dout), .ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid), .ram_line_tag(ram_line_tag), .ram_line_data(ram_line_data),
 	.DDRAM_BUSY(ga_busy), .DDRAM_BURSTCNT(ga_burst), .DDRAM_ADDR(ga_addr),
 	.DDRAM_DOUT(ga_dout), .DDRAM_DOUT_READY(ga_dout_ready),
 	.DDRAM_RD(ga_rd), .DDRAM_DIN(ga_din), .DDRAM_BE(ga_be), .DDRAM_WE(ga_we)

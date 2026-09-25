@@ -150,6 +150,11 @@ module next_system #(
 	output reg [31:0] ram_din,
 	input      [31:0] ram_dout,
 	input             ram_ack,
+	// the line next_ddram retains (docs/PERF_PLAN.md stage 2b), offered
+	// to the CPU cache's fills through the wrapper's cache_line_* sideband
+	input             ram_line_valid,
+	input      [21:0] ram_line_tag,    // ram_addr[23:2]
+	input     [127:0] ram_line_data,   // word 0 in [127:96]
 
 	output        led,
 
@@ -369,10 +374,10 @@ ap040_tg68k_compat #(
 	.b32_ack(b_ack),
 	.b32_rdata(b_rdata),
 	.b32_busy(b_busy),
-	// the retained-line sideband (docs/PERF_PLAN.md stage 2b): not yet
-	.cache_line_valid(1'b0),
-	.cache_line_tag(28'd0),
-	.cache_line_data(128'd0),
+	// the retained-line sideband (docs/PERF_PLAN.md stage 2b)
+	.cache_line_valid(sb_valid),
+	.cache_line_tag(sb_tag),
+	.cache_line_data(ram_line_data),
 
 	.mmu_addr_log(),
 	.mmu_addr_phys(),
@@ -457,6 +462,19 @@ reg        sel_rom, sel_vram, sel_io, sel_bmap;
 // adapter still shows it under b_ack), not while a bus error is reported
 wire cpu_req = b_req && !b_ack && !berr_hold;
 
+// The retained-line sideband (docs/PERF_PLAN.md stage 2b).  The cache
+// compares the physical address it asked for, so the tag offered is the
+// CPU's own address of the line it last read from RAM (sb_tag, latched
+// with the beat; the MWF mirrors at 0x10-0x1F reach the same RAM through
+// a different address and simply miss), and the line is valid only
+// while next_ddram holds that very line whole.  A DMA or walker write
+// into it keeps the copy current (next_ddram updates the word) and the
+// snoop invalidates the cache's set, so no stale word can be served
+// from it; a burst in flight drops it.
+reg  [31:4] sb_tag;
+reg         sb_ram;
+wire        sb_valid = sb_ram && ram_line_valid && (ram_line_tag == sb_tag[25:4]);
+
 // walker service (the core never runs walker and CPU bus cycles at the
 // same time, see tb_ap040_program.v)
 wire walker_is_ram = (walker_addr[31:26] == 6'b000001) || (walker_addr[31:28] == 4'h1);
@@ -517,6 +535,8 @@ always @(posedge clk) begin
 		walker_armed <= 1;
 		walker_busy <= 0;
 		half_r <= 0;
+		sb_ram <= 0;
+		sb_tag <= 0;
 	end
 	else begin
 		// the adapter drops the faulted beat on the next enabled clock;
@@ -616,6 +636,10 @@ always @(posedge clk) begin
 					ram_addr <= b_addr[25:2];
 					ram_din  <= b_wdata;
 					state    <= S_RAM;
+					if (!b_write) begin
+						sb_tag <= b_addr[31:4];
+						sb_ram <= 1;
+					end
 				end
 				else begin
 					// 16-bit target: first sub-cycle (the upper half unless

@@ -36,6 +36,12 @@ module next_ddram
 	input      [31:0] ram_din,
 	output reg [31:0] ram_dout,
 	output reg        ram_ack,
+	// the retained line, for the CPU cache's fills (docs/PERF_PLAN.md
+	// stage 2b): valid only while it is whole (dropped for the duration
+	// of a burst), current across writes
+	output            ram_line_valid,
+	output     [21:0] ram_line_tag,    // ram_addr[23:2]
+	output    [127:0] ram_line_data,   // word 0 in [127:96]
 
 	// MiSTer DDRAM interface
 	input             DDRAM_BUSY,
@@ -61,6 +67,9 @@ reg [127:0] line;
 reg  [21:0] line_tag;
 reg         line_valid;
 wire        line_hit = line_valid && (line_tag == ram_addr[23:2]);
+assign ram_line_valid = line_valid;
+assign ram_line_tag   = line_tag;
+assign ram_line_data  = line;
 wire [31:0] line_word = (ram_addr[1:0] == 2'd0) ? line[127:96] :
                         (ram_addr[1:0] == 2'd1) ? line[95:64]  :
                         (ram_addr[1:0] == 2'd2) ? line[63:32]  : line[31:0];
@@ -172,6 +181,9 @@ always @(posedge clk) begin
 				acked          <= 0;
 				want           <= ram_addr[1:0];
 				want_tag       <= ram_addr[23:2];
+				// the old line is overwritten half by half as the burst
+				// lands: not a whole line to anyone until it is complete
+				line_valid     <= 0;
 			end
 		end
 	end

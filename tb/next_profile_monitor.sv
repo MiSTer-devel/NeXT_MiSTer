@@ -42,6 +42,7 @@ longint gap_clk  [0:1];
 longint fill_clk [0:1];
 longint fill_n   [0:1];
 longint fill_i   [0:1];
+longint fill_sb  [0:1];      // fill words copied from the host's retained line (stage 2b)
 longint pass_clk [0:1];
 longint post_clk [0:1];
 longint walker_clk [0:1];
@@ -65,7 +66,7 @@ initial begin
 	for (i = 0; i < 2; i = i + 1) begin
 		clocks[i] = 0; int_run[i] = 0; int_gate[i] = 0; bus_arb[i] = 0;
 		bus_ram[i] = 0; bus_dmae[i] = 0; bus_int[i] = 0; gap_clk[i] = 0;
-		fill_clk[i] = 0; fill_n[i] = 0; fill_i[i] = 0; pass_clk[i] = 0;
+		fill_clk[i] = 0; fill_n[i] = 0; fill_i[i] = 0; pass_clk[i] = 0; fill_sb[i] = 0;
 		post_clk[i] = 0; walker_clk[i] = 0; pc_rom[i] = 0;
 		cyc_ram[i] = 0; cyc_rom[i] = 0; cyc_io[i] = 0; cyc_vram[i] = 0; cyc_wr[i] = 0;
 		ddr_rd[i] = 0; ddr_we[i] = 0; ddr_busy[i] = 0;
@@ -162,6 +163,7 @@ always @(posedge `TB.clk) if (!`TB.reset) begin : count
 		if (`CCH.r_bank) fill_i[ph] = fill_i[ph] + 1;
 	end
 	if (`CCH.cst == 3'd6) pass_clk[ph] = pass_clk[ph] + 1;
+	if (`CCH.fill_line_match && `CCH.ce) fill_sb[ph] = fill_sb[ph] + 1;
 	cst_prev = `CCH.cst;
 
 	// core-level access latency
@@ -268,6 +270,8 @@ task report;
 		$display("  PC in ROM      %12d  %5.1f%%", pc_rom[p], 100.0 * pc_rom[p] / clocks[p]);
 		$display("  cache fills    %12d  (instr %0d)  %0d clocks, avg %0.1f", fill_n[p], fill_i[p], fill_clk[p],
 		         fill_n[p] ? 1.0 * fill_clk[p] / fill_n[p] : 0.0);
+		$display("  fill words from the retained line %0d  (%0.2f of 4 per fill)", fill_sb[p],
+		         fill_n[p] ? 1.0 * fill_sb[p] / fill_n[p] : 0.0);
 		$display("  cache pass clk %12d  %5.1f%%", pass_clk[p], 100.0 * pass_clk[p] / clocks[p]);
 		$display("  bus cycles: ram %0d rom %0d io %0d vram %0d (writes %0d)",
 		         cyc_ram[p], cyc_rom[p], cyc_io[p], cyc_vram[p], cyc_wr[p]);

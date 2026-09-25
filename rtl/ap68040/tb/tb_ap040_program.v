@@ -285,9 +285,9 @@ ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE), .AP040_BUS32(TB_BUS32
 	.b32_ack(b32_ack),
 	.b32_rdata(b32_rdata),
 	.b32_busy(b32_busy),
-	.cache_line_valid(1'b0),
-	.cache_line_tag(28'd0),
-	.cache_line_data(128'd0),
+	.cache_line_valid(lp_on && lp_valid && (lp_tag[31:16] == 16'd0)),
+	.cache_line_tag(lp_tag),
+	.cache_line_data(lp_data),
 
 	.mmu_addr_log(),
 	.mmu_addr_phys(),
@@ -314,6 +314,30 @@ ap040_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE), .AP040_BUS32(TB_BUS32
 	.debug_halted(debug_halted),
 	.debug_status(debug_status)
 );
+
+// +lineprov: a bench-side retained line for the wrapper's cache_line_*
+// sideband (NeXT_MiSTer docs/PERF_PLAN.md stage 2b): the 16-byte line of the
+// last completed read beat, its data taken live from the bench memory
+// (always current, so a copy is exact), so the cache's fill copies
+// (fill_line_match) run under every clock-enable policy.  Beat port only.
+reg         lp_on = 0;
+initial     lp_on = $test$plusargs("lineprov");
+reg  [31:4] lp_tag = 0;
+reg         lp_valid = 0;
+always @(posedge clk) begin
+	if (!nreset) lp_valid <= 0;
+	else if (b32_ack && !b32_write) begin
+		lp_tag   <= b32_addr[31:4];
+		lp_valid <= 1;
+	end
+end
+wire [127:0] lp_data = {mem[{lp_tag[15:4], 3'd0}], mem[{lp_tag[15:4], 3'd1}],
+                        mem[{lp_tag[15:4], 3'd2}], mem[{lp_tag[15:4], 3'd3}],
+                        mem[{lp_tag[15:4], 3'd4}], mem[{lp_tag[15:4], 3'd5}],
+                        mem[{lp_tag[15:4], 3'd6}], mem[{lp_tag[15:4], 3'd7}]};
+integer lp_copies = 0;
+always @(posedge clk) if (dut.g_cache.cache.fill_line_match && dut.g_cache.cache.ce) lp_copies = lp_copies + 1;
+final if (lp_on) $display("lineprov: %0d fill words copied from the retained line", lp_copies);
 
 // the beat port's host (idle when the 16-bit port is in use)
 tb_bus32_host16 host16 (

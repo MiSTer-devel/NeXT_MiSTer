@@ -225,6 +225,9 @@ wire        ram_req, ram_we, ram_ack;
 wire  [3:0] ram_be;
 wire [23:0] ram_addr;
 wire [31:0] ram_din, ram_dout;
+wire        ram_line_valid;
+wire [21:0] ram_line_tag;
+wire [127:0] ram_line_data;
 
 wire        btx_req, btx_rd, btx_ack, btx_done;
 wire [10:0] btx_len, btx_addr;
@@ -326,6 +329,9 @@ next_system #(
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid),
+	.ram_line_tag(ram_line_tag),
+	.ram_line_data(ram_line_data),
 
 	.led(led),
 	.audio_in(status[59] ? adc_audio_in : 16'sd0),
@@ -435,6 +441,9 @@ next_ddram ddram
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid),
+	.ram_line_tag(ram_line_tag),
+	.ram_line_data(ram_line_data),
 
 	.DDRAM_BUSY(ga_busy),
 	.DDRAM_BURSTCNT(ga_burst),
