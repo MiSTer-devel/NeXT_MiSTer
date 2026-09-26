@@ -19,6 +19,15 @@
 
 module tb_next_scsi;
 
+// The HPS side of the SCSI/MO windows: the real Main_MiSTer support/next
+// code (tb/host/next_host_dpi.cpp, sources synced by tb/host/sync_main.sh).
+import "DPI-C" function int  host_fill(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_byte(input int i);
+import "DPI-C" function void host_put(input int i, input int b);
+import "DPI-C" function void host_exec(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_mount_cd(input string path);
+import "DPI-C" function int  host_mount_disk(input int slot, input longint bytes);
+
 reg clk = 0;
 always #5 clk = ~clk;
 
@@ -91,7 +100,7 @@ next_scsi #(.CLK_HZ(1000000), .CD_UNITS(6'b001000)) dut   // target 3 is a CD-RO
 	.int_scsi(int_scsi), .int_scsi_dma(int_scsi_dma),
 	.img_mounted({2'b00, img_mounted_cd, 1'b0, img_mounted2, img_mounted}), .img_readonly(1'b0), .img_size(img_size),
 	.sd_unit(),
-	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack(sd_ack),
+	.sd_lba(sd_lba), .sd_rd(sd_rd), .sd_wr(sd_wr), .sd_ack_in(sd_ack), .sd_hold(1'b0),
 	.sd_buff_addr(sd_buff_addr), .sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din), .sd_buff_wr(sd_buff_wr),
 	.flp_select(flp_select), .flp_req(flp_req), .flp_wr(flp_wr),
@@ -190,6 +199,15 @@ initial begin
 	end
 end
 
+// the mounts, as user_io's mount hook reports them to the HPS model
+integer hr;
+reg     sd_win = 0;     // the transaction is a window (served by the HPS model)
+always @(negedge clk) begin   // the pulses are driven with blocking assignments around the posedge
+	if (img_mounted)    hr = host_mount_disk(0, img_size);
+	if (img_mounted2)   hr = host_mount_disk(1, img_size);
+	if (img_mounted_cd) hr = host_mount_disk(3, img_size);
+end
+
 // serve sd_rd / sd_wr with the hps_io handshake
 always @(posedge clk) begin
 	// hps_io registers sd_buff_wr separately from sd_ack.  Its final write
@@ -198,11 +216,14 @@ always @(posedge clk) begin
 	if (sd_rd && !sd_ack) begin
 		sd_ack <= 1;
 		sd_buff_addr <= 0;
+		sd_win <= (sd_lba >= 32'h7C00_0000);
+		if (sd_lba >= 32'h7C00_0000) hr = host_fill(3, sd_lba, 512);
 	end
 	else if (sd_ack && sd_rd_active) begin
 		// one byte every other cycle
 		if (!sd_buff_wr && sd_buff_addr <= 9'd511) begin
-			sd_buff_dout <= (dut.sd_unit == 3'd3)
+			sd_buff_dout <= sd_win ? host_byte(sd_buff_addr)
+			              : (dut.sd_unit == 3'd3)
 			              ? cd   [{sd_lba[3:0], 9'd0} + {23'd0, sd_buff_addr}]
 			              : (dut.sd_unit == 3'd1)
 			              ? disk2[{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}]
@@ -220,7 +241,8 @@ always @(posedge clk) begin
 	else if (sd_ack && sd_wr_active) begin
 		// read a byte every other cycle (registered buffer read)
 		if (rd_phase) begin
-			if (dut.sd_unit == 3'd1)
+			if (sd_win) host_put(sd_buff_addr, sd_buff_din);
+			else if (dut.sd_unit == 3'd1)
 				disk2[{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
 			else
 				disk [{sd_lba[4:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
@@ -228,6 +250,7 @@ always @(posedge clk) begin
 			if (sd_buff_addr == 9'd511) begin
 				sd_ack <= 0;
 				sd_wr_active <= 0;
+				if (sd_win) host_exec(3, sd_lba, 512);
 			end
 			else sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
@@ -238,6 +261,7 @@ always @(posedge clk) begin
 		sd_buff_addr <= 0;
 		rd_phase <= 0;
 		sd_wr_active <= 1;
+		sd_win <= (sd_lba >= 32'h7C00_0000);
 	end
 	if (sd_rd && !sd_ack && !sd_rd_active) sd_rd_active <= 1;
 end
@@ -2130,6 +2154,160 @@ initial begin
 	check(ok, "cd read(10): four 512-byte blocks reach memory (disk-style)");
 	check(dut.d_next == BUF + 32'd2048, "cd read(10): 2048-byte read reaches limit");
 	finish_command(sts);
+
+	//------------------------------------------------------------
+	// CD audio through the HPS: the transport commands are forwarded
+	// through the command window, READ SUB-CHANNEL and READ TOC come
+	// back through the response window, so the playhead's state is read
+	// exactly as NeXTSTEP would read it.
+	//------------------------------------------------------------
+	// READ TOC, MSF, 32 bytes: one data track at 00:02:00, leadout 0xAA
+	select_atn10_target(3'd3, 8'h43, 8'h02, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h20, 8'h00);
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 8; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd32, BUF, BUF + 32'd64);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'd18 && ram_byte(BUF + 2) == 8'd1 && ram_byte(BUF + 3) == 8'd1,
+	      "cd read toc: header, tracks 1..1");
+	check(ram_byte(BUF + 6) == 8'd1 && ram_byte(BUF + 10) == 8'd2 && ram_byte(BUF + 11) == 8'd0,
+	      "cd read toc: track 1 starts at 00:02:00");
+	check(ram_byte(BUF + 14) == 8'hAA && ram_byte(BUF + 18) == 8'd2 && ram_byte(BUF + 19) == 8'd4,
+	      "cd read toc: lead-out 0xAA at 00:02:04 (16 blocks)");
+	finish_command(sts);
+	check(sts == 0, "cd read toc completes normally");
+
+	// PLAY AUDIO MSF 00:02:00 .. 00:05:00
+	select_atn10_target(3'd3, 8'h47, 8'h00, 8'h00, 8'h00, 8'h02, 8'h00,
+	                    8'h00, 8'h05, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 0, "cd play audio msf: forwarded, status GOOD");
+
+	// READ SUB-CHANNEL, MSF, SubQ, current position, 16 bytes: playing
+	select_atn10_target(3'd3, 8'h42, 8'h02, 8'h40, 8'h01, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h10, 8'h00);
+	wait_irq; read_intr(intr);
+	for (i = 0; i < 4; i = i + 1) ram[(BUF >> 2) + i] = 32'hDEADBEEF;
+	ti_dma_in(17'd16, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'h11 && ram_byte(BUF + 4) == 8'h01 && ram_byte(BUF + 6) == 8'd1,
+	      "cd read sub-channel: audio status 0x11 (playing), track 1");
+	finish_command(sts);
+
+	// PAUSE, then the status reads paused
+	select_atn10_target(3'd3, 8'h4B, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 0, "cd pause: forwarded, status GOOD");
+	select_atn10_target(3'd3, 8'h42, 8'h02, 8'h40, 8'h01, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h10, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd16, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'h12, "cd read sub-channel: audio status 0x12 (paused)");
+	finish_command(sts);
+
+	// STOP PLAY/SCAN, then the status reads idle
+	select_atn10_target(3'd3, 8'h4E, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 0, "cd stop play: forwarded, status GOOD");
+	select_atn10_target(3'd3, 8'h42, 8'h02, 8'h40, 8'h01, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'h10, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd16, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 1) == 8'h15, "cd read sub-channel: audio status 0x15 (no status) after stop");
+	finish_command(sts);
+
+	// a transport command to a disk target is an invalid command
+	select_atn10_target(3'd0, 8'h47, 8'h00, 8'h00, 8'h00, 8'h02, 8'h00,
+	                    8'h00, 8'h05, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "play audio on a disk target: CHECK CONDITION");
+
+	//------------------------------------------------------------
+	// Eject.  NeXTSTEP's Workspace "Eject" sends PREVENT ALLOW MEDIUM
+	// REMOVAL (allow) and START STOP UNIT with LoEj; the medium must then
+	// be gone (NOT READY, medium not present) while the drive stays on
+	// the bus, until the OSD mounts an image again.  An OSD unmount is
+	// the same removal.
+	//------------------------------------------------------------
+	select_atn6_target(3'd3, 8'h1E, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd prevent/allow medium removal: good status");
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd test unit ready with medium: good status");
+	select_atn6_target(3'd3, 8'h1B, 8'h00, 8'h00, 8'h00, 8'h02, 8'h00);   // LoEj, stop
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd eject: good status");
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "cd test unit ready after eject: CHECK CONDITION");
+	select_atn6_target(3'd3, 8'h03, 8'h00, 8'h00, 8'h00, 8'd22, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd22, BUF, BUF + 32'd32);
+	read_intr(intr);
+	flush_dma_in_words(2);
+	check(ram_byte(BUF + 2) == 8'h02, "cd sense after eject: not ready key");
+	check(ram_byte(BUF + 12) == 8'h3A, "cd sense after eject: medium not present");
+	finish_command(sts);
+	check(sts == 8'h00, "cd request sense after eject: good status");
+	select_atn10_target(3'd3, 8'h28, 8'h00, 8'h00, 8'h00, 8'h00, 8'h04,
+	                    8'h00, 8'h00, 8'h01, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "cd read after eject: CHECK CONDITION");
+	select_atn10_target(3'd3, 8'h43, 8'h02, 8'h00, 8'h00, 8'h00, 8'h00,
+	                    8'h00, 8'h00, 8'd12, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h02, "cd read toc after eject: CHECK CONDITION");
+	select_atn6_target(3'd3, 8'h12, 8'h00, 8'h00, 8'h00, 8'd54, 8'h00);
+	wait_irq; read_intr(intr);
+	ti_dma_in(17'd54, BUF, BUF + 32'd64);
+	read_intr(intr);
+	flush_dma_in_words(14);
+	check(ram_byte(BUF + 0) == 8'h05, "cd inquiry after eject: still a CD-ROM");
+	finish_command(sts);
+	check(sts == 8'h00, "cd inquiry after eject: good status");
+	// the OSD mounts an image again: the medium is back
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd test unit ready after remount: good status");
+	// an OSD unmount: the drive stays on the bus, the medium is gone
+	img_size = 0;
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	esp_rd8(6'h04, v);
+	check(v[2:0] == 3'd3, "cd unmounted: the drive still answers selection (status phase)");
+	finish_command(sts);
+	check(sts == 8'h02, "cd test unit ready after unmount: CHECK CONDITION");
+	img_size = CD_SECTORS * 2048;
+	img_mounted_cd = 1; @(posedge clk); img_mounted_cd = 0;
+	repeat (4) @(posedge clk);
+	select_atn6_target(3'd3, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00);
+	wait_irq; read_intr(intr);
+	finish_command(sts);
+	check(sts == 8'h00, "cd test unit ready after the second mount: good status");
 
 	//------------------------------------------------------------
 	// NeXTSTEP 3.3 raw-device WRITE(10), driven exactly as sdmach's

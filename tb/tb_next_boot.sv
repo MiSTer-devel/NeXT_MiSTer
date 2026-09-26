@@ -22,6 +22,15 @@
 
 module tb_next_boot;
 
+// The HPS side of the SCSI/MO windows: the real Main_MiSTer support/next
+// code (tb/host/next_host_dpi.cpp, sources synced by tb/host/sync_main.sh).
+import "DPI-C" function int  host_fill(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_byte(input int i);
+import "DPI-C" function void host_put(input int i, input int b);
+import "DPI-C" function void host_exec(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_mount_cd(input string path);
+import "DPI-C" function int  host_mount_disk(input int slot, input longint bytes);
+
 reg clk = 0;
 reg reset = 1;
 
@@ -34,6 +43,9 @@ wire [23:0] ram_addr;
 wire [31:0] ram_din;
 wire [31:0] ram_dout;   // driven by next_ddram
 wire        ram_ack;
+wire        ram_line_valid;
+wire [21:0] ram_line_tag;
+wire [127:0] ram_line_data;
 
 wire        hsync, vsync, hblank, vblank;
 wire  [7:0] gray;
@@ -50,16 +62,45 @@ localparam DEBUG_EXCEPTIONS = 0;
 wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
-// exactly the FPGA parameterization: virtual microsecond of 50 clocks,
-// no pacing (the physical simulation clock rate is immaterial, the
-// clock ratios are what the ROM's calibration checks measure)
+// exactly the FPGA parameterization: virtual microsecond of 25 clocks,
+// DBcc period floor of 4 enabled clocks, no pacing (the physical
+// simulation clock rate is immaterial, the clock ratios are what the
+// ROM's calibration checks measure).  -DNEXT_TB_CLK_HZ=, -DNEXT_TB_DBCC_FLOOR=
+// and -DNEXT_TB_PACE_DEN= override the three for experiments (the old
+// configuration is FLOOR 0, DEN 2).
+`ifdef NEXT_PROFILE
+// bench-side cycle accounting (tb/next_profile_monitor.sv), -DNEXT_PROFILE
+next_profile_monitor prof();
+`endif
+
 next_system #(
-	.CLK_HZ(50000000),
-	.CPU_PACE_NUM(2),
-	.CPU_PACE_DEN(2),
+	`ifdef NEXT_TB_CLK_HZ
+	.CLK_HZ(`NEXT_TB_CLK_HZ),
+`else
+	.CLK_HZ(25000000),
+`endif
+`ifdef NEXT_TB_DBCC_FLOOR
+	.DBCC_FLOOR(`NEXT_TB_DBCC_FLOOR),
+`else
+	.DBCC_FLOOR(4),
+`endif
+	.CPU_PACE_NUM(1),
+`ifdef NEXT_TB_SND_IN
+	.SND_IN_EN(`NEXT_TB_SND_IN),
+`endif
+`ifdef NEXT_TB_PACE_DEN
+	.CPU_PACE_DEN(`NEXT_TB_PACE_DEN),
+`else
+	.CPU_PACE_DEN(1),
+`endif
 	.ROM_INIT_EN(1),
 	.ROM_INIT("build/rom.hex"),
-	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
+`ifdef NEXT_POST_STORES
+	.POST_STORES(`NEXT_POST_STORES)
+`else
+	.POST_STORES(0)
+`endif
 ) dut
 (
 	.clk(clk),
@@ -68,6 +109,7 @@ next_system #(
 		.ps2_key(ps2),
 		.ps2_mouse(25'd0),
 	.boot_sel(bootfd ? 3'd2 : bootcd ? 3'd6 : bootsd ? 3'd1 : 3'd0),
+	.ts_host(ts_host),
 	.enet_connected(net_enable),
 	.fimg_mounted(fimg_mounted), .fsd_unit(), .fimg_readonly(1'b0),
 	.fimg_size(fimg_bytes),
@@ -82,6 +124,11 @@ next_system #(
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
+	.sd_blk_cnt(sd_blk_cnt),
+	.osd_blk_cnt(osd_blk_cnt),
+	.oimg_mounted(2'b00), .oimg_readonly(1'b0), .oimg_size(64'd0),
+	.osd_unit(), .osd_lba(osd_lba), .osd_rd(osd_rd), .osd_wr(osd_wr),
+	.osd_ack(osd_ack), .osd_buff_din(osd_buff_din),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
@@ -101,6 +148,9 @@ next_system #(
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid),
+	.ram_line_tag(ram_line_tag),
+	.ram_line_data(ram_line_data),
 
 	.led(led),
 	.audio_l(), .audio_r(),
@@ -194,6 +244,7 @@ next_ddram ddram
 	.ram_req(ram_req), .ram_we(ram_we), .ram_be(ram_be),
 	.ram_addr(ram_addr), .ram_din(ram_din),
 	.ram_dout(ram_dout), .ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid), .ram_line_tag(ram_line_tag), .ram_line_data(ram_line_data),
 	.DDRAM_BUSY(ga_busy), .DDRAM_BURSTCNT(ga_burst), .DDRAM_ADDR(ga_addr),
 	.DDRAM_DOUT(ga_dout), .DDRAM_DOUT_READY(ga_dout_ready),
 	.DDRAM_RD(ga_rd), .DDRAM_DIN(ga_din), .DDRAM_BE(ga_be), .DDRAM_WE(ga_we)
@@ -228,6 +279,18 @@ wire  [7:0] brx_data;
 wire [47:0] enet_mac;
 
 reg         net_enable = 1;
+// +rtc: seed the NeXT clock as the HPS would, one TIMESTAMP update shortly
+// after reset; +rtcts=<unix seconds> chooses the moment (default
+// 1718884800 = Thu 2024-06-20 12:00:00 UTC, inside this image's window).
+// Without +rtc the RTC starts at zero as it did before the seed existed.
+reg  [32:0] ts_host = 33'd0;
+reg  [31:0] rtc_ts = 32'd1718884800;
+initial if ($value$plusargs("rtcts=%d", rtc_ts)) ;
+reg         rtc_pulsed = 0;
+always @(posedge clk) if (!reset && !rtc_pulsed && $test$plusargs("rtc")) begin
+	rtc_pulsed <= 1;
+	ts_host <= {1'b1, rtc_ts};
+end
 
 next_enet_bridge #(.CLK_HZ(50000000)) bridge
 (
@@ -273,6 +336,11 @@ function [31:0] bsw; input [31:0] x; bsw = {x[7:0], x[15:8], x[23:16], x[31:24]}
 reg  [7:0] d3_left = 0;
 reg [28:0] d3_addr = 0;
 reg  [5:0] d3_lat = 0;
+// +ddrlat=<n>: clocks from the read's acceptance to its first data word
+// (12 by default; the MiSTer DDRAM port answers in ~20 clocks at 100 MHz,
+// about 6 at 28 MHz, when the HPS leaves it alone)
+integer ddr_lat = 12;
+initial if ($value$plusargs("ddrlat=%d", ddr_lat)) ;
 reg [31:0] d3_lfsr = 32'h1234_5678;
 reg        d3_busy_r = 0;
 reg        d3_dv = 0;
@@ -318,7 +386,7 @@ always @(posedge clk) begin
 			else if (dr_rd) begin
 				d3_addr <= dr_addr;
 				d3_left <= dr_burst;
-				d3_lat  <= 6'd12;
+				d3_lat  <= ddr_lat[5:0];
 				if (in_mbox) mbox_reads = mbox_reads + 1;
 				else if (!in_ram && !in_vram) stray_ddr = stray_ddr + 1;
 			end
@@ -345,15 +413,19 @@ end
 // bus monitor
 //----------------------------------------------------------------------------
 
-wire [31:0] cpu_addr  = dut.cpu_addr;
-wire  [1:0] busstate  = dut.busstate;
-wire        mem_ready = dut.mem_ready;
-wire [15:0] cpu_din   = dut.cpu_din;
-wire [15:0] cpu_dout  = dut.cpu_dout;
+// the CPU's beat port: mem_ready is one completion per aligned longword
+// beat (b_ack), with the address, byte enables and data of that beat
+wire [31:0] cpu_addr  = {dut.b_addr, 2'b00};
+wire  [3:0] cpu_be    = dut.b_be;
+wire        mem_ready = dut.b_ack;
+wire [31:0] cpu_din   = dut.b_rdata;
+wire [31:0] cpu_dout  = dut.b_wdata;
+wire        is_write  = dut.b_write;
 wire        berr_hold = dut.berr_hold;
+// the 16-bit half a narrow access carries (device registers are 16-bit)
+wire [15:0] cpu_data16 = (cpu_be[3:2] != 2'b00) ? (is_write ? cpu_dout[31:16] : cpu_din[31:16])
+                                                : (is_write ? cpu_dout[15:0]  : cpu_din[15:0]);
 
-// latch the address of the cycle being completed: mem_ready comes two
-// cycles after dispatch, while the CPU still holds addr_out
 integer access_count = 0;
 reg [31:0] first_addr [0:3];
 
@@ -370,7 +442,6 @@ integer iolog_n = 0;
 reg [63:0] iolog [0:1023];       // {we, addr[30:0], data[15:0], pc[15:0]}
 
 wire is_io_cyc = (cpu_addr[31:24] == 8'h02);
-wire is_write  = (busstate == 2'b11);
 
 always @(posedge clk) begin
 	if (!reset) begin
@@ -385,8 +456,8 @@ always @(posedge clk) begin
 			if ((cpu_addr[31:17] == 15'h0100 || cpu_addr[31:17] == 15'h0108) &&
 			    (cpu_addr[16:0] >= 17'h0c000 && cpu_addr[16:0] < 17'h0c004) && !is_write) begin
 				seen_scr1 <= 1;
-				if (!cpu_addr[1] && cpu_din == 16'h0001) scr1_ok <= 1;
-				if ( cpu_addr[1] && cpu_din == 16'h2052) scr1_ok <= 1;
+				if (cpu_be[3:2] != 2'b00 && cpu_din[31:16] == 16'h0001) scr1_ok <= 1;
+				if (cpu_be[1:0] != 2'b00 && cpu_din[15:0]  == 16'h2052) scr1_ok <= 1;
 			end
 
 			if ((cpu_addr[31:24] == 8'h02) &&
@@ -396,11 +467,10 @@ always @(posedge clk) begin
 			// which bit-bangs the RTC forever: recording that scrolls
 			// the conversation that caused the fault out of the ring.
 			if (is_io_cyc && berr_count < 2) begin
-				iolog[iolog_n % 1024] <= {is_write, cpu_addr[30:0], is_write ? cpu_dout : cpu_din, dbg_pc[15:0]};
+				iolog[iolog_n % 1024] <= {is_write, cpu_addr[30:0], cpu_data16, dbg_pc[15:0]};
 				iolog_n = iolog_n + 1;
 			end
 		end
-		if (berr_hold && busstate != 2'b01) ;
 		if (dbg_pc == 32'h0100001E) seen_entry <= 1;
 	end
 end
@@ -497,8 +567,8 @@ wire is_enet_cyc = (cpu_addr[31:24] == 8'h02) &&
 
 always @(posedge clk) begin
 	if (!reset && mem_ready && is_enet_cyc && $test$plusargs("entrace"))
-		$display("[%0t] EN %s %08x data=%04x pc=%08x",
-		         $time, is_write ? "WR" : "RD", cpu_addr,
+		$display("[%0t] EN %s %08x be=%b data=%08x pc=%08x",
+		         $time, is_write ? "WR" : "RD", cpu_addr, cpu_be,
 		         is_write ? cpu_dout : cpu_din, dbg_pc);
 end
 
@@ -521,8 +591,28 @@ always @(posedge clk) begin
 		pc_ring[pc_ring_n % 64] <= dbg_pc;
 		pc_ring_n = pc_ring_n + 1;
 		post_trace(dbg_pc);
+		// TEMP loop timing probe: PCs seen inside the ROM's delay() body
+	end
+	// +loopdump: time every looped call of the ROM's delay(n) (entry
+	// $010024CC, rts $010024FC; n is the longword read off the stack on
+	// entry), to recalibrate CLK_HZ/CPU_PACE for a CPU whose cached DBF
+	// speed changed.  The delay() entry watchpoint above does not fire
+	// on every core (the front end need not present that PC), this does.
+	if ($test$plusargs("loopdump")) begin
+		if (dbg_pc == 32'h010024cc && loop_t0 == 0) begin loop_t0 = $time; loop_n = 0; loop_nw = 0; end
+		if (loop_t0 != 0 && mem_ready && !is_write && loop_nw < 1) begin
+			loop_n = cpu_din; loop_nw = loop_nw + 1;
+		end
+		if (dbg_pc == 32'h010024fc && loop_t0 != 0) begin
+			if (($time - loop_t0) / 10 > 40)   // n <= 3 returns before the loop
+				$display("[%0t] LOOP n=%0d clocks=%0d", $time, loop_n, ($time - loop_t0) / 10);
+			loop_t0 = 0;
+		end
 	end
 end
+time loop_t0 = 0;
+reg [31:0] loop_n;
+integer loop_nw;
 
 task dump_state;
 	integer i, k;
@@ -687,6 +777,58 @@ always @(posedge clk) if (!reset && panic_trace && saw_kernel && !wildpc_seen &&
 	ptr_data[ptr_n % 64] <= dut.cpu.mem_write ? dut.cpu.mem_wdata : dut.cpu.mem_rdata;
 	ptr_kind[ptr_n % 64] <= {dut.cpu.mem_write, dut.cpu.mem_instr, dut.cpu.mem_size};
 	ptr_n <= ptr_n + 1;
+end
+
+// +exctrace: log exception entries once the kernel runs (vector, the
+// instruction PC, the exception's own PC/address arguments, SR) and, on a
+// processor halt (double fault), the core's state, the words around the
+// halting PC in physical RAM and the +panictrace completions.
+reg exctrace = 0;
+initial exctrace = $test$plusargs("exctrace");
+reg exc_prev = 0, halted_prev = 0;
+integer exc_n = 0, ex_i;
+always @(posedge clk) if (!reset) begin
+	exc_prev <= dut.cpu.core.in_exc;
+	if (exctrace && saw_kernel && dut.cpu.core.in_exc && !exc_prev && exc_n < 400) begin
+		$display("[%0t] EXC: vec=%0d pc_i=%08x spc=%08x addr=%08x sr=%04x aer_fa=%08x sp=%08x",
+		         $time, dut.cpu.core.exc_vec, dut.cpu.core.pc_i, dut.cpu.core.exc_spc,
+		         dut.cpu.core.exc_addr, dut.cpu.core.sr, dut.cpu.core.aer_fa, dut.cpu.core.dbg_a7);
+		exc_n = exc_n + 1;
+	end
+	halted_prev <= dbg_halted;
+	if (exctrace && dbg_halted && !halted_prev) begin
+		$display("[%0t] HALT: double fault. pc_i=%08x pc=%08x ir=%04x state=%0d in_exc=%b exc_vec=%0d exc_spc=%08x exc_addr=%08x aer_fa=%08x sr=%04x sp=%08x vbr=%08x",
+		         $time, dut.cpu.core.pc_i, dut.cpu.core.pc, dut.cpu.core.ir, dut.cpu.core.state,
+		         dut.cpu.core.in_exc, dut.cpu.core.exc_vec, dut.cpu.core.exc_spc, dut.cpu.core.exc_addr,
+		         dut.cpu.core.aer_fa, dut.cpu.core.sr, dut.cpu.core.dbg_a7, dut.cpu.core.vbr);
+		$display("  mmu: tc=%08x srp=%08x urp=%08x  cpu: mem_addr=%08x phys=%08x mem_req=%b mem_write=%b fc=%0d",
+		         dut.cpu.mmu.tc, dut.cpu.mmu.srp, dut.cpu.mmu.urp,
+		         dut.cpu.mem_addr, dut.cpu.mmu_addr_phys, dut.cpu.mem_req, dut.cpu.mem_write, dut.cpu.mem_fc);
+		$display("  RAM around pc_i (physical = pc - 0x04000000 assumed):");
+		for (ex_i = -8; ex_i < 8; ex_i = ex_i + 1)
+			$display("    %08x: %08x", dut.cpu.core.pc_i + ex_i*4,
+			         ram_mem[((dut.cpu.core.pc_i - 32'h04000000) >> 2) + ex_i]);
+		$display("  RAM around sp:");
+		for (ex_i = -4; ex_i < 12; ex_i = ex_i + 1)
+			$display("    %08x: %08x", dut.cpu.core.dbg_a7 + ex_i*4,
+			         ram_mem[((dut.cpu.core.dbg_a7 - 32'h04000000) >> 2) + ex_i]);
+		// NS3.3 vm_page_lookup: the bucket table pointer and hash mask live at
+		// $040c4338/$040c433c; an empty bucket is a self-pointer, never 0
+		begin : buckets
+			reg [31:0] tab, mask; integer zeros, k;
+			tab = ram_mem[(32'h040c4338 - 32'h04000000) >> 2];
+			mask = ram_mem[(32'h040c433c - 32'h04000000) >> 2];
+			zeros = 0;
+			for (k = 0; k <= mask && k < 65536; k = k + 1)
+				if (ram_mem[((tab - 32'h04000000) >> 2) + 2*k] == 0) zeros = zeros + 1;
+			$display("  vm_page_buckets=%08x mask=%08x: %0d of %0d buckets read 0 in RAM", tab, mask, zeros, mask + 1);
+			for (k = 0; k < 8; k = k + 1)
+				$display("    bucket %0d @%08x: next=%08x prev=%08x", k, tab + 8*k,
+				         ram_mem[((tab - 32'h04000000) >> 2) + 2*k], ram_mem[((tab - 32'h04000000) >> 2) + 2*k + 1]);
+		end
+		dump_panic_trace;
+		halt_run <= 1;
+	end
 end
 
 task dump_panic_trace;
@@ -918,10 +1060,16 @@ reg  [2:0] img_mounted = 0;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 reg         sd_ack = 0;
-reg   [8:0] sd_buff_addr = 0;
+reg  [12:0] sd_buff_addr = 0;     // one buffer bus for the SCSI and MO slots
 reg   [7:0] sd_buff_dout = 0;
 wire  [7:0] sd_buff_din;
 reg         sd_buff_wr = 0;
+wire  [5:0] sd_blk_cnt, osd_blk_cnt;
+// the MO slot: no cartridge, only the ECC exchange (a 3-block window)
+wire [31:0] osd_lba;
+wire        osd_rd, osd_wr;
+wire  [7:0] osd_buff_din;
+reg         osd_ack = 0;
 
 reg  [7:0] disk [0:2048*512-1];
 
@@ -974,53 +1122,132 @@ initial for (sdi = 0; sdi < 2048*512; sdi = sdi + 1)
 reg sd_rd_act = 0, sd_wr_act = 0, sd_rphase = 0, img_flush = 0;
 integer sd_reads = 0;
 reg sd_lba0 = 0;
+// A window transaction (lba >= 0x7C000000) is served by the HPS model;
+// the MO slot shares the buffer bus and only ever carries windows.
+reg         sd_win = 0;
+reg  [12:0] sd_last = 13'd511;
+reg         osd_rd_act = 0, osd_wr_act = 0;
+integer     hr;
+// +hostlat=<clocks>: the HPS answers a window request only after this many
+// clocks (Main's poll cadence is milliseconds; the default answers at once)
+integer     hostlat = 0;
+integer     hl_cnt = 0;
+initial if ($value$plusargs("hostlat=%d", hostlat)) ;
+wire        hl_ok = (hl_cnt >= hostlat);
+always @(posedge clk) begin
+	if ((sd_rd && sd_lba >= 32'h7C00_0000) || (sd_wr && sd_lba >= 32'h7C00_0000) || osd_rd || osd_wr) begin
+		if (!sd_ack && !osd_ack && hl_cnt < hostlat) hl_cnt <= hl_cnt + 1;
+	end
+	else hl_cnt <= 0;
+	if (sd_ack || osd_ack) hl_cnt <= 0;
+end
+
+// the mounts, as user_io's mount hook reports them to the HPS
+always @(negedge clk) begin
+	if (img_mounted[0]) hr = host_mount_disk(0, img_bytes);
+	if (img_mounted[2]) hr = host_mount_disk(2, img_bytes);
+	if (cimg_mounted) begin
+		if (img_fd != 0) hr = host_mount_cd(img_path);
+		else hr = host_mount_disk(3, img_bytes);
+	end
+end
 
 always @(posedge clk) begin
 	sd_buff_wr <= 0;
-	if (sd_rd && !sd_ack) begin
+	if (!sd_ack && !osd_ack && sd_rd && (sd_lba < 32'h7C00_0000 || hl_ok)) begin
 		sd_ack <= 1;
 		sd_rd_act <= 1;
 		sd_buff_addr <= 0;
-		sd_reads = sd_reads + 1;
-		if (sd_lba == 0) sd_lba0 <= 1;
-		if (img_fd != 0) begin
-			fr = $fseek(img_fd, {sd_lba, 9'd0}, 0);
-			fr = $fread(fbuf, img_fd);
+		sd_win <= (sd_lba >= 32'h7C00_0000);
+		sd_last <= ({7'd0, sd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+		if (sd_lba >= 32'h7C00_0000)
+			hr = host_fill(3, sd_lba, ({26'd0, sd_blk_cnt} + 32'd1) * 32'd512);
+		else begin
+			sd_reads = sd_reads + 1;
+			if (sd_lba == 0) sd_lba0 <= 1;
+			if (img_fd != 0) begin
+				fr = $fseek(img_fd, {sd_lba, 9'd0}, 0);
+				fr = $fread(fbuf, img_fd);
+			end
+			if (sd_reads < 200 || (sd_reads % 256) == 0)
+				$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
 		end
-		if (sd_reads < 200 || (sd_reads % 256) == 0)
-			$display("[%0t] BOOT: SD read lba %0d", $time, sd_lba);
 	end
 	else if (sd_ack && sd_rd_act) begin
 		if (!sd_buff_wr) begin
-			sd_buff_dout <= (img_fd != 0)
-			              ? fbuf[sd_buff_addr]
-			              : disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}];
+			sd_buff_dout <= sd_win ? host_byte(sd_buff_addr) :
+			                (img_fd != 0) ? fbuf[sd_buff_addr[8:0]]
+			              : disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr[8:0]}];
 			sd_buff_wr <= 1;
-			if (sd_buff_addr == 9'd511) begin
+			if (sd_buff_addr == sd_last) begin
 				sd_ack <= 0;
 				sd_rd_act <= 0;
 			end
 		end
 		else begin
-			if (sd_buff_addr != 9'd511) sd_buff_addr <= sd_buff_addr + 1'd1;
+			if (sd_buff_addr != sd_last) sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
 	end
-	else if (sd_wr && !sd_ack) begin
+	else if (!sd_ack && !osd_ack && sd_wr && (sd_lba < 32'h7C00_0000 || hl_ok)) begin
 		sd_ack <= 1;
 		sd_wr_act <= 1;
 		sd_buff_addr <= 0;
 		sd_rphase <= 0;
-		$display("[%0t] BOOT: SD write lba %0d", $time, sd_lba);
+		sd_win <= (sd_lba >= 32'h7C00_0000);
+		sd_last <= ({7'd0, sd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+		if (sd_lba < 32'h7C00_0000)
+			$display("[%0t] BOOT: SD write lba %0d", $time, sd_lba);
 	end
 	else if (sd_ack && sd_wr_act) begin
 		if (sd_rphase) begin
-			if (img_fd != 0) fbuf[sd_buff_addr] <= sd_buff_din;
-			else disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr}] <= sd_buff_din;
+			if (sd_win) host_put(sd_buff_addr, sd_buff_din);
+			else if (img_fd != 0) fbuf[sd_buff_addr[8:0]] <= sd_buff_din;
+			else disk[{sd_lba[10:0], 9'd0} + {23'd0, sd_buff_addr[8:0]}] <= sd_buff_din;
 			sd_rphase <= 0;
-			if (sd_buff_addr == 9'd511) begin
+			if (sd_buff_addr == sd_last) begin
 				sd_ack <= 0;
 				sd_wr_act <= 0;
-				if (img_fd != 0) img_flush <= 1;
+				if (sd_win) host_exec(3, sd_lba, {19'd0, sd_last} + 32'd1);
+				else if (img_fd != 0) img_flush <= 1;
+			end
+			else sd_buff_addr <= sd_buff_addr + 1'd1;
+		end
+		else sd_rphase <= 1;
+	end
+	// the MO slot's ECC exchange
+	else if (!sd_ack && !osd_ack && osd_rd && hl_ok) begin
+		osd_ack <= 1;
+		osd_rd_act <= 1;
+		sd_buff_addr <= 0;
+		sd_last <= ({7'd0, osd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+		hr = host_fill(5, osd_lba, ({26'd0, osd_blk_cnt} + 32'd1) * 32'd512);
+	end
+	else if (osd_ack && osd_rd_act) begin
+		if (!sd_buff_wr) begin
+			sd_buff_dout <= host_byte(sd_buff_addr);
+			sd_buff_wr <= 1;
+			if (sd_buff_addr == sd_last) begin
+				osd_ack <= 0;
+				osd_rd_act <= 0;
+			end
+		end
+		else if (sd_buff_addr != sd_last) sd_buff_addr <= sd_buff_addr + 1'd1;
+	end
+	else if (!sd_ack && !osd_ack && osd_wr && hl_ok) begin
+		osd_ack <= 1;
+		osd_wr_act <= 1;
+		sd_buff_addr <= 0;
+		sd_rphase <= 0;
+		sd_last <= ({7'd0, osd_blk_cnt} + 13'd1) * 13'd512 - 13'd1;
+	end
+	else if (osd_ack && osd_wr_act) begin
+		if (sd_rphase) begin
+			host_put(sd_buff_addr, osd_buff_din);
+			sd_rphase <= 0;
+			if (sd_buff_addr == sd_last) begin
+				osd_ack <= 0;
+				osd_wr_act <= 0;
+				host_exec(5, osd_lba, {19'd0, sd_last} + 32'd1);
 			end
 			else sd_buff_addr <= sd_buff_addr + 1'd1;
 		end
@@ -1178,11 +1405,13 @@ end
 
 // 1120x832 2bpp NeXT gray to PGM: 0 = white, 3 = black, line pitch
 // 288 bytes (1120/4 active plus 8 pad), even address byte in mem_hi
+string fb_path;   // +fbout=<path> chooses the dump file (parallel runs)
 task fb_dump;
 	integer fd, y, xb, p;
 	reg [7:0] b;
 	begin
-		fd = $fopen("build/fb.pgm", "wb");
+		if (!$value$plusargs("fbout=%s", fb_path)) fb_path = "build/fb.pgm";
+		fd = $fopen(fb_path, "wb");
 		$fwrite(fd, "P5\n1120 832\n255\n");
 		for (y = 0; y < 832; y = y + 1) begin
 			for (xb = 0; xb < 280; xb = xb + 1) begin : row

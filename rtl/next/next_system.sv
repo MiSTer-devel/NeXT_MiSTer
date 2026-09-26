@@ -19,34 +19,61 @@
 //  The MWF mirrors are plain accesses for now (MWF0 = copy); the raster
 //  op write functions are a TODO documented in docs/PORTING.md.
 //
-//  The CPU bus follows the TG68K-shaped protocol of ap040_tg68k_compat
-//  (see rtl/AP68040/tb/tb_ap040_program.v): the host pulses mem_ready for
-//  one cycle to complete an access, clkena_in = idle | mem_ready | berr.
+//  The CPU bus is the 32-bit beat port of ap040_tg68k_compat with
+//  AP040_BUS32 (ap040_bus32_adapter.v: aligned longword beats with byte
+//  enables, b_req level-held per beat, b_ack a one-clock pulse, berr
+//  aborts).  Main RAM takes a beat as one ram_* transaction; the ROM,
+//  VRAM, BMAP and the device registers are 16-bit and take it as one or
+//  two 16-bit sub-cycles (upper half first), which is exactly the access
+//  sequence the old 16-bit CPU bus produced, so every device keeps its
+//  16-bit register file (docs/PERF_PLAN.md stage 3).  The core's clock
+//  enable stays high while a beat is in flight (the mode the CPU tree is
+//  validated in); only idle clocks are gated, by the DBcc floor below.
 //============================================================================
 
 module next_system #(
-	parameter CLK_HZ      = 100000000,
-	// Internal (cached) CPU cycles advance NUM of every DEN clocks
-	// (bus cycles are never gated).  The boot ROM's delay() is a
-	// calibrated DBF loop, self-checked by the POST event counter test
+	parameter CLK_HZ      = 25000000,
+	// CPU speed calibration.  The boot ROM's delay() is a calibrated
+	// bare "dbf d0,*" loop, self-checked by the POST event counter test
 	// against a 899..1100 us window for delay(1000): 6.25 loop
-	// iterations per microsecond TICK of this module.  The core runs a
-	// cached DBF-taken in ~8 clocks (measured in full-POST simulation),
-	// so the calibration invariant is
-	//     (CLK_HZ / 1e6) * (CPU_PACE_NUM / CPU_PACE_DEN) = 50
-	// clocks per microsecond tick.  CLK_HZ defines the microsecond of
-	// every timer in this system, so it may be a VIRTUAL microsecond:
-	// the FPGA build runs the 32 MHz clock with CLK_HZ = 50 MHz and
-	// pacing off, making the machine uniformly 64 percent of real time
-	// but internally consistent with the calibration.  The defaults
-	// below (100 MHz, 1/2) satisfy the same invariant.
+	// iterations per microsecond TICK of this module, i.e. the ROM
+	// assumes a real 68040's 4 clocks per taken DBcc.  The AP68040 runs
+	// that loop in 2 clocks through its DBcc fast path, so the host
+	// prices DBcc the way the real chip (and Previous's 68040 timing
+	// model, gencpu.c adjust_cycles: DBcc = 4 cycles) does: consecutive
+	// executions of DBcc are kept at least DBCC_FLOOR enabled clocks
+	// apart by gating the core's clock enable on idle clocks only, and
+	// no other instruction is slowed.  The calibration invariant is
+	//     (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR
+	// clocks per microsecond tick (25 MHz for a floor of 4).  CLK_HZ
+	// defines the microsecond of every timer in this system, so it may
+	// be a VIRTUAL microsecond: the FPGA build runs the 28 MHz clock with
+	// CLK_HZ = 25 MHz, making the machine uniformly 112 percent of real
+	// time but internally consistent with the calibration.
+	//
+	// DBCC_FLOOR is the count of enabled clocks between entries into the
+	// core's S_DBCC1 state (read from debug_status[231:224]; the encoding
+	// 8'd53 must be re-checked on every CPU drop, docs/CPU_NEXT_PORT.md);
+	// 0 turns the floor off.  A DBcc followed by a bus cycle hides its
+	// stall under the bus wait, so memcpy-shaped loops are not affected.
+	parameter DBCC_FLOOR   = 4,
+	// The older, coarser calibration: internal (cached) CPU cycles
+	// advance NUM of every DEN clocks (bus cycles are never gated), i.e.
+	// the whole CPU is slowed.  1/1 = off, the default; 1/2 with a floor
+	// of 0 is the previous 25 MHz configuration, kept selectable for
+	// comparison.
 	parameter CPU_PACE_NUM = 1,
-	parameter CPU_PACE_DEN = 2,
+	parameter CPU_PACE_DEN = 1,
 	// physical clock rate, for the battery backed time of day
 	parameter CLK_REAL_HZ = CLK_HZ,
 	parameter ROM_INIT_EN = 0,
 	parameter ROM_INIT    = "rom.hex",
-	parameter DEBUG_EXCEPTIONS = 0
+	parameter DEBUG_EXCEPTIONS = 0,
+	parameter POST_STORES = 0,
+	// 0 leaves the sound input (the codec input DMA channel and its
+	// registers) out of the build: ~340 ALMs here plus the ADC in the emu
+	// top.  The registers then read as zero and the channel never runs.
+	parameter SND_IN_EN = 1
 )
 (
 	input         clk,            // system clock: CPU, devices, RAM
@@ -55,6 +82,7 @@ module next_system #(
 
 	// boot device menu (to the NVRAM boot command, see next_scr)
 	input   [2:0] boot_sel,
+	input  [32:0] ts_host,       // host clock from hps_io TIMESTAMP (see next_scr)
 
 	// external ethernet cable/backend state.  Internal loopback remains
 	// available inside next_enet_dma when this is false.
@@ -94,8 +122,10 @@ module next_system #(
 	output [31:0] sd_lba,
 	output        sd_rd,
 	output        sd_wr,
+	output  [5:0] sd_blk_cnt,      // hps_io blocks-1 for the CD-ROM slot (audio frames)
+	output  [5:0] osd_blk_cnt,     // ... for the MO slot (the ECC exchange)
 	input         sd_ack,
-	input   [8:0] sd_buff_addr,
+	input  [12:0] sd_buff_addr,    // multi-block transfers reach 2560 bytes
 	input   [7:0] sd_buff_dout,
 	output  [7:0] sd_buff_din,
 	input         sd_buff_wr,
@@ -124,6 +154,11 @@ module next_system #(
 	output reg [31:0] ram_din,
 	input      [31:0] ram_dout,
 	input             ram_ack,
+	// the line next_ddram retains (docs/PERF_PLAN.md stage 2b), offered
+	// to the CPU cache's fills through the wrapper's cache_line_* sideband
+	input             ram_line_valid,
+	input      [21:0] ram_line_tag,    // ram_addr[23:2]
+	input     [127:0] ram_line_data,   // word 0 in [127:96]
 
 	output        led,
 
@@ -159,14 +194,15 @@ module next_system #(
 // CPU
 //----------------------------------------------------------------------------
 
-wire [15:0] cpu_din;
-wire [31:0] cpu_addr;
-wire [15:0] cpu_dout;
-wire        nwr, nuds, nlds;
-wire  [1:0] busstate;
-wire        longword;
+// the CPU's beat port (ap040_bus32_adapter.v for the contract)
+wire        b_req, b_write, b_instr, b_busy;
+wire [31:2] b_addr;
+wire  [3:0] b_be;
+wire [31:0] b_wdata;
+wire  [2:0] b_fc;
+reg         b_ack;
+reg  [31:0] b_rdata;
 wire        nresetout;
-wire  [2:0] fc;
 
 wire        walker_req, walker_we;
 wire [31:0] walker_addr, walker_wdat;
@@ -174,7 +210,6 @@ reg         walker_ack;
 reg  [31:0] walker_data;
 reg         walker_berr;
 
-reg         mem_ready;
 reg         berr_hold;
 
 // snoop pulse for DMA writes into main RAM (one per acknowledged write)
@@ -232,16 +267,53 @@ wire [15:0] pr_rdata;
 
 wire  [2:0] ipl_level;
 
-// fractional pacing of internal cycles (see CPU_PACE_* above)
-reg [$clog2(CPU_PACE_DEN)-1:0] pace_acc = 0;
+// fractional pacing of internal cycles (see CPU_PACE_* above; 1/1 = off)
+localparam PACE_W = (CPU_PACE_DEN > 1) ? $clog2(CPU_PACE_DEN) : 1;
+reg [PACE_W-1:0] pace_acc = 0;
 wire pace = pace_acc < CPU_PACE_NUM;
 always @(posedge clk)
 	pace_acc <= (pace_acc == CPU_PACE_DEN-1) ? 1'd0 : pace_acc + 1'd1;
 
-wire clkena = ((busstate == 2'b01) & pace) | mem_ready | berr_hold;
-
 wire [255:0] debug_status;
 assign dbg_pc  = debug_status[31:0];
+
+// DBcc period floor (see DBCC_FLOOR above): consecutive entries into the
+// core's S_DBCC1 state are kept DBCC_FLOOR ENABLED clocks apart.  The
+// entry is seen one clock after the core took the state (debug_status
+// carries the state register), so the owed stall lands on the state
+// after it; only idle clocks are gated, exactly as CPU_PACE gates them.
+// dbcc_since counts enabled clocks, the entry clock included, since the
+// last entry, saturating at the floor: a stall must not count toward
+// the next interval, or the loop settles below the floor.
+localparam DBCC_S = 8'd53;      // ap040_core.v S_DBCC1: re-check on every CPU drop
+localparam [2:0] DBCC_FLOOR_W = DBCC_FLOOR;
+wire       in_dbcc    = (debug_status[231:224] == DBCC_S);
+reg        dbcc_prev  = 0;      // in_dbcc last clock
+reg  [2:0] dbcc_since = DBCC_FLOOR_W;
+reg  [2:0] dbcc_left  = 0;      // stall clocks still owed
+wire       dbcc_entry = in_dbcc & ~dbcc_prev;
+wire       dbcc_stall = (dbcc_left != 0);
+
+// b_busy: a beat in flight or a transaction requested last clock, so a
+// request arriving during a stall starts one clock later at most and the
+// rest of the stall hides under the bus wait, as it did on the 16-bit bus
+wire clkena = b_busy | berr_hold | (pace & ~dbcc_stall);
+
+always @(posedge clk) begin
+	dbcc_prev <= in_dbcc;
+	if (reset) begin
+		dbcc_left  <= 0;
+		dbcc_since <= DBCC_FLOOR_W;
+	end
+	else if (dbcc_entry) begin
+		dbcc_left  <= (dbcc_since < DBCC_FLOOR_W) ? DBCC_FLOOR_W - dbcc_since : 3'd0;
+		dbcc_since <= clkena ? 3'd1 : 3'd0;
+	end
+	else begin
+		if (dbcc_left != 0) dbcc_left <= dbcc_left - 1'd1;
+		if (clkena && dbcc_since != DBCC_FLOOR_W) dbcc_since <= dbcc_since + 1'd1;
+	end
+end
 assign dbg_ipl = ipl_level;
 
 ap040_tg68k_compat #(
@@ -250,7 +322,14 @@ ap040_tg68k_compat #(
 	// Match Previous's non-Turbo 040: old Mach expects 44-byte FPU frames.
 	.AP040_FPU_REVISION(8'h40),
 	.AP040_ENABLE_CACHE(1),
-	.AP040_DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
+	// Post stores to main RAM only (0x04000000-0x07FFFFFF): device space
+	// must still be able to bus-error a write.  POST_STORES is a parameter
+	// of this module so the bench can run both ways.
+	.AP040_POST_STORES(POST_STORES),
+	.AP040_POST_LO(32'h0400_0000),
+	.AP040_POST_HI(32'h0800_0000),
+	.AP040_DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
+	.AP040_BUS32(1)
 ) cpu
 (
 	.clk(clk),
@@ -273,20 +352,36 @@ ap040_tg68k_compat #(
 	.cache_z3_base1(4'd0),
 	.cache_z3_ena1(1'b0),
 
-	.data_in(cpu_din),
+	// the 16-bit port idles (AP040_BUS32)
+	.data_in(16'd0),
 	.ipl(~ipl_level),
 	.ipl_autovector(1'b1),
 	.berr(berr_hold),
 
-	.addr_out(cpu_addr),
-	.data_write(cpu_dout),
-	.nwr(nwr),
-	.nuds(nuds),
-	.nlds(nlds),
-	.busstate(busstate),
-	.longword(longword),
+	.addr_out(),
+	.data_write(),
+	.nwr(),
+	.nuds(),
+	.nlds(),
+	.busstate(),
+	.longword(),
 	.nresetout(nresetout),
-	.fc(fc),
+	.fc(),
+
+	.b32_req(b_req),
+	.b32_write(b_write),
+	.b32_instr(b_instr),
+	.b32_addr(b_addr),
+	.b32_be(b_be),
+	.b32_wdata(b_wdata),
+	.b32_fc(b_fc),
+	.b32_ack(b_ack),
+	.b32_rdata(b_rdata),
+	.b32_busy(b_busy),
+	// the retained-line sideband (docs/PERF_PLAN.md stage 2b)
+	.cache_line_valid(sb_valid),
+	.cache_line_tag(sb_tag),
+	.cache_line_data(ram_line_data),
 
 	.mmu_addr_log(),
 	.mmu_addr_phys(),
@@ -320,14 +415,33 @@ ap040_tg68k_compat #(
 );
 
 // devices also see the RESET instruction
-wire dev_reset = reset | ~nresetout;
+// registered: a global-routed net (NeXT.qsf), ~4,000 device registers
+reg  dev_reset = 1;
+always @(posedge clk) dev_reset <= reset | ~nresetout;
 
 //----------------------------------------------------------------------------
 // address decode
 //----------------------------------------------------------------------------
 
-wire is_write = (busstate == 2'b11);
-wire [1:0] lanes = {~nuds, ~nlds};
+localparam S_IDLE = 3'd0, S_INT = 3'd1, S_RAM = 3'd2, S_RAM_E = 3'd3, S_GAP = 3'd4;
+reg  [2:0] state;
+
+// The 16-bit view of the beat for the ROM, VRAM, BMAP and the device
+// registers: a beat is served to them as one or two 16-bit sub-cycles
+// (S_INT), the upper half (bytes 0-1, b_be[3:2]) first, then after an
+// idle clock (S_GAP) the lower half (b_be[1:0]); a half with no byte
+// enabled is skipped.  cpu_addr/lanes/cpu_dout/is_write are the same
+// signals the old 16-bit CPU bus drove, so the devices see the same
+// accesses in the same order (a longword read of the event counter still
+// latches on its first half, the ESP FIFO still sees one 16-bit access
+// per half).  The address is valid in the clock before S_INT for the
+// ROM's and the VRAM's synchronous read.
+reg         half_r;
+wire        half     = half_r | ((state == S_IDLE) && (b_be[3:2] == 2'b00));
+wire [31:0] cpu_addr = {b_addr, half, 1'b0};
+wire  [1:0] lanes    = half ? b_be[1:0] : b_be[3:2];
+wire [15:0] cpu_dout = half ? b_wdata[15:0] : b_wdata[31:16];
+wire        is_write = b_write;
 
 wire d_rom  = (cpu_addr[31:17] == 15'h0000) || (cpu_addr[31:17] == {8'h01, 7'd0});
 wire d_io   = (cpu_addr[31:24] == 8'h02) &&
@@ -344,15 +458,26 @@ wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
 // bus cycle state machine
 //----------------------------------------------------------------------------
 
-localparam S_IDLE = 2'd0, S_INT = 2'd1, S_RAM = 2'd2, S_RAM_E = 2'd3;
-
-reg  [1:0] state;
 localparam G_ENET = 3'd0, G_MO = 3'd1, G_SND = 3'd2, G_SCSI = 3'd3, G_PRINT = 3'd4, G_SNDIN = 3'd5;
 reg  [2:0] dma_grant;
 reg        sel_rom, sel_vram, sel_io, sel_bmap;
-reg [15:0] cyc_rdata;
 
-wire cpu_req = (busstate != 2'b01) && !mem_ready && !berr_hold;
+// a beat to serve: not the retire clock of the one just acknowledged (the
+// adapter still shows it under b_ack), not while a bus error is reported
+wire cpu_req = b_req && !b_ack && !berr_hold;
+
+// The retained-line sideband (docs/PERF_PLAN.md stage 2b).  The cache
+// compares the physical address it asked for, so the tag offered is the
+// CPU's own address of the line it last read from RAM (sb_tag, latched
+// with the beat; the MWF mirrors at 0x10-0x1F reach the same RAM through
+// a different address and simply miss), and the line is valid only
+// while next_ddram holds that very line whole.  A DMA or walker write
+// into it keeps the copy current (next_ddram updates the word) and the
+// snoop invalidates the cache's set, so no stale word can be served
+// from it; a burst in flight drops it.
+reg  [31:4] sb_tag;
+reg         sb_ram;
+wire        sb_valid = sb_ram && ram_line_valid && (ram_line_tag == sb_tag[25:4]);
 
 // walker service (the core never runs walker and CPU bus cycles at the
 // same time, see tb_ap040_program.v)
@@ -363,8 +488,9 @@ reg  walker_busy;
 // internal read data mux (valid in cycle S_INT)
 wire [15:0] rom_q, vram_q, io_rdata, bmap_rdata;
 wire        bmap_tpe_select;
-
-assign cpu_din = cyc_rdata;
+wire [15:0] int_rdata = sel_rom  ? rom_q :
+                        sel_vram ? vram_q :
+                        sel_bmap ? bmap_rdata : io_rdata;
 
 assign en_m_ack = (state == S_RAM_E) && (dma_grant == G_ENET) && ram_ack;
 assign mo_m_ack = (state == S_RAM_E) && (dma_grant == G_MO) && ram_ack;
@@ -390,9 +516,19 @@ assign pr_m_err = pr_m_req && !pr_m_is_ram;
 assign si_m_err = si_m_req && !si_m_is_ram;
 
 always @(posedge clk) begin
-	mem_ready  <= 0;
-	walker_ack <= 0;
-	walker_berr<= 0;
+	b_ack <= 0;
+	// The walker's acknowledge is a LEVEL held until the MMU drops its
+	// request, not a one-clock pulse: the MMU samples it only under the
+	// CPU's clock enable, and with the core paced (CPU_PACE 1 of 2) a
+	// pulse landing on the un-enabled clock was lost, hanging the table
+	// walk until the stall watchdog faulted it (every MMU test of the CPU
+	// suite failed +pace this way).  The MMU inserts a request-low cycle
+	// after every descriptor transaction (w_issued), so a held ack can
+	// never complete the next one -- the contract ap040_walker_cdc keeps.
+	if (!walker_req) begin
+		walker_ack <= 0;
+		walker_berr<= 0;
+	end
 
 	dma_snoop_stb <= 0;
 	if (reset) begin
@@ -402,9 +538,14 @@ always @(posedge clk) begin
 		ram_req <= 0;
 		walker_armed <= 1;
 		walker_busy <= 0;
+		half_r <= 0;
+		sb_ram <= 0;
+		sb_tag <= 0;
 	end
 	else begin
-		if (berr_hold && busstate == 2'b01) berr_hold <= 0;
+		// the adapter drops the faulted beat on the next enabled clock;
+		// berr stays up until it has (two clocks, as on the 16-bit bus)
+		if (berr_hold && !b_req) berr_hold <= 0;
 		if (!walker_req) walker_armed <= 1;
 
 		case (state)
@@ -489,33 +630,59 @@ always @(posedge clk) begin
 					state <= S_RAM_E;
 				end
 			end
-			else if (cpu_req && !berr_hold) begin
+			else if (cpu_req) begin
 				if (!d_any) berr_hold <= 1;
 				else if (d_ram) begin
+					// one 32-bit transaction per beat
 					ram_req  <= 1;
-					ram_we   <= is_write;
-					ram_be   <= cpu_addr[1] ? {2'b00, lanes} : {lanes, 2'b00};
-					ram_addr <= cpu_addr[25:2];
-					ram_din  <= {cpu_dout, cpu_dout};
+					ram_we   <= b_write;
+					ram_be   <= b_be;
+					ram_addr <= b_addr[25:2];
+					ram_din  <= b_wdata;
 					state    <= S_RAM;
+					if (!b_write) begin
+						sb_tag <= b_addr[31:4];
+						sb_ram <= 1;
+					end
 				end
 				else begin
+					// 16-bit target: first sub-cycle (the upper half unless
+					// it has no byte enabled)
 					sel_rom  <= d_rom;
 					sel_vram <= d_vram;
 					sel_io   <= d_io;
 					sel_bmap <= d_bmap;
+					half_r   <= half;
 					state    <= S_INT;
 				end
 			end
 		end
 
 		S_INT: begin
-			cyc_rdata <= sel_rom  ? rom_q :
-			             sel_vram ? vram_q :
-			             sel_bmap ? bmap_rdata : io_rdata;
-			mem_ready <= 1;
+			// the sub-cycle: the selected target sees sel/we/lanes/wdata
+			// in this clock and its read data is taken at the end of it
 			{sel_rom, sel_vram, sel_io, sel_bmap} <= 0;
-			state <= S_IDLE;
+			if (half_r) b_rdata[15:0]  <= int_rdata;
+			else        b_rdata[31:16] <= int_rdata;
+			if (!half_r && (b_be[1:0] != 2'b00)) begin
+				half_r <= 1;
+				state  <= S_GAP;
+			end
+			else begin
+				half_r <= 0;
+				b_ack  <= 1;
+				state  <= S_IDLE;
+			end
+		end
+
+		S_GAP: begin
+			// one idle clock between the two halves (the address of the
+			// lower half settles for the ROM's and the VRAM's read)
+			sel_rom  <= d_rom;
+			sel_vram <= d_vram;
+			sel_io   <= d_io;
+			sel_bmap <= d_bmap;
+			state    <= S_INT;
 		end
 
 		S_RAM: begin
@@ -527,8 +694,8 @@ always @(posedge clk) begin
 					walker_data <= ram_dout;
 				end
 				else begin
-					cyc_rdata <= cpu_addr[1] ? ram_dout[15:0] : ram_dout[31:16];
-					mem_ready <= 1;
+					b_rdata <= ram_dout;
+					b_ack   <= 1;
 				end
 				state <= S_IDLE;
 			end
@@ -695,7 +862,8 @@ assign io_rdata = io_enet  ? enet_rdata :
                   io_scc   ? scc_rdata :
                   io_esp   ? esp_rdata :
                   io_flp   ? flp_rdata :
-                  io_evt   ? evt_rdata : 16'h0000;
+                  io_evt   ? evt_rdata :
+                  16'h0000;
 
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;
@@ -742,6 +910,7 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.rdata(scr_rdata),
 	.scr1(32'h00012052),         // 25MHz NeXTcube 68040, 100ns memory
 	.boot_sel(boot_sel),
+	.ts_host(ts_host),
 	.floppy_mounted(floppy_mounted),
 	.sd_lower_mounted(sd_lower_mounted),
 	.timer_ipl7(timer_ipl7),
@@ -859,10 +1028,11 @@ next_mo #(.CLK_HZ(CLK_HZ), .DRIVE_CONNECTED(2'b01)) mo
 	.sd_rd(osd_rd),
 	.sd_wr(osd_wr),
 	.sd_ack(osd_ack),
-	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_addr(sd_buff_addr[10:0]),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(osd_buff_din),
-	.sd_buff_wr(sd_buff_wr)
+	.sd_buff_wr(sd_buff_wr),
+	.sd_blk_cnt(osd_blk_cnt)
 );
 
 // KMS and sound out DMA (a RAM bus master)
@@ -896,22 +1066,45 @@ next_kms_snd #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) kms_snd
 	.sndin_request(sndin_request), .sndin_overrun(sndin_overrun),
 	.int_keymouse(int_keymouse),
 	.int_power(int_power),
-	.audio_l(audio_l),
-	.audio_r(audio_r)
+	.audio_l(kms_l),
+	.audio_r(kms_r)
 );
 
-next_snd_in #(.CLK_REAL_HZ(CLK_REAL_HZ)) snd_in
-(
-	.clk(clk), .reset(dev_reset),
-	.active(sndin_active), .clear_status(sndin_clear),
-	.audio_in(audio_in),
-	.request_status(sndin_request), .overrun(sndin_overrun),
-	.sel_csr(io_si_csr), .sel_sptr(io_si_sptr), .sel_ptr(io_si_ptr), .sel_ini(io_si_ini),
-	.addr(io_off[3:0]), .we(is_write), .be(lanes), .wdata(cpu_dout), .rdata(sndin_rdata),
-	.int_dma(int_snd_in_dma),
-	.m_req(si_m_req), .m_we(si_m_we), .m_addr(si_m_addr), .m_be(si_m_be), .m_din(si_m_din),
-	.m_ack(si_m_ack), .m_err(si_m_err)
-);
+// the CD-ROM's audio is summed into the sound output with saturation
+wire signed [15:0] kms_l, kms_r, cd_l, cd_r;
+wire signed [16:0] mix_l = {kms_l[15], kms_l} + {cd_l[15], cd_l};
+wire signed [16:0] mix_r = {kms_r[15], kms_r} + {cd_r[15], cd_r};
+assign audio_l = (mix_l[16] != mix_l[15]) ? (mix_l[16] ? 16'h8000 : 16'h7FFF) : mix_l[15:0];
+assign audio_r = (mix_r[16] != mix_r[15]) ? (mix_r[16] ? 16'h8000 : 16'h7FFF) : mix_r[15:0];
+
+generate if (SND_IN_EN != 0) begin : g_snd_in
+	next_snd_in #(.CLK_REAL_HZ(CLK_REAL_HZ)) snd_in
+	(
+		.clk(clk), .reset(dev_reset),
+		.active(sndin_active), .clear_status(sndin_clear),
+		.audio_in(audio_in),
+		.request_status(sndin_request), .overrun(sndin_overrun),
+		.sel_csr(io_si_csr), .sel_sptr(io_si_sptr), .sel_ptr(io_si_ptr), .sel_ini(io_si_ini),
+		.addr(io_off[3:0]), .we(is_write), .be(lanes), .wdata(cpu_dout), .rdata(sndin_rdata),
+		.int_dma(int_snd_in_dma),
+		.m_req(si_m_req), .m_we(si_m_we), .m_addr(si_m_addr), .m_be(si_m_be), .m_din(si_m_din),
+		.m_ack(si_m_ack), .m_err(si_m_err)
+	);
+end
+else begin : g_no_snd_in
+	// no sound input: its registers read as zero, no DMA, no interrupt
+	assign sndin_rdata    = 16'd0;
+	assign sndin_request  = 1'b0;
+	assign sndin_overrun  = 1'b0;
+	assign int_snd_in_dma = 1'b0;
+	assign si_m_req  = 1'b0;
+	assign si_m_we   = 1'b0;
+	assign si_m_addr = 30'd0;
+	assign si_m_be   = 4'd0;
+	assign si_m_din  = 32'd0;
+	wire unused_snd_in = sndin_active | sndin_clear | (|audio_in) | si_m_ack | si_m_err;
+end
+endgenerate
 
 // Laser printer interface and its memory-to-device DMA channel
 next_printer #(.CLK_HZ(CLK_HZ)) printer
@@ -1022,16 +1215,55 @@ next_scsi #(.CLK_HZ(CLK_HZ), .CD_UNITS(6'b001000)) scsi   // target 3 is the CD-
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_unit(sd_unit),
-	.sd_lba(sd_lba),
-	.sd_rd(sd_rd),
+	.sd_unit(scsi_sd_unit),
+	.sd_lba(scsi_sd_lba),
+	.sd_rd(scsi_sd_rd),
 	.sd_wr(sd_wr),
-	.sd_ack(sd_ack),
-	.sd_buff_addr(sd_buff_addr),
+	.sd_ack_in(sd_ack),
+	.sd_buff_addr(sd_buff_addr[8:0]),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
-	.sd_buff_wr(sd_buff_wr)
+	.sd_buff_wr(sd_buff_wr),
+	.sd_busy(scsi_sd_busy),
+	.sd_hold(ca_req | ca_act),
+	.cd_fwd_stb(cd_fwd_stb)
 );
+
+// The CD-ROM's audio front end shares the CD-ROM slot with the target:
+// while it owns the channel the slot sees its frame request.
+wire  [2:0] scsi_sd_unit;
+wire [31:0] scsi_sd_lba, ca_lba;
+wire        scsi_sd_rd, scsi_sd_busy, ca_req, ca_act, ca_rd, cd_fwd_stb;
+wire  [5:0] ca_blk_cnt;
+assign sd_unit    = ca_act ? 3'd3 : scsi_sd_unit;
+assign sd_lba     = ca_act ? ca_lba : scsi_sd_lba;
+assign sd_rd      = scsi_sd_rd | ca_rd;
+assign sd_blk_cnt = ca_act ? ca_blk_cnt : 6'd0;
+
+next_cd_audio #(.CLK_HZ(CLK_REAL_HZ)) cd_audio
+(
+	.clk(clk),
+	.rst(dev_reset),
+	.mounted(cd_mounted),
+	.fwd_stb(cd_fwd_stb),
+	.stop_stb(1'b0),
+	.scsi_busy(scsi_sd_busy),
+	.ch_req(ca_req),
+	.ch_act(ca_act),
+	.io_rd(ca_rd),
+	.io_lba(ca_lba),
+	.io_blk_cnt(ca_blk_cnt),
+	.io_ack(sd_ack),
+	.sd_buff_addr(sd_buff_addr),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_wr(sd_buff_wr),
+	.snd_l(cd_l),
+	.snd_r(cd_r)
+);
+
+// the CD-ROM slot's mount state, from its mount pulses
+reg cd_mounted = 0;
+always @(posedge clk) if (img_mounted[3]) cd_mounted <= (img_size != 0);
 
 // SCC serial controller
 next_scc scc_dev

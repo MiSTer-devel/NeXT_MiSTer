@@ -53,20 +53,24 @@ assign BUTTONS = 0;
 
 //////////////////////////////////////////////////////////////////
 
-// 1120 x 832 is close to 4:3
+// The MegaPixel display is 1120 x 832, which is 35:26 exactly (not 4:3:
+// declaring 4:3 makes the scaler squeeze 1120 columns into 1109 at 1x
+// integer scaling and blurs the one-pixel font strokes).
 wire [1:0] ar = status[122:121];
 
-assign VIDEO_ARX = (!ar) ? 12'd4 : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
+assign VIDEO_ARX = (!ar) ? 12'd35 : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? 12'd26 : 12'd0;
 
 `include "build_id.v"
 localparam CONF_STR = {
 	"NeXT;;",
+	// SC slots: main remembers the mounted image in config/NeXT.s<n> and
+	// re-mounts it at core start, so the ROM auto-boots from the disk.
+	// The removable media (CD-ROM, floppy, MO) stay plain S slots.
 	"F1,BINROM,Boot ROM;",
-	"S0,VHDIMG,SCSI Disk 0;",
-	"S1,VHDIMG,SCSI Disk 1;",
-	"S2,VHDIMG,SCSI Disk 2;",
-	"S3,ISO,CD-ROM;",
+	"SC0,VHDIMG,SCSI Disk 0;",
+	"SC1,VHDIMG,SCSI Disk 1;",
+	"S3,ISOCUEBINCHD,CD-ROM;",
 	"S4,IMGIMAFLPVFDFD ,Floppy;",
 	"S5,IMGMO OD ,Magneto-optical;",
 	"-;",
@@ -85,6 +89,7 @@ localparam CONF_STR = {
 wire forced_scandoubler;
 wire   [1:0] buttons;
 wire [127:0] status;
+wire  [32:0] TIMESTAMP;      // the HPS clock (Unix seconds), seeds the NeXT RTC
 wire  [10:0] ps2_key;
 wire  [24:0] ps2_mouse;
 wire        enet_connected = |status[54:52] && !status[58];
@@ -135,6 +140,7 @@ wire [63:0] img_size;
 wire [31:0] sd_lba;
 wire        sd_rd, sd_wr;
 wire [13:0] sd_buff_addr;
+wire  [5:0] sd_blk_cnt, osd_blk_cnt;
 wire  [7:0] sd_buff_dout, sd_buff_din;
 wire        sd_buff_wr;
 
@@ -150,6 +156,7 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 	.buttons(buttons),
 	.status(status),
 	.status_menumask(0),
+	.TIMESTAMP(TIMESTAMP),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -164,6 +171,7 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 	.sd_rd({osd_rd, fsd_rd, {4{sd_rd}} & scsi_onehot[3:0]}),
 	.sd_wr({osd_wr, fsd_wr, {4{sd_wr}} & scsi_onehot[3:0]}),
 	.sd_ack(sd_ack_v),
+	.sd_blk_cnt('{6'd0, 6'd0, 6'd0, sd_blk_cnt, 6'd0, osd_blk_cnt}),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din('{sd_buff_din, sd_buff_din, sd_buff_din, sd_buff_din,
@@ -194,13 +202,27 @@ wire rom_download = ioctl_download && (ioctl_index[5:0] <= 6'd1);
 reg  rom_loaded = 0;
 always @(posedge clk_sys) if (rom_download) rom_loaded <= 1;
 
-wire reset = RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
+// Registered so the net can ride a global network (NeXT.qsf GLOBAL_SIGNAL):
+// it fans out to some 5,500 registers and was the largest net on ordinary
+// routing in a design whose peak interconnect usage sits at 95%.
+reg  reset = 1;
+always @(posedge clk_sys) reset <= RESET | status[0] | buttons[1] | rom_download | ~rom_loaded;
 
+// The sound input (codec input DMA channel and the board's ADC) is a
+// build option: NEXT_SND_IN=1 in the qsf's VERILOG_MACRO list puts it in
+// (~620 ALMs); the default build leaves it out for the fitter's sake at
+// 92% ALMs.  The "Audio input" OSD option is then without effect.
 wire signed [15:0] adc_audio_in;
+`ifdef NEXT_SND_IN
+localparam SND_IN_EN = 1;
 next_audio_adc #(.CLK_REAL_HZ(28000000)) adc_input
 (
 	.clk(clk_sys), .reset(reset), .ADC_BUS(ADC_BUS), .audio_in(adc_audio_in)
 );
+`else
+localparam SND_IN_EN = 0;
+assign adc_audio_in = 16'sd0;
+`endif
 
 ///////////////////////   SYSTEM    //////////////////////////////
 
@@ -212,6 +234,9 @@ wire        ram_req, ram_we, ram_ack;
 wire  [3:0] ram_be;
 wire [23:0] ram_addr;
 wire [31:0] ram_din, ram_dout;
+wire        ram_line_valid;
+wire [21:0] ram_line_tag;
+wire [127:0] ram_line_data;
 
 wire        btx_req, btx_rd, btx_ack, btx_done;
 wire [10:0] btx_len, btx_addr;
@@ -229,18 +254,24 @@ localparam DEBUG_EXCEPTIONS = 0;
 wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
-// CLK_HZ sets the machine's microsecond tick at 50 clocks: with the
-// 32 MHz system clock this is a virtual microsecond (the machine runs
-// at 64 percent of real time, uniformly), which satisfies the boot
-// ROM's CPU-speed calibration invariant (see CPU_PACE_* in
-// next_system.sv).  Pacing is off: 32 MHz is already below the
-// calibrated speed.
+// CLK_HZ sets the machine's microsecond tick: with the 28 MHz system
+// clock this is a virtual microsecond (the machine runs at 112 percent
+// of real time, uniformly), chosen to satisfy the boot ROM's CPU-speed
+// calibration invariant (see DBCC_FLOOR in next_system.sv):
+//     (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR
+// The ROM's delay() loop is a bare dbf, which the Quadra 800 AP68040
+// tree runs in 2 clocks per iteration (measured, docs/CPU_NEXT_PORT.md);
+// the host keeps consecutive DBcc executions 4 enabled clocks apart, as
+// on a real 68040, so 6.25 iterations per microsecond need 25 clocks.
+// Nothing else is slowed (CPU_PACE 1/1).
 next_system #(
-	.CLK_HZ(50000000),
-	.CPU_PACE_NUM(2),
-	.CPU_PACE_DEN(2),
+	.CLK_HZ(25000000),
+	.DBCC_FLOOR(4),
+	.CPU_PACE_NUM(1),
+	.CPU_PACE_DEN(1),
 	.CLK_REAL_HZ(28000000),   // the real clk_sys, so the clock keeps time
-	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
+	.SND_IN_EN(SND_IN_EN)
 ) system
 (
 	.clk(clk_sys),
@@ -250,6 +281,7 @@ next_system #(
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
 	.boot_sel(status[57:55]),
+	.ts_host(TIMESTAMP),
 	.enet_connected(enet_connected),
 
 	.oimg_mounted(oimg_mounted),
@@ -279,11 +311,13 @@ next_system #(
 	.img_readonly(img_readonly),
 	.img_size(img_size),
 	.sd_unit(sd_unit),
+	.sd_blk_cnt(sd_blk_cnt),
+	.osd_blk_cnt(osd_blk_cnt),
 	.sd_lba(sd_lba),
 	.sd_rd(sd_rd),
 	.sd_wr(sd_wr),
 	.sd_ack(sd_ack),
-	.sd_buff_addr(sd_buff_addr[8:0]),
+	.sd_buff_addr(sd_buff_addr[12:0]),   // multi-block: the ECC exchange (3) and audio frames (5)
 	.sd_buff_dout(sd_buff_dout),
 	.sd_buff_din(sd_buff_din),
 	.sd_buff_wr(sd_buff_wr),
@@ -305,6 +339,9 @@ next_system #(
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid),
+	.ram_line_tag(ram_line_tag),
+	.ram_line_data(ram_line_data),
 
 	.led(led),
 	.audio_in(status[59] ? adc_audio_in : 16'sd0),
@@ -414,6 +451,9 @@ next_ddram ddram
 	.ram_din(ram_din),
 	.ram_dout(ram_dout),
 	.ram_ack(ram_ack),
+	.ram_line_valid(ram_line_valid),
+	.ram_line_tag(ram_line_tag),
+	.ram_line_data(ram_line_data),
 
 	.DDRAM_BUSY(ga_busy),
 	.DDRAM_BURSTCNT(ga_burst),

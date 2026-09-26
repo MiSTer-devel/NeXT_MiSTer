@@ -15,6 +15,15 @@
 
 module tb_next_mo;
 
+// The HPS side of the SCSI/MO windows: the real Main_MiSTer support/next
+// code (tb/host/next_host_dpi.cpp, sources synced by tb/host/sync_main.sh).
+import "DPI-C" function int  host_fill(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_byte(input int i);
+import "DPI-C" function void host_put(input int i, input int b);
+import "DPI-C" function void host_exec(input int slot, input int lba, input int sz);
+import "DPI-C" function int  host_mount_cd(input string path);
+import "DPI-C" function int  host_mount_disk(input int slot, input longint bytes);
+
 reg clk = 0;
 always #5 clk = ~clk;
 
@@ -52,7 +61,8 @@ next_mo #(.CLK_HZ(1000000)) dut
 	.img_mounted(oimg_mounted), .img_readonly(oimg_readonly), .img_size(oimg_size),
 	.sd_unit(osd_unit), .sd_lba(osd_lba), .sd_rd(osd_rd), .sd_wr(osd_wr),
 	.sd_ack(osd_ack), .sd_buff_addr(osd_buff_addr),
-	.sd_buff_dout(osd_buff_dout), .sd_buff_din(osd_buff_din_w), .sd_buff_wr(osd_buff_wr)
+	.sd_buff_dout(osd_buff_dout), .sd_buff_din(osd_buff_din_w), .sd_buff_wr(osd_buff_wr),
+	.sd_blk_cnt(osd_blk_cnt)
 );
 
 //----------------------------------------------------------------------------
@@ -68,7 +78,12 @@ reg [63:0] oimg_size = 0;
 wire       osd_unit, osd_rd, osd_wr;
 wire [31:0] osd_lba;
 reg        osd_ack = 0;
-reg  [8:0] osd_buff_addr = 0;
+reg [10:0] osd_buff_addr = 0;
+wire [5:0] osd_blk_cnt;
+// the ECC exchange: a 3-block window served by the HPS model
+reg        osd_win = 0;
+reg [10:0] osd_last = 11'd511;
+integer    hr;
 reg  [7:0] osd_buff_dout = 0;
 reg        osd_buff_wr = 0;
 wire [7:0] osd_buff_din_w;
@@ -86,6 +101,14 @@ integer ci;
 initial for (ci = 0; ci < CART_BYTES; ci = ci + 1) cart[ci] = dbyte(ci);
 
 integer osd_reads = 0, osd_writes = 0;
+// +ecctrace: every ECC / sector-engine / host-exchange state change
+reg [2:0] tr_ecc = 0, tr_dst = 0, tr_hst = 0;
+always @(posedge clk) if ($test$plusargs("ecctrace")) begin
+	if (dut.ecc_state != tr_ecc || dut.dst != tr_dst || dut.hst != tr_hst)
+		$display("[%0t] ecc_state=%0d dst=%0d hst=%0d eccin=%0d eccout=%0d size0=%0d size1=%0d fmt=%0d dsk_active=%0d",
+		         $time, dut.ecc_state, dut.dst, dut.hst, dut.eccin, dut.eccout, dut.ecc_size_b[0], dut.ecc_size_b[1], dut.fmt_mode, dut.dsk_active);
+	tr_ecc <= dut.ecc_state; tr_dst <= dut.dst; tr_hst <= dut.hst;
+end
 reg     osd_active = 0, osd_wact = 0, osd_rdph = 0;
 reg     sd_owner_watch = 0, sd_owner_expected = 0, sd_owner_mismatch = 0;
 
@@ -101,36 +124,48 @@ always @(posedge clk) begin
 		osd_ack <= 1;
 		osd_active <= 1;
 		osd_buff_addr <= 0;
-		osd_reads = osd_reads + 1;
+		osd_win <= (osd_lba >= 32'h7C00_0000);
+		osd_last <= ({5'd0, osd_blk_cnt} + 11'd1) * 11'd512 - 11'd1;
+		if (osd_lba >= 32'h7C00_0000) begin
+			hr = host_fill(5, osd_lba, ({26'd0, osd_blk_cnt} + 32'd1) * 32'd512);
+			if ($test$plusargs("wintrace")) $display("[%0t] OSD window read lba=%08x blk_cnt=%0d ecc_state=%0d dst=%0d", $time, osd_lba, osd_blk_cnt, dut.ecc_state, dut.dst);
+		end
+		else osd_reads = osd_reads + 1;
 	end
 	else if (osd_wr && !osd_ack && !osd_active && !osd_wact) begin
 		osd_ack <= 1;
 		osd_wact <= 1;
 		osd_buff_addr <= 0;
 		osd_rdph <= 0;
-		osd_writes = osd_writes + 1;
+		osd_win <= (osd_lba >= 32'h7C00_0000);
+		osd_last <= ({5'd0, osd_blk_cnt} + 11'd1) * 11'd512 - 11'd1;
+		if (osd_lba < 32'h7C00_0000) osd_writes = osd_writes + 1;
+		else if ($test$plusargs("wintrace")) $display("[%0t] OSD window write lba=%08x blk_cnt=%0d ecc_state=%0d dst=%0d rs_bank=%0d", $time, osd_lba, osd_blk_cnt, dut.ecc_state, dut.dst, dut.rs_bank);
 	end
 	else if (osd_ack && osd_active) begin
 		if (!osd_buff_wr) begin
-			osd_buff_dout <= cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr}];
+			osd_buff_dout <= osd_win ? host_byte(osd_buff_addr)
+			               : cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr[8:0]}];
 			osd_buff_wr <= 1;
-			if (osd_buff_addr == 9'd511) begin
+			if (osd_buff_addr == osd_last) begin
 				osd_ack <= 0;
 				osd_active <= 0;
 			end
 		end
 		else begin
-			if (osd_buff_addr != 9'd511) osd_buff_addr <= osd_buff_addr + 1'd1;
+			if (osd_buff_addr != osd_last) osd_buff_addr <= osd_buff_addr + 1'd1;
 		end
 	end
 	else if (osd_ack && osd_wact) begin
 		// one byte every other cycle: the buffer read is registered
 		if (osd_rdph) begin
-			cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr}] <= osd_buff_din_w;
+			if (osd_win) host_put(osd_buff_addr, osd_buff_din_w);
+			else cart[{osd_lba, 9'd0} + {23'd0, osd_buff_addr[8:0]}] <= osd_buff_din_w;
 			osd_rdph <= 0;
-			if (osd_buff_addr == 9'd511) begin
+			if (osd_buff_addr == osd_last) begin
 				osd_ack <= 0;
 				osd_wact <= 0;
+				if (osd_win) host_exec(5, osd_lba, {21'd0, osd_last} + 32'd1);
 			end
 			else osd_buff_addr <= osd_buff_addr + 1'd1;
 		end
@@ -632,7 +667,7 @@ initial begin
 	osp_wr8(5'h07, 8'h00);
 	repeat (4) @(posedge clk);
 	osp_rd8(5'h04, v);
-	check(dut.ecc_state == 3'd0 && dut.rs.st == 6'd0 &&
+	check(dut.ecc_state == 3'd0 && dut.hst == 3'd0 &&
 	      !dut.rs_start_enc && !dut.rs_start_dec && v[3],
 	      "FMT_RESET aborts RS engine and preserves pending interrupt status");
 	osp_wr8(5'h04, 8'hFC);
@@ -1258,10 +1293,17 @@ initial begin
 		waited = waited + 1;
 	end
 	ok = v[2] && dut.ecc_state == 3'd0 && dut.d_next == SRC + 2048;
+	$display("  WAITING: v=%02x ecc_state=%0d d_next=%08x (SRC+2048=%08x) eccout=%0d", v, dut.ecc_state, dut.d_next, SRC + 2048, dut.eccout);
 	for (i = 0; i < MO_SECT; i = i + 1) begin
-		if (cart[7*MO_SECT + i] !== first_codeword[i]) ok = 0;
+		if (cart[7*MO_SECT + i] !== first_codeword[i]) begin
+			if (ok) $display("  WAITING: sector 7 byte %0d cart %02x first_codeword %02x", i, cart[7*MO_SECT + i], first_codeword[i]);
+			ok = 0;
+		end
 		if (cart[8*MO_SECT + i] !==
-		    (dut.eccout ? dut.eccbuf1[i] : dut.eccbuf0[i])) ok = 0;
+		    (dut.eccout ? dut.eccbuf1[i] : dut.eccbuf0[i])) begin
+			if (ok) $display("  WAITING: sector 8 byte %0d cart %02x bank %02x", i, cart[8*MO_SECT + i], dut.eccout ? dut.eccbuf1[i] : dut.eccbuf0[i]);
+			ok = 0;
+		end
 	end
 	check(ok,
 	      "encoded-write WAITING preserves each buffer until its matching disk commit");
@@ -1352,8 +1394,12 @@ initial begin
 		waited = waited + 1;
 	end
 	ok = v[2] && v[3] && !v[4] && dut.d_next == DST + 2048 && overlap_seen;
+	$display("  BLOCKS read: v=%02x d_next=%08x (DST+2048=%08x) overlap_seen=%0d waited=%0d", v, dut.d_next, DST + 2048, overlap_seen, waited);
 	for (i = 0; i < 2048; i = i + 1)
-		if (ram_byte(DST + i) !== (8'hC3 ^ i[7:0] ^ {1'b0, i[9:8], 5'd0})) ok = 0;
+		if (ram_byte(DST + i) !== (8'hC3 ^ i[7:0] ^ {1'b0, i[9:8], 5'd0})) begin
+			if (ok) $display("  BLOCKS read: byte %0d ram %02x expected %02x", i, ram_byte(DST + i), 8'hC3 ^ i[7:0] ^ {1'b0, i[9:8], 5'd0});
+			ok = 0;
+		end
 	check(ok, "ECC_BLOCKS two-sector read overlaps next fill with prior drain");
 
 	//------------------------------------------------------------

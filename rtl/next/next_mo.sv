@@ -7,7 +7,11 @@
 //
 //  Modeled on Previous src/mo.c and the disk channel parts of src/dma.c.
 //  Includes the two-drive command/status model, formatter timing, encoded
-//  1296-byte cartridge images, disk DMA, and the shared Reed-Solomon codec.
+//  1296-byte cartridge images and disk DMA.  The Reed-Solomon codec runs
+//  on the HPS (Main_MiSTer support/next/next_mo.cpp, a port of Previous
+//  src/rs.c): an ECC bank is handed over as a 3-block write to the MO
+//  slot's window LBA 0x7E000x00 (x = 1 encode, 2 decode) and read back
+//  the same way, bytes 1296/1297 carrying the fail flag and the count.
 //  Standalone ECC diagnostics retain the OSP's historical read/write naming;
 //  real cartridge reads decode and writes encode 1024-byte data sectors.
 //  Two alternating 1296-byte ECC banks preserve the reference's eccin/eccout
@@ -60,10 +64,11 @@ module next_mo #(
 	output reg    sd_rd,
 	output reg    sd_wr,
 	input         sd_ack,
-	input   [8:0] sd_buff_addr,
+	input  [10:0] sd_buff_addr,  // 3-block window transfers for the ECC exchange
 	input   [7:0] sd_buff_dout,
 	output  [7:0] sd_buff_din,
-	input         sd_buff_wr
+	input         sd_buff_wr,
+	output  [5:0] sd_blk_cnt     // hps_io blocks-1: 2 during the ECC exchange
 );
 
 localparam MOINT_ECC_DONE   = 8'h08;
@@ -201,20 +206,22 @@ wire        dsk_read_window = ((dst == D_RGO) || (dst == D_RACK)) &&
 reg   [7:0] stage [0:511];
 reg   [7:0] stage_q;
 reg         win_q;
-wire [11:0] wgidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_buff_addr};
+wire  [8:0] sd_addr9 = sd_buff_addr[8:0];
+wire [11:0] wgidx = {1'd0, dsk_blk, 8'd0, 1'd0} + {3'd0, sd_addr9};
 wire        wgin  = (wgidx >= {3'd0, dsk_skip}) &&
                     ((wgidx - {3'd0, dsk_skip}) < SECT_DISK);
 always @(posedge clk) begin
 	if (dsk_active && dsk_read_window && sd_buff_wr)
-		stage[sd_buff_addr] <= sd_buff_dout;
-	stage_q <= stage[sd_buff_addr];
+		stage[sd_addr9] <= sd_buff_dout;
+	stage_q <= stage[sd_addr9];
 	win_q   <= wgin;
 end
 reg         sec_tick = 0;
-assign sd_lba = dsk_lba_r;
 // what the card takes back: the sector's own bytes inside the window,
-// the block's original bytes outside it
-assign sd_buff_din = win_q ? (dsk_erase ? 8'hFF : ecc_q) : stage_q;
+// the block's original bytes outside it; during the ECC exchange the
+// bank itself
+assign sd_buff_din = hst_act ? ecc_q :
+                     win_q ? (dsk_erase ? 8'hFF : ecc_q) : stage_q;
 
 reg  [3:0] sec_offset [0:1];     // sector under the head
 reg [20:0] sec_timer = 0;
@@ -373,30 +380,35 @@ wire fmt_pipeline_busy = (fmt_mode != FM_IDLE) &&
 localparam M_IDLE = 3'd0, M_REQ = 3'd1, M_WAIT = 3'd2, M_PRE = 3'd3;
 reg  [2:0] mst;
 
-// Reed-Solomon codec sharing the ECC buffers
+// Reed-Solomon codec, served by the HPS through the MO slot's window: the
+// transform bank goes out as one 3-block write of the ECC window LBA and
+// comes back as one 3-block read of the same LBA, transformed in place,
+// byte 1296 = uncorrectable, byte 1297 = corrected-byte count.  Only the
+// bank's port is shared; the sector engine (dst) is idle while this runs.
 wire  [7:0] ecc_q;
-wire        rs_done, rs_fail;
-wire  [7:0] rs_count;
-wire [10:0] rs_addr;
-wire  [7:0] rs_wdata;
-wire        rs_we;
 reg         rs_start_enc, rs_start_dec;
 wire        rs_active = (ecc_state == ECC_RS);
-
-next_rs rs
-(
-	.clk(clk),
-	.reset(reset | fmt_reset_bus),
-	.start_encode(rs_start_enc),
-	.start_decode(rs_start_dec),
-	.done(rs_done),
-	.fail(rs_fail),
-	.err_count(rs_count),
-	.b_addr(rs_addr),
-	.b_rdata(ecc_q),
-	.b_wdata(rs_wdata),
-	.b_we(rs_we)
-);
+localparam [31:0] ECC_BLK = 32'h7E00_0000;
+localparam [2:0] H_IDLE = 3'd0, H_WGO = 3'd1, H_WACK = 3'd2,
+                 H_RGO = 3'd3, H_RACK = 3'd4, H_END = 3'd5, H_GAP = 3'd6;
+reg   [2:0] hst = H_IDLE;
+// The exchange owns the card port only while it runs: in BLOCKS mode the
+// codec is asked for while the sector engine is still putting the other
+// bank back, and that transaction keeps its own LBA and data.
+wire        hst_act = (hst != H_IDLE);
+reg         hst_owned = 0;       // the write strobe trails sd_ack by a clock
+reg         hst_done = 0;        // one clock: the bank holds the result
+reg         hst_fail = 0;
+reg   [7:0] hst_count = 0;
+wire        hst_rd_win = ((hst == H_RGO) || (hst == H_RACK)) && (sd_ack || hst_owned);
+wire [10:0] rs_addr  = sd_buff_addr;
+wire  [7:0] rs_wdata = sd_buff_dout;
+wire        rs_we    = hst_rd_win && sd_buff_wr && (sd_buff_addr < 11'd1296);
+wire        rs_done  = hst_done;
+wire        rs_fail  = hst_fail;
+wire  [7:0] rs_count = hst_count;
+assign sd_lba     = hst_act ? (ECC_BLK | (rs_decoding ? 32'h200 : 32'h100)) : dsk_lba_r;
+assign sd_blk_cnt = hst_act ? 6'd2 : 6'd0;
 
 // Each physical bank has one registered read/write port.  This permits the
 // BLOCKS producer (disk -> eccin) and consumer (eccout -> DMA) to run in the
@@ -434,7 +446,7 @@ always @(posedge clk) begin
 end
 
 assign ecc_q = (dsk_active && dsk_is_wr) ? (dsk_bank ? ecc_q1 : ecc_q0) :
-               rs_active ? (rs_bank ? ecc_q1 : ecc_q0) :
+               hst_act ? (rs_bank ? ecc_q1 : ecc_q0) :
                (mo_bank ? ecc_q1 : ecc_q0);
 
 // engine step delay, roughly the ECC_DELAY pacing in mo.c
@@ -634,6 +646,7 @@ always @(posedge clk) begin
 		dsk_lba_r <= 0; dsk_blk <= 0; dsk_nblk <= 0; dsk_skip <= 0;
 		rs_start_enc <= 0;
 		rs_start_dec <= 0;
+		hst <= H_IDLE; hst_owned <= 0; hst_done <= 0;
 		tickcnt <= 0;
 		uscnt <= 0;
 	end
@@ -1243,6 +1256,48 @@ always @(posedge clk) begin
 
 
 		//------------------------------------------------------------
+		// the ECC exchange with the HPS (see rs_* above)
+		//------------------------------------------------------------
+		hst_done <= 0;
+		if (hst_rd_win && sd_buff_wr) begin
+			if (sd_buff_addr == 11'd1296) hst_fail  <= sd_buff_dout[0];
+			if (sd_buff_addr == 11'd1297) hst_count <= sd_buff_dout;
+		end
+		if (!fmt_reset_bus) begin
+		case (hst)
+		H_IDLE: if (rs_active && dst == D_IDLE && !dsk_abort_wait) begin
+			sd_wr <= 1;
+			hst <= H_WGO;
+		end
+		H_WGO: if (sd_ack) begin
+			sd_wr <= 0;
+			hst <= H_WACK;
+		end
+		H_WACK: if (!sd_ack) begin
+			sd_rd <= 1;
+			hst <= H_RGO;
+		end
+		H_RGO: if (sd_ack) begin
+			sd_rd <= 0;
+			hst_owned <= 1;
+			hst <= H_RACK;
+		end
+		H_RACK: if (!sd_ack) begin
+			hst_owned <= 0;
+			hst <= H_END;
+		end
+		H_END: begin
+			hst_done <= 1;
+			hst <= H_GAP;
+		end
+		// the engine leaves ECC_RS the clock after rs_done; do not read the
+		// still-standing state as the next request
+		H_GAP: if (!rs_active) hst <= H_IDLE;
+		default: hst <= H_IDLE;
+		endcase
+		end
+
+		//------------------------------------------------------------
 		// ECC engine
 		//------------------------------------------------------------
 		if (!fmt_reset_bus) begin
@@ -1546,6 +1601,8 @@ always @(posedge clk) begin
 			mo_we <= 0;
 			rs_start_enc <= 0;
 			rs_start_dec <= 0;
+			hst <= H_IDLE;
+			hst_owned <= 0;
 			dst <= D_IDLE;
 			dsk_active <= 0;
 			dsk_is_wr <= 0;
