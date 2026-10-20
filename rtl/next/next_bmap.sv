@@ -25,7 +25,11 @@ module next_bmap
 
 	// bmap_tpe_select in bmap.c: set when both TPE bits (31 and 28) of
 	// register 0xD are written set, cleared when both are written clear
-	output reg    tpe_select
+	output reg    tpe_select,
+	// register 3 (BMAP_BURWREN) bits 29 and 28: the DSP HREQ and TXD
+	// interrupt enables (bmap.c bmap_put)
+	output        dsp_hreq_en,
+	output        dsp_txd_en
 );
 
 reg [31:0] regs [0:15];
@@ -38,6 +42,8 @@ wire [31:0] rval_d = (rval_raw & ~32'h30000000) |
 wire [31:0] rval = (ridx == 4'hD) ? rval_d : rval_raw;
 
 assign rdata = addr[1] ? rval[15:0] : rval[31:16];
+assign dsp_hreq_en = regs[3][29];
+assign dsp_txd_en  = regs[3][28];
 
 integer i;
 

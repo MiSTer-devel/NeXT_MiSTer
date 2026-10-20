@@ -81,7 +81,15 @@ module next_scr #(
 
 	// soft interrupt levels (INT_SOFT1/INT_SOFT2), level signals
 	output        softint1,
-	output        softint2
+	output        softint2,
+	// the DSP's bits (sysReg.c SCR2_Write0/Write3, non-Turbo)
+	output        dsp_run,       // SCR2 byte 0 bit 7: reset released, the DSP started
+	output  [1:0] dsp_mode,      // byte 0 bits 4:3 inverted: the start mode (OMR MB:MA)
+	output        dsp_blk_end,   // byte 0 bit 6: IRQB at the DMA block end
+	output        dsp_unpacked,  // byte 0 bit 5: 32-bit DMA words
+	output        dsp_int_l4,    // byte 3 bit 6: HREQ at level 4 instead of 3
+	output        dsp_mem_en     // external DSP memory: byte 3 bit 5, inverted on
+	                             // non-Turbo, and enabled while the DSP runs
 );
 
 reg [7:0] scr2_0, scr2_1, scr2_2, scr2_3;
@@ -91,6 +99,12 @@ assign led        = scr2_3[0];
 assign rom_overlay= scr2_3[7];
 assign softint1   = scr2_0[0];
 assign softint2   = scr2_0[1];
+assign dsp_run      = scr2_0[7];
+assign dsp_mode     = ~scr2_0[4:3];
+assign dsp_blk_end  = scr2_0[6];
+assign dsp_unpacked = scr2_0[5];
+assign dsp_int_l4   = scr2_3[6];
+assign dsp_mem_en   = scr2_0[7] & ~scr2_3[5];
 
 //----------------------------------------------------------------------------
 // MC68HC68T1 RTC and NVRAM

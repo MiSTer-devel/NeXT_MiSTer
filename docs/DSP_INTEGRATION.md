@@ -1,7 +1,44 @@
 # Integrating the Falcon DSP56001 (`Falcon_MiSTer/rtl/falcon/dsp`) into NeXT
 
-Investigation, 2026-10-19.  Nothing here is implemented; `PORTING.md` still
-lists the DSP as "reads return 0".  Sources read: the Falcon block
+## Status (2026-10-19, evening)
+
+Implemented on `pipelined_040`:
+
+- `rtl/dsp56k/`: the Falcon block vendored as-is plus four small,
+  parameterised changes (`rtl/dsp56k/UPSTREAM.md`): the NeXT memory map
+  and 8K-word external RAM (`MEMMAP`, `EXT_AW`), the external memory
+  enable, an IRQB input, the three start modes, and in the peripheral
+  block the host DMA mode bits (`HOST_DMA`, `dma_mode`, `dma_treq`) and the
+  mode-gated bootstrap.  Falcon_MiSTer's differential harness passes
+  against this copy in its Falcon configuration (12 tests, 600 random
+  seeds, 926,545 instructions cycle-exact): `tb/run_dsp_harness.sh`.
+- `rtl/next/next_dsp.sv`: the host port at 0x02008000 on the 16-bit
+  sub-cycle bus, the DMA channel 0x020000d0 / 0x020040d0 / 0x020042d0
+  (packed 24/16/8-bit and unpacked 32-bit words, both directions, chaining,
+  IRQB at the block end), the interrupt routing (INT_DSP_L3, INT_DSP_L4
+  through the BMAP enable, INT_DSP_DMA).  A seventh master of the RAM
+  arbiter (`G_DSP`); SCR2 byte 0 bits 7:3 and byte 3 bits 6:5 and BMAP
+  register 3 bits 29:28 are decoded in `next_scr.sv` / `next_bmap.sv`.
+  The SSI is idle (the DSP port is not wired).  The block runs on the
+  27.5 MHz system clock.
+- `tb/tb_next_dsp.sv` (`tb_dsp` in the suite): reset values, the mode-1
+  bootstrap and PIO exchange, HREQ at levels 3 and 4, DMA both ways,
+  packed and unpacked, IRQB, start modes 2 and 0, the memory enable.
+
+The fit (2026-10-20, seed 13): 41,301 / 41,910 ALMs (99 %), 550 / 553
+M10K, 34,790 registers; the CPU clock closes (setup +0.283 ns, hold
++0.171 ns) and only the HDMI PLL's setup misses (-0.418 ns, the path the
+user accepts), so the RBF is staged by hand as
+`releases/NeXT-ap68040-55mhz-dsp_20261020.rbf` outside the release gate.
+The DSP block synthesises to 8,545 ALUTs and 2,304 registers here (the
+Falcon's 5,702 ALMs packed).
+
+Not done: the SCI TXD interrupt (`bmap_txd_en` is accepted and unused),
+the SSI/DSP port, the Turbo SCR2 variants, a kernel-level test (the
+OPENSTEP SoundDSP driver on the boot bench), and any slack for later
+features: at 99 % every build is a seed hunt (see "Resources" below).
+
+Investigation of 2026-10-19 (the plan the above follows).  Sources read: the Falcon block
 (`falcon_dsp.sv`, `dsp56k_core.sv`, `dsp_periph.sv`, `dsp_ram.sv`, its
 `tb/dsp` harness and `tb/dsp/syn` fit), Previous (`src/dsp/dsp.c`,
 `dsp_core.c`, `dsp_cpu.c`, `sysReg.c`, `dma.c`, `bmap.c`, `snd.c`,

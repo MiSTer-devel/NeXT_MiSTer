@@ -20,6 +20,15 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_kms_snd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_snd_in.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_audio_adc.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_printer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_dsp.sv
+# the DSP56001 block vendored from Falcon_MiSTer (rtl/dsp56k/UPSTREAM.md)
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dsp56k/dsp56k_core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dsp56k/dsp56k_alu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dsp56k/dsp56k_dec.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dsp56k/dsp56k_rom.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dsp56k/dsp_periph.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dsp56k/dsp_ram.sv
+set_global_assignment -name SEARCH_PATH rtl/dsp56k
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_ddram_arb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_enet_bridge.sv

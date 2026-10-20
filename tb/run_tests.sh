@@ -42,14 +42,17 @@ CPUSRC="$CPU/ap68040_pkg.sv $CPU/gen/ap68040_upkg.sv $CPU/ap68040_alu.sv $CPU/ap
         $CPU/ap68040_dmu.sv $CPU/ap68040_predec.sv $CPU/ap68040_fetch.sv $CPU/ap68040_decode.sv \
         $CPU/ap68040_useq.sv $CPU/fpu/ap040_fpu.v $CPU/ap68040_fpif.sv $CPU/ap68040_backend.sv \
         $CPU/ap68040_snoop.sv $CPU/ap68040.sv"
-CPUINC="-I$CPU -I$CPU/fpu"
+# the DSP56001 block vendored from Falcon_MiSTer (rtl/dsp56k/UPSTREAM.md)
+DSP=../rtl/dsp56k
+DSPSRC="$DSP/dsp56k_core.sv $DSP/dsp56k_alu.sv $DSP/dsp56k_dec.sv $DSP/dsp56k_rom.sv $DSP/dsp_periph.sv $DSP/dsp_ram.sv"
+CPUINC="-I$CPU -I$CPU/fpu -I$DSP"
 
 NEXTSRC="$RTL/next_system.sv $RTL/next_cpu040.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_cd_audio.sv $RTL/next_enet_dma.sv \
          $RTL/next_mo.sv $RTL/next_kms_snd.sv $RTL/next_snd_in.sv $RTL/next_audio_adc.sv \
-         $RTL/next_floppy.sv $RTL/next_printer.sv \
+         $RTL/next_floppy.sv $RTL/next_printer.sv $RTL/next_dsp.sv $DSPSRC \
          $RTL/next_ddram.sv $RTL/next_ddram_arb.sv \
          $RTL/next_enet_bridge.sv $RTL/next_exception_mailbox.sv $RTL/next_exception_trigger.sv $RTL/dpram.v"
 
@@ -99,6 +102,7 @@ vbuild tb_next_audio_adc tb_next_audio_adc.sv $RTL/next_audio_adc.sv ../sys/ltc2
 vbuild tb_next_sound_output tb_next_sound_output.sv $RTL/next_kms_snd.sv
 vbuild tb_next_adc_timing tb_next_adc_timing.sv ../sys/ltc2308.sv
 vbuild tb_next_printer   tb_next_printer.sv $RTL/next_printer.sv
+vbuild tb_next_dsp       $CPUINC tb_next_dsp.sv $RTL/next_dsp.sv $DSPSRC
 vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
@@ -127,7 +131,7 @@ if ! grep -q "\.sd_buff_addr(sd_buff_addr\[12:0\])" ../NeXT.sv; then
 	fail=1
 fi
 verilator --lint-only -Wno-fatal $DIAG_FLAGS \
-	-I.. -I../sys -I"$WORK" --top-module emu ../NeXT.sv $NEXTSRC \
+	-I.. -I../sys -I"$WORK" -I$DSP --top-module emu ../NeXT.sv $NEXTSRC \
 	> "$WORK/vl_emu_lint.log" 2>&1 || true
 if grep -E "^%Error" "$WORK/vl_emu_lint.log" \
      | grep -vE "MODMISSING|Exiting due to" | grep -q .; then
@@ -165,6 +169,7 @@ run tb_audio_adc "$WORK/vl_tb_next_audio_adc/tb_next_audio_adc"
 run tb_sound_output "$WORK/vl_tb_next_sound_output/tb_next_sound_output"
 run tb_adc_timing "$WORK/vl_tb_next_adc_timing/tb_next_adc_timing"
 run tb_printer   "$WORK/vl_tb_next_printer/tb_next_printer"
+run tb_dsp       "$WORK/vl_tb_next_dsp/tb_next_dsp"
 run tb_kbd       "$WORK/vl_tb_next_kbd/tb_next_kbd"
 run tb_hardclock "$WORK/vl_tb_next_hardclock/tb_next_hardclock"
 run tb_video     "$WORK/vl_tb_next_video/tb_next_video"

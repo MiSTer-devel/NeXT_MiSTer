@@ -250,6 +250,11 @@ wire        pr_m_req, pr_m_we;
 wire [29:0] pr_m_addr;
 wire  [3:0] pr_m_be;
 wire [31:0] pr_m_din;
+wire        ds_m_req, ds_m_we, ds_m_ack, ds_m_err;   // the DSP's DMA channel
+wire [29:0] ds_m_addr;
+wire  [3:0] ds_m_be;
+wire [31:0] ds_m_din;
+wire [15:0] dsp_rdata;
 wire        pr_m_ack, pr_m_err;
 wire        int_printer, int_printer_dma;
 wire [15:0] pr_rdata;
@@ -366,7 +371,7 @@ wire d_any  = d_rom | d_io | d_bmap | d_ram | d_vram;
 // bus cycle state machine
 //----------------------------------------------------------------------------
 
-localparam G_ENET = 3'd0, G_MO = 3'd1, G_SND = 3'd2, G_SCSI = 3'd3, G_PRINT = 3'd4, G_SNDIN = 3'd5;
+localparam G_ENET = 3'd0, G_MO = 3'd1, G_SND = 3'd2, G_SCSI = 3'd3, G_PRINT = 3'd4, G_SNDIN = 3'd5, G_DSP = 3'd6;
 reg  [2:0] dma_grant;
 reg        sel_rom, sel_vram, sel_io, sel_bmap;
 
@@ -389,6 +394,7 @@ assign sn_m_ack = (state == S_RAM_E) && (dma_grant == G_SND) && ram_ack;
 assign sc_m_ack = (state == S_RAM_E) && (dma_grant == G_SCSI) && ram_ack;
 assign pr_m_ack = (state == S_RAM_E) && (dma_grant == G_PRINT) && ram_ack;
 assign si_m_ack = (state == S_RAM_E) && (dma_grant == G_SNDIN) && ram_ack;
+assign ds_m_ack = (state == S_RAM_E) && (dma_grant == G_DSP) && ram_ack;
 
 // DMA can reach physical main RAM only.  Keep the six high address
 // bits emitted by the controller until here; otherwise any invalid pointer
@@ -398,12 +404,14 @@ wire mo_m_is_ram = mo_m_addr[29:24] == 6'b000001;
 wire sn_m_is_ram = sn_m_addr[29:24] == 6'b000001;
 wire sc_m_is_ram = sc_m_addr[29:24] == 6'b000001;
 wire pr_m_is_ram = pr_m_addr[29:24] == 6'b000001;
+wire ds_m_is_ram = ds_m_addr[29:24] == 6'b000001;
 wire si_m_is_ram = si_m_addr[29:24] == 6'b000001;
 assign en_m_err = en_m_req && !en_m_is_ram;
 assign mo_m_err = mo_m_req && !mo_m_is_ram;
 assign sn_m_err = sn_m_req && !sn_m_is_ram;
 assign sc_m_err = sc_m_req && !sc_m_is_ram;
 assign pr_m_err = pr_m_req && !pr_m_is_ram;
+assign ds_m_err = ds_m_req && !ds_m_is_ram;
 assign si_m_err = si_m_req && !si_m_is_ram;
 
 always @(posedge clk) begin
@@ -487,6 +495,17 @@ always @(posedge clk) begin
 					ram_addr <= si_m_addr[23:0];
 					ram_din <= si_m_din;
 					dma_grant <= G_SNDIN;
+					state <= S_RAM_E;
+				end
+			end
+			else if (ds_m_req && !cpu_req && !berr_hold && snoop_idle && !bus_locked) begin
+				if (ds_m_is_ram) begin
+					ram_req <= 1;
+					ram_we <= ds_m_we;
+					ram_be <= ds_m_be;
+					ram_addr <= ds_m_addr[23:0];
+					ram_din <= ds_m_din;
+					dma_grant <= G_DSP;
 					state <= S_RAM_E;
 				end
 			end
@@ -658,7 +677,12 @@ wire io_pr_csr = sel_io && (io_off[16:2] == 15'h0024);          // 0x00090-0x000
 wire io_pr_ptr = sel_io && (io_off[16:4] == 13'h409);           // 0x04090-0x0409f
 wire io_pr_ini = sel_io && (io_off[16:2] == 15'h10A4);          // 0x04290-0x04293
 wire io_printer= io_lp | io_pr_csr | io_pr_ptr | io_pr_ini;
-wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd && !io_sndin && !io_scsi && !io_printer; // 0x00000-0x04FFF
+wire io_dsp_host = sel_io && (io_off[16:3] == 14'h1000);        // 0x08000-0x08007 DSP host port
+wire io_dsp_csr  = sel_io && (io_off[16:2] == 15'h0034);        // 0x000d0-0x000d3
+wire io_dsp_ptr  = sel_io && (io_off[16:4] == 13'h40d);         // 0x040d0-0x040df
+wire io_dsp_ini  = sel_io && (io_off[16:2] == 15'h10b4);        // 0x042d0-0x042d3
+wire io_dsp    = io_dsp_host | io_dsp_csr | io_dsp_ptr | io_dsp_ini;
+wire io_dma   = sel_io && (io_off[16:12] < 5'h05) && !io_enet && !io_mo && !io_snd && !io_sndin && !io_scsi && !io_printer && !io_dsp; // 0x00000-0x04FFF
 wire io_intc  = sel_io && (io_off[16:12] == 5'h07);             // 0x07000-0x07FFF
 wire io_scr1  = sel_io && (io_off[16:11] == 6'h18);             // 0x0c000-0x0c7ff
 wire io_sid   = sel_io && (io_off[16:11] == 6'h19);             // 0x0c800-0x0cfff
@@ -703,6 +727,7 @@ assign io_rdata = io_enet  ? enet_rdata :
                   io_snd   ? snd_rdata :
                   io_sndin ? sndin_rdata :
                   io_printer ? pr_rdata :
+                  io_dsp   ? dsp_rdata :
                   io_scsi  ? esp_rdata :
                   io_dma   ? dma_rdata :
                   io_intc  ? intc_rdata :
@@ -716,6 +741,9 @@ assign io_rdata = io_enet  ? enet_rdata :
 
 // system control registers and RTC
 wire timer_ipl7, softint1, softint2;
+wire dsp_run, dsp_blk_end, dsp_unpacked, dsp_int_l4, dsp_mem_en;
+wire [1:0] dsp_mode;
+wire bmap_dsp_hreq_en, bmap_dsp_txd_en;
 
 // SCSI disks mounted below the CD-ROM's target 3 (OSD slots S0-S2 are
 // targets 0-2).  The ROM's "sd(unit,lun,part)" numbers disks in scan
@@ -766,7 +794,13 @@ next_scr #(.CLK_HZ(CLK_HZ), .CLK_REAL_HZ(CLK_REAL_HZ)) scr
 	.led(led),
 	.rom_overlay(),
 	.softint1(softint1),
-	.softint2(softint2)
+	.softint2(softint2),
+	.dsp_run(dsp_run),
+	.dsp_mode(dsp_mode),
+	.dsp_blk_end(dsp_blk_end),
+	.dsp_unpacked(dsp_unpacked),
+	.dsp_int_l4(dsp_int_l4),
+	.dsp_mem_en(dsp_mem_en)
 );
 
 // hardclock
@@ -981,6 +1015,42 @@ next_printer #(.CLK_HZ(CLK_HZ)) printer
 	.int_printer_dma(int_printer_dma)
 );
 
+// DSP56001: the host port, its DMA channel (a seventh RAM master) and the
+// SCR2/BMAP/interrupt glue around the vendored Falcon block (rtl/dsp56k)
+next_dsp #(.CLK_HZ(CLK_HZ)) dsp
+(
+	.clk(clk),
+	.reset(dev_reset),
+	.sel_host(io_dsp_host),
+	.sel_csr(io_dsp_csr),
+	.sel_ptr(io_dsp_ptr),
+	.sel_ini(io_dsp_ini),
+	.addr(io_off[15:0]),
+	.we(is_write),
+	.be(lanes),
+	.wdata(cpu_dout),
+	.rdata(dsp_rdata),
+	.m_req(ds_m_req),
+	.m_we(ds_m_we),
+	.m_addr(ds_m_addr),
+	.m_be(ds_m_be),
+	.m_din(ds_m_din),
+	.m_dout(ram_dout),
+	.m_ack(ds_m_ack),
+	.m_err(ds_m_err),
+	.dsp_run(dsp_run),
+	.dsp_mode(dsp_mode),
+	.dsp_blk_end(dsp_blk_end),
+	.dsp_unpacked(dsp_unpacked),
+	.dsp_int_l4(dsp_int_l4),
+	.dsp_mem_en(dsp_mem_en),
+	.bmap_hreq_en(bmap_dsp_hreq_en),
+	.bmap_txd_en(bmap_dsp_txd_en),
+	.int_dsp_l3(int_dsp_l3),
+	.int_dsp_l4(int_dsp_l4),
+	.int_dsp_dma(int_dsp_dma)
+);
+
 // Floppy drive: an 82077 whose sector data rides the SCSI DMA channel
 wire        int_floppy, flp_select;
 wire        flp_req, flp_wr, flp_bwe, flp_done;
@@ -1139,7 +1209,9 @@ next_bmap bmap
 	.wdata(cpu_dout),
 	.rdata(bmap_rdata),
 	.tpe_link(enet_connected),
-	.tpe_select(bmap_tpe_select)
+	.tpe_select(bmap_tpe_select),
+	.dsp_hreq_en(bmap_dsp_hreq_en),
+	.dsp_txd_en(bmap_dsp_txd_en)
 );
 
 // interrupt controller
@@ -1147,6 +1219,8 @@ reg soft1_d, soft2_d, scsi_d, flp_d, power_d;
 reg entx_d, enrx_d, entxd_d, enrxd_d, disk_d, diskd_d, sndo_d, sndd_d, km_d;
 reg scsid_d;
 reg pr_d, prd_d, sndi_d;
+reg dspl3_d, dspl4_d, dspd_d;
+wire int_dsp_l3, int_dsp_l4, int_dsp_dma;
 always @(posedge clk) begin
 	soft1_d <= softint1;
 	soft2_d <= softint2;
@@ -1166,6 +1240,9 @@ always @(posedge clk) begin
 	km_d    <= int_keymouse;
 	pr_d    <= int_printer;
 	prd_d   <= int_printer_dma;
+	dspl3_d <= int_dsp_l3;
+	dspl4_d <= int_dsp_l4;
+	dspd_d  <= int_dsp_dma;
 end
 
 wire [31:0] int_set =
@@ -1174,6 +1251,7 @@ wire [31:0] int_set =
 	({31'd0, int_power & ~power_d} << 2) |
 	({31'd0, int_keymouse & ~km_d} << 3) |
 	({31'd0, vid_int_set} << 5) |
+	({31'd0, int_dsp_l3 & ~dspl3_d} << 6) |
 	({31'd0, int_floppy & ~flp_d} << 7) |
 	({31'd0, int_snd_ovrun & ~sndo_d} << 8) |
 	({31'd0, int_en_rx & ~enrx_d} << 9) |
@@ -1181,6 +1259,8 @@ wire [31:0] int_set =
 	({31'd0, int_printer & ~pr_d} << 11) |
 	({31'd0, esp_int_scsi & ~scsi_d} << 12) |
 	({31'd0, int_disk & ~disk_d} << 13) |
+	({31'd0, int_dsp_l4 & ~dspl4_d} << 14) |
+	({31'd0, int_dsp_dma & ~dspd_d} << 20) |
 	({31'd0, int_snd_in_dma & ~sndi_d} << 22) |
 	({31'd0, int_snd_out_dma & ~sndd_d} << 23) |
 	({31'd0, int_printer_dma & ~prd_d} << 24) |
@@ -1196,6 +1276,7 @@ wire [31:0] int_clr =
 	({31'd0, ~int_power & power_d} << 2) |
 	({31'd0, ~int_keymouse & km_d} << 3) |
 	({31'd0, vid_int_clr} << 5) |
+	({31'd0, ~int_dsp_l3 & dspl3_d} << 6) |
 	({31'd0, ~int_floppy & flp_d} << 7) |
 	({31'd0, ~int_snd_ovrun & sndo_d} << 8) |
 	({31'd0, ~int_en_rx & enrx_d} << 9) |
@@ -1203,6 +1284,8 @@ wire [31:0] int_clr =
 	({31'd0, ~int_printer & pr_d} << 11) |
 	({31'd0, ~esp_int_scsi & scsi_d} << 12) |
 	({31'd0, ~int_disk & disk_d} << 13) |
+	({31'd0, ~int_dsp_l4 & dspl4_d} << 14) |
+	({31'd0, ~int_dsp_dma & dspd_d} << 20) |
 	({31'd0, ~int_snd_in_dma & sndi_d} << 22) |
 	({31'd0, ~int_snd_out_dma & sndd_d} << 23) |
 	({31'd0, ~int_printer_dma & prd_d} << 24) |
