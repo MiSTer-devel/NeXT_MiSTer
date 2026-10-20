@@ -1,8 +1,12 @@
 # AP68040 in this repository
 
 This directory is the AP68040 `faster` core, vendored from
-`apolkosnik/AP68040` branch `main` at **b388dfc** (2026-10-18, "Merge pull
-request #8 from apolkosnik/faster") on 2026-10-18.  It is the pipelined
+`apolkosnik/AP68040` branch `main` at **1247b45** (2026-10-19, "Merge pull
+request #10 from apolkosnik/dead-job-kill"), first taken at b388dfc
+(2026-10-18, PR #8 `faster`) and brought up to main on 2026-10-19: that
+adds PR #9 and PR #10 (this port's two fixes, below) and PR #11
+(georgemog: an IPEND claim is made against the new mask on the clock an
+SR write commits, `t_ipendsr`).  It is the pipelined
 SystemVerilog core (`rtl/ap68040*.sv`, the FPU in `rtl/fpu/`) that
 presents the real MC68040 external bus; the NeXT side talks to that bus
 through `rtl/next/next_cpu040.sv`, documented in `docs/CPU_NEXT_PORT.md`.
@@ -31,27 +35,17 @@ that a newer drop can replace this directory and the list be re-applied:
    slice instead of one per byte (and does not fall back to flip-flops,
    which it does for a `for` loop over the bytes with variable enables).
 
-3. `rtl/ap68040_dmu.sv`: the table walk samples its data-cache tag
-   compare one wait state later (`E_TW_DESCW2`), after the tag RAM's
-   registered port B address has taken the descriptor's set; before, the
-   compare looked at the previously addressed set and a false hit or miss
-   corrupted the walk (the NeXT kernel's page-fault loop on hardware,
-   2026-10-19).  `tb/asm/t_nx8k.s` reproduces it.
-4. `rtl/ap68040_dmu.sv`: the DC2 job's kill mark (`e_kill`) is cleared
-   when the job is scheduled in `E_IDLE`, not in `E_S_START`: the engine
-   is frozen while the snooper holds the cache but the kill block is
-   not, so a kill landing on a frozen `E_S_START` was erased when its
-   body ran, the dead job completed, and the next uop into DC2 took its
-   data (OPENSTEP panics under disk DMA on the NeXT, 2026-10-19).
-   `tb/asm/t_snkill.s`, the bench's `$F2F0` coincidence counter and
-   traffic bit 13 (a random hold before each snooped transfer), and a
-   self-check at `E_S_DONE`.
+Two more were made here and are upstream now (in the vendored main):
+the table walk's tag compare wait state (`E_TW_DESCW2`, `t_nx8k`,
+https://github.com/apolkosnik/AP68040/pull/9) and the DC2 job's kill
+mark cleared in `E_IDLE` (`t_snkill`, the bench's `$F2F0` counter and
+traffic bit 13, the `E_S_DONE` self-check,
+https://github.com/apolkosnik/AP68040/pull/10); both found on the NeXT
+on 2026-10-19 (`docs/CPU_NEXT_PORT.md`).
 
-All four are candidates for upstream; the third and fourth are bug
-fixes, pushed on 2026-10-19 as
-https://github.com/apolkosnik/AP68040/pull/9 (branch `walker-tag-compare`,
-merged) and https://github.com/apolkosnik/AP68040/pull/10 (branch
-`dead-job-kill`).
+Both remaining changes are candidates for upstream.  `tb/asm/t_cbzero.s`
+and `t_pushfill.s` are investigation programs from the panic hunt, not
+in `run_tests.sh`.
 
 ## History
 

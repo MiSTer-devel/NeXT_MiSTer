@@ -1,7 +1,7 @@
 # Running NeXT on the AP68040 `faster` core
 
 `rtl/ap68040/` is the pipelined AP68040 (`apolkosnik/AP68040` branch
-`main`, b388dfc of 2026-10-18; `rtl/ap68040/UPSTREAM.md`).  It presents
+`main`, 1247b45 of 2026-10-19, first taken at b388dfc of 2026-10-18; `rtl/ap68040/UPSTREAM.md`).  It presents
 the real MC68040 external bus and runs on its own clock, twice the
 system clock.  This file lists everything that makes that core drive
 `next_system.sv`, so the same can be re-done when a newer drop replaces
@@ -20,7 +20,7 @@ its port are history: `CPU_NEXT_PORT_ap040.md`.
 | `NeXT.sdc` | the two clocks' 2:1 timing exceptions |
 | `tb/tb_next_boot.sv`, `tb/tb_next_recording.sv`, `tb/run_tests.sh` | two clocks, probes on the new core |
 
-## CPU-side changes (four)
+## CPU-side changes (four; 3 and 4 are upstream since 1247b45, 1 and 2 are still local)
 
 **1. The DBcc period floor.**  `rtl/ap68040.sv`, `rtl/ap68040_backend.sv`: the `dbcc_floor[3:0]` input.
 A DBcc that follows a taken DBcc leaves EX no earlier than `dbcc_floor`

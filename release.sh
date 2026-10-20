@@ -11,7 +11,9 @@
 #
 #   ./release.sh          -> releases/NeXT_YYYYMMDD.rbf (or the next free
 #                            letter suffix for today: a, b, c, ...)
-#   ./release.sh fpsp     -> releases/NeXT_YYYYMMDD_fpsp.rbf
+#   ./release.sh fpsp     -> releases/NeXT-fpsp_YYYYMMDD.rbf (the MiSTer
+#                            convention: Core-variant_date, as the board's
+#                            own file names)
 set -eu
 cd "$(dirname "$0")"
 
@@ -35,7 +37,7 @@ tb/check_timing.sh || { echo; echo "*** release REFUSED: timing not closed"; exi
 
 day=$(date +%Y%m%d)
 if [ $# -ge 1 ]; then
-	out="releases/NeXT_${day}_$1.rbf"
+	out="releases/NeXT-$1_${day}.rbf"
 else
 	out="releases/NeXT_${day}.rbf"
 	[ -e "$out" ] && for s in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
