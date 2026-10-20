@@ -110,7 +110,11 @@ wire  [7:0] ioctl_dout;
 // carrying the wrong size.  This build stays below that ceiling with
 // VDNUM 6, so bits 0..5 are slots and bit 7 remains only the flag.
 //
-// Four SCSI targets, one floppy and one magneto-optical drive.  ISO is
+// Two SCSI disks (targets 0 and 1), the CD-ROM (target 3), one floppy
+// and one magneto-optical drive.  Slot 2 has no menu entry and is not
+// routed: SCSI target 2 is unpopulated (next_scsi's has_unit), and the
+// number is kept so S3/S4/S5 stay where saved configs, MGL files and
+// Main's NEXT_CDROM_SLOT expect them.  ISO is
 // deliberately not accepted by the MO slot: this controller consumes
 // NeXT's 1296-byte encoded MO sectors, while a CD-ROM is a 2048-byte SCSI
 // target and needs a different target implementation.
@@ -121,12 +125,12 @@ wire [31:0] osd_lba;
 wire        osd_rd, osd_wr;
 wire  [7:0] osd_buff_din;
 wire        osd_ack       = sd_ack_v[5];
-wire  [5:0] img_mounted   = {2'b00, img_mounted_v[3:0]};
+wire  [5:0] img_mounted   = {2'b00, img_mounted_v[3], 1'b0, img_mounted_v[1:0]};
 wire  [1:0] fimg_mounted  = {1'b0, img_mounted_v[4]};
 wire  [2:0] sd_unit;
 wire        fsd_unit;
-// One engine, six possible targets: only targets 0..3 have host slots in
-// this build.  Keep the complete target number until this final routing
+// One engine, six possible targets: only targets 0, 1 and 3 have host
+// slots in this build.  Keep the complete target number until this final routing
 // point so target 2/3 cannot alias target 0/1.
 wire        sd_ack        = (sd_unit < 3'd4) ? sd_ack_v[sd_unit] : 1'b0;
 wire        fsd_ack       = sd_ack_v[4];
@@ -184,17 +188,20 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(6)) hps_io
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
-// The AP68040 closes timing around 30 MHz on this device (the proven
-// Minimig-AGA integration runs it at 28.7 MHz), so the system runs at
-// 28 MHz and the 1600x912 pixel timing gets its own 100 MHz clock.
-wire clk_sys;   // 28 MHz: CPU, devices, DDR3
+// The AP68040 (the pipelined core) runs at 55 MHz; its bus, the devices
+// and the DDR3 port run at half that, 27.5 MHz, from the same PLL (the
+// 68040's 2:1 bus clock), and the 1600x912 pixel timing gets its own
+// 100 MHz clock.
+wire clk_sys;   // 27.5 MHz: the CPU bus, devices, DDR3
 wire clk_vid;   // 100 MHz: pixel clock
+wire clk_cpu;   // 55 MHz: the AP68040, two clocks per clk_sys (edge aligned)
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),
-	.outclk_1(clk_vid)
+	.outclk_1(clk_vid),
+	.outclk_2(clk_cpu)
 );
 
 // hold the machine in reset until a boot ROM has been loaded
@@ -215,7 +222,7 @@ always @(posedge clk_sys) reset <= RESET | status[0] | buttons[1] | rom_download
 wire signed [15:0] adc_audio_in;
 `ifdef NEXT_SND_IN
 localparam SND_IN_EN = 1;
-next_audio_adc #(.CLK_REAL_HZ(28000000)) adc_input
+next_audio_adc #(.CLK_REAL_HZ(27500000)) adc_input
 (
 	.clk(clk_sys), .reset(reset), .ADC_BUS(ADC_BUS), .audio_in(adc_audio_in)
 );
@@ -254,27 +261,26 @@ localparam DEBUG_EXCEPTIONS = 0;
 wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
-// CLK_HZ sets the machine's microsecond tick: with the 28 MHz system
-// clock this is a virtual microsecond (the machine runs at 112 percent
-// of real time, uniformly), chosen to satisfy the boot ROM's CPU-speed
+// CLK_HZ sets the machine's microsecond tick: with the 27.5 MHz system
+// clock, 28 is a virtual microsecond (the machine runs at 98 percent of
+// real time, uniformly), chosen to satisfy the boot ROM's CPU-speed
 // calibration invariant (see DBCC_FLOOR in next_system.sv):
-//     (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR
-// The ROM's delay() loop is a bare dbf, which the Quadra 800 AP68040
-// tree runs in 2 clocks per iteration (measured, docs/CPU_NEXT_PORT.md);
-// the host keeps consecutive DBcc executions 4 enabled clocks apart, as
-// on a real 68040, so 6.25 iterations per microsecond need 25 clocks.
-// Nothing else is slowed (CPU_PACE 1/1).
+//     (CLK_HZ / 1e6) = 6.25 * DBCC_FLOOR / 2
+// The ROM's delay() loop is a bare dbf, which the AP68040 would run in
+// 2-3 of its 55 MHz clocks; the core keeps consecutive DBcc executions
+// 9 of its clocks apart (164 ns, a real 25 MHz 68040's 4 clocks), so
+// 6.25 iterations per microsecond need 28 bus clocks.  Nothing else is
+// slowed.
 next_system #(
-	.CLK_HZ(25000000),
-	.DBCC_FLOOR(4),
-	.CPU_PACE_NUM(1),
-	.CPU_PACE_DEN(1),
-	.CLK_REAL_HZ(28000000),   // the real clk_sys, so the clock keeps time
+	.CLK_HZ(28000000),
+	.DBCC_FLOOR(9),
+	.CLK_REAL_HZ(27500000),   // the real clk_sys, so the clock keeps time
 	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
 	.SND_IN_EN(SND_IN_EN)
 ) system
 (
 	.clk(clk_sys),
+	.clk_cpu(clk_cpu),
 	.clk_vid(clk_vid),
 	.reset(reset),
 
@@ -380,7 +386,7 @@ next_system #(
 //
 //  b[1] = 0 leaves the framework's own status OR'd in, per sys/.
 
-localparam [21:0] LED_HOLD = 22'd1400000;   // ~50 ms at 28 MHz
+localparam [21:0] LED_HOLD = 22'd1400000;   // ~50 ms at 27.5 MHz
 
 reg [21:0] disk_lamp = 0;
 reg [21:0] flp_lamp  = 0;

@@ -42,3 +42,8 @@ tb/build
 quartus_build.log
 build_quartus.log
 build_quartus.pid
+
+# the AP68040 core tree: Verilator objects and assembled test programs
+rtl/ap68040/obj/
+rtl/ap68040/tb/build/
+rtl/ap68040/tools/__pycache__/

@@ -1,0 +1,705 @@
+# The three local changes to the AP68040 drop b388dfc (docs/CPU_NEXT_PORT.md, "CPU-side changes"),
+# as a unified diff against the upstream tree: from the root of a new drop,
+#   patch -p1 < <NeXT_MiSTer>/docs/CPU_NEXT_PORT_ap68040.patch
+
+diff -ruN a/rtl/ap68040_backend.sv b/rtl/ap68040_backend.sv
+--- a/rtl/ap68040_backend.sv	2026-10-18 23:02:29.000000000 -0400
++++ b/rtl/ap68040_backend.sv	2026-10-18 23:37:26.028248393 -0400
+@@ -126,6 +126,7 @@
+ 
+ 	// interrupts (synchronized level, 0-7)
+ 	input  logic  [2:0] ipl,
++	input  logic  [3:0] dbcc_floor,    // DBcc period floor in clocks (0/1: off)
+ 	output logic  [2:0] iack_lvl,
+ 	output logic        rsto_req,
+ 	input  logic        rsto_busy,
+@@ -279,6 +280,7 @@
+ 
+ // EX holds for a multicycle unit; DC2 for memory; WB for stores/serial ops
+ logic md_busy;                // multiply/divide running (register)
++logic dbf_hold;               // the DBcc period floor holds EX (below)
+ logic ex_md_start;
+ // DC2 holds until the data memory unit has its result
+ assign dc2_hold  = dc2_v && (dc2_u.mem != M_NONE) && (dc2_u.exc == 8'd0) && !dm_dc2_rdy;
+@@ -658,7 +660,35 @@
+ // operand stays off the stall path, and the exception goes a cycle later)
+ assign ex_hold = (ex_v && ex_is_md && !md_z && !ex_fault && !md_done && !md_fin) ||
+                  (ex_v && ex_slow && !ex_ph) ||
+-                 (ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0 && fp_hold);
++                 (ex_v && ex_is_fp && !ex_fault && ex_u.exc == 8'd0 && fp_hold) ||
++                 dbf_hold;
++
++// DBcc period floor (the dbcc_floor input): a taken DBcc leaving EX loads
++// the counter with floor-1, and a DBcc in EX waits while it is nonzero, so
++// consecutive DBccs leave EX (and retire: WB never holds one) at least
++// dbcc_floor clocks apart.  The hold is keyed on the previous DBcc's real
++// outcome, not on a prediction, and it commits nothing: Dn is written and
++// the predictors trained on adv_ex only, and a flush clears ex_v.  Only a
++// DBcc that follows a taken DBcc waits, so a loop's exit and a lone DBcc
++// cost nothing extra.  Hosts calibrated on a real 68040's DBcc loops set
++// the floor (NeXT: 9 clocks at 55 MHz for the ROM's 4 clocks at 25 MHz).
++logic [3:0] dbf_cnt;
++logic       dbf_nz;
++assign dbf_hold = ex_v && ex_kc[3] && dbf_nz;
++always_ff @(posedge clk) begin
++	if (!nreset) begin
++		dbf_cnt <= 4'd0;
++		dbf_nz  <= 1'b0;
++	end
++	else if (adv_ex && ex_kc[3] && ex_taken) begin
++		dbf_cnt <= (dbcc_floor > 4'd1) ? dbcc_floor - 4'd1 : 4'd0;
++		dbf_nz  <= (dbcc_floor > 4'd1);
++	end
++	else if (dbf_nz) begin
++		dbf_cnt <= dbf_cnt - 4'd1;
++		dbf_nz  <= (dbf_cnt != 4'd1);
++	end
++end
+ 
+ // multiply/divide result and flags
+ logic [31:0] md_res;
+diff -ruN a/rtl/ap68040_dmu.sv b/rtl/ap68040_dmu.sv
+--- a/rtl/ap68040_dmu.sv	2026-10-18 23:02:29.000000000 -0400
++++ b/rtl/ap68040_dmu.sv	2026-10-19 01:34:36.361484672 -0400
+@@ -737,7 +737,7 @@
+ 	E_M_START, E_M_PG, E_M_SCAN, E_M_SCANW, E_M_SCAN2, E_M_IC, E_M_DONE, E_M_CLR,
+ 	E_FILL, E_FILLW, E_FILL_W, E_FILL_INS, E_PUSHV, E_PUSHVW, E_PUSHV_W, E_PUSHV_B,
+ 	E_BUS, E_BUS_W,
+-	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
++	E_TW_START, E_TW_DESC, E_TW_DESCW, E_TW_DESCW2, E_TW_DLK, E_TW_DBUS, E_TW_EVAL, E_TW_UPD, E_TW_UPD_W,
+ 	E_TW_LKW, E_TW_DONE,
+ 	E_I_DONE
+ } est_t;
+@@ -2030,7 +2030,17 @@
+ 			tset_b <= tw_da[9:4];
+ 			e_st   <= E_TW_DESCW;
+ 		end
+-		E_TW_DESCW: e_st <= E_TW_DLK;   // (the tags of the set valid: the compare registers)
++		// The tag RAM registers its port B address: tset_b lands at the end
++		// of E_TW_DESC, the RAM takes it at the end of E_TW_DESCW, its tags
++		// are on tq_b in E_TW_DESCW2, and the compare registered at the end
++		// of that cycle (tw_hhq, tw_hwq) is what E_TW_DLK reads.  One wait
++		// state fewer sampled the compare against the set addressed BEFORE
++		// (the previous descriptor's, or the pipeline's): a false hit took
++		// another line's data for the descriptor, a false miss read memory
++		// past a dirty cached descriptor (the NeXT kernel's page-fault loop
++		// of 2026-10-19, tb/asm/t_nx8k.s).
++		E_TW_DESCW:  e_st <= E_TW_DESCW2;
++		E_TW_DESCW2: e_st <= E_TW_DLK;    // (the tags of the set valid: the compare registers)
+ 		E_TW_DLK: begin
+ 			if (tw_hhq && dc_en) begin
+ 				tw_d <= take(dq_w, tw_da[3:0], 3'd4);
+@@ -2431,7 +2441,7 @@
+ // snooped set in the first H cycle)
+ assign sn_line = (sn_src == 2'd0) ? dq_w : (sn_src == 2'd1) ? pv_line : bo_line;
+ 
+-assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) ||
++assign tw_busy = (e_st == E_TW_START) || (e_st == E_TW_DESC) || (e_st == E_TW_DESCW) || (e_st == E_TW_DESCW2) ||
+                  (e_st == E_TW_DLK) || (e_st == E_TW_DBUS) || (e_st == E_TW_EVAL) ||
+                  (e_st == E_TW_UPD) || (e_st == E_TW_LKW) || (e_st == E_TW_UPD_W) ||
+                  (e_st == E_TW_DONE) ||
+diff -ruN a/rtl/ap68040.qip b/rtl/ap68040.qip
+--- a/rtl/ap68040.qip	1969-12-31 19:00:00.000000000 -0500
++++ b/rtl/ap68040.qip	2026-10-18 23:51:26.817484575 -0400
+@@ -0,0 +1,24 @@
++# AP68040 (rtl/ap68040, the pipelined core): Quartus file list in dependency
++# order, as syn/fitcore.sh lists it.  The generated rtl/gen/*.svh tables are
++# `included, not compiled, hence the search paths.
++set_global_assignment -name SEARCH_PATH [file join $::quartus(qip_path) "."]
++set_global_assignment -name SEARCH_PATH [file join $::quartus(qip_path) "gen"]
++set_global_assignment -name SEARCH_PATH [file join $::quartus(qip_path) "fpu"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_pkg.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "gen/ap68040_upkg.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_alu.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_alu_slow.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_muldiv.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_biu.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_ram.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_atc.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_dmu.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_predec.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_fetch.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_decode.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_useq.sv"]
++set_global_assignment -name VERILOG_FILE       [file join $::quartus(qip_path) "fpu/ap040_fpu.v"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_fpif.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_backend.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040_snoop.sv"]
++set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "ap68040.sv"]
+diff -ruN a/rtl/ap68040_ram.sv b/rtl/ap68040_ram.sv
+--- a/rtl/ap68040_ram.sv	2026-10-18 23:02:29.000000000 -0400
++++ b/rtl/ap68040_ram.sv	2026-10-19 00:34:20.419996945 -0400
+@@ -27,21 +27,27 @@
+ );
+ 	// Intel's byte-enabled simple dual port template (Quartus 17 infers
+ 	// byte enables for at most four bytes per memory, so a wider word is
+-	// built from 32-bit slices).  The read data is registered: a read of
+-	// the word written in the same cycle returns the old data (the users
+-	// track that case).
++	// built from 32-bit slices, one ap68040_sdp_be_slice each).  The read
++	// data is registered: a read of the word written in the same cycle
++	// returns the old data (the users track that case).
++	//
++	// Each slice is a module of its own with the byte writes and the read
++	// in ONE always block and a whole-variable output, the template's
++	// shape: Quartus 17.0 made one memory per BYTE of the slice when the
++	// bytes were written from separate always blocks (64 M10Ks for a 4 KB
++	// data cache, 20 percent used each), and no memory at all (flip-flops
++	// and a multiplexer) when the slices of one module assigned
++	// part-selects of a shared read vector.
+ 	localparam int SL = (NB > 4) ? 4 : NB;      // bytes per slice
+ 	localparam int NS = (NB + SL - 1) / SL;     // slices
+ 	logic [NB*8-1:0] qr;
+-	genvar gs, gb;
++	genvar gs;
+ 	generate
+ 		for (gs = 0; gs < NS; gs++) begin : g_sl
+-			(* ramstyle = "M10K, no_rw_check" *) logic [SL-1:0][7:0] mem [0:(1<<AW)-1];
+-			for (gb = 0; gb < SL; gb++) begin : g_b
+-				always_ff @(posedge clk)
+-					if (we && wbe[gs*SL + gb]) mem[waddr][gb] <= wdata[(gs*SL + gb)*8 +: 8];
+-			end
+-			always_ff @(posedge clk) qr[gs*SL*8 +: SL*8] <= mem[raddr];
++			ap68040_sdp_be_slice #(.AW(AW), .SL(SL)) sl (
++				.clk(clk), .we(we), .waddr(waddr),
++				.wbe(wbe[gs*SL +: SL]), .wdata(wdata[gs*SL*8 +: SL*8]),
++				.raddr(raddr), .q(qr[gs*SL*8 +: SL*8]));
+ 		end
+ 	endgenerate
+ 	generate
+@@ -53,6 +59,64 @@
+ 		end
+ 	endgenerate
+ endmodule
++
++// one slice of ap68040_sdp_be: SL bytes (1..4), byte enables, one M10K
++module ap68040_sdp_be_slice #(
++	parameter int AW = 6,
++	parameter int SL = 4
++)(
++	input  logic              clk,
++	input  logic              we,
++	input  logic [AW-1:0]     waddr,
++	input  logic [SL-1:0]     wbe,
++	input  logic [SL*8-1:0]   wdata,
++	input  logic [AW-1:0]     raddr,
++	output logic [SL*8-1:0]   q
++);
++	// Each byte's write is spelled out (Intel's template, "edit this code
++	// if using other than four bytes per word"): with the bytes written in
++	// a for loop Quartus 17.0 infers the memory only when the byte enables
++	// are constant, and makes flip-flops of it when they are not.
++	(* ramstyle = "M10K, no_rw_check" *) logic [SL-1:0][7:0] mem [0:(1<<AW)-1];
++	generate
++		if (SL == 4) begin : g4
++			always_ff @(posedge clk) begin
++				if (we) begin
++					if (wbe[0]) mem[waddr][0] <= wdata[7:0];
++					if (wbe[1]) mem[waddr][1] <= wdata[15:8];
++					if (wbe[2]) mem[waddr][2] <= wdata[23:16];
++					if (wbe[3]) mem[waddr][3] <= wdata[31:24];
++				end
++				q <= mem[raddr];
++			end
++		end
++		else if (SL == 3) begin : g3
++			always_ff @(posedge clk) begin
++				if (we) begin
++					if (wbe[0]) mem[waddr][0] <= wdata[7:0];
++					if (wbe[1]) mem[waddr][1] <= wdata[15:8];
++					if (wbe[2]) mem[waddr][2] <= wdata[23:16];
++				end
++				q <= mem[raddr];
++			end
++		end
++		else if (SL == 2) begin : g2
++			always_ff @(posedge clk) begin
++				if (we) begin
++					if (wbe[0]) mem[waddr][0] <= wdata[7:0];
++					if (wbe[1]) mem[waddr][1] <= wdata[15:8];
++				end
++				q <= mem[raddr];
++			end
++		end
++		else begin : g1
++			always_ff @(posedge clk) begin
++				if (we && wbe[0]) mem[waddr][0] <= wdata[7:0];
++				q <= mem[raddr];
++			end
++		end
++	endgenerate
++endmodule
+ 
+ module ap68040_tdp #(
+ 	parameter int AW = 6,
+diff -ruN a/rtl/ap68040.sv b/rtl/ap68040.sv
+--- a/rtl/ap68040.sv	2026-10-18 23:02:29.000000000 -0400
++++ b/rtl/ap68040.sv	2026-10-18 23:37:26.028055042 -0400
+@@ -59,6 +59,11 @@
+ 	input  logic        tbi_n,
+ 	input  logic  [2:0] ipl_n,
+ 	input  logic        avec_n,
++	// host calibration: a DBcc that follows a taken DBcc leaves EX no
++	// earlier than dbcc_floor clocks after it (0 or 1: off).  For hosts
++	// whose firmware times a "dbf d0,*" loop against a real 68040's 4
++	// clocks per taken DBcc (the NeXT ROM); nothing else is slowed.
++	input  logic  [3:0] dbcc_floor,
+ 	output logic        br_n,
+ 	input  logic        bg_n,
+ 	input  logic        bb_n_i,
+@@ -269,7 +274,7 @@
+ 	.mt_wr(mt_wr), .mt_done(mt_done), .mt_mmusr(mt_mmusr), .mt_fault(mt_fault),
+ 	.mt_fssw(mt_fssw), .mt_faddr(mt_faddr), .dm_st_faddr(dm_st_faddr),
+ 	.urp(urp), .srp(srp),
+-	.ipl(ipl_v), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
++	.ipl(ipl_v), .dbcc_floor(dbcc_floor), .iack_lvl(iack_lvl), .rsto_req(rsto_req), .rsto_busy(rsto_busy),
+ 	.kill_now(kill_now), .lk_abandon(lk_abandon), .adv_ag(adv_ag),
+ 	.dtt0(dtt0), .dtt1(dtt1), .itt0(itt0), .itt1(itt1), .tc(tc),
+ 	.dbg_pc(dbg_pc), .dbg_retire(dbg_retire), .halted(dbg_halted), .fetch_stop(be_fstop)
+diff -ruN a/tb/asm/t_dbccfloor.s b/tb/asm/t_dbccfloor.s
+--- a/tb/asm/t_dbccfloor.s	1969-12-31 19:00:00.000000000 -0500
++++ b/tb/asm/t_dbccfloor.s	2026-10-18 23:38:17.270387671 -0400
+@@ -0,0 +1,164 @@
++; AP68040: the DBcc period floor (the dbcc_floor input, bench register $F10C)
++; assembled with vasmm68k_mot -Fbin -m68040
++;
++; A host whose firmware times a bare "dbf d0,*" loop against a real 68040's
++; 4 clocks per taken DBcc (the NeXT ROM's delay()) sets dbcc_floor so that
++; a DBcc following a taken DBcc leaves EX no earlier than that many clocks
++; after it.  The program times its loops with the bench's clock count
++; ($F2EC, a noncachable read) and checks:
++;   1    floor 0: 999 taken dbf cost well under 9 clocks each (the loop's
++;        natural rate, 2-3 clocks)
++;   2    floor 9: at least 9 clocks per taken dbf, and not more than the
++;        floor plus the bracketing overhead
++;   3    floor 4: the same at 4
++;   4    a subq/bne loop runs the same with floor 9 as with floor 0: the
++;        floor slows only DBcc
++;   5    a never-taken dbf (counter 0) in a bne loop runs the same with
++;        floor 9 as with floor 0: only a TAKEN DBcc arms the floor
++;   6    floor 9 then floor 0 again: the floor releases (nothing sticks)
++
++FAILREG	equ	$F100
++DONEREG	equ	$F102
++FLOOR	equ	$F10C		; bench: the core's dbcc_floor input (word)
++CYCLES	equ	$F2EC		; bench: the clock count (long, read)
++
++ITER	equ	1000		; dbf executions per timed loop (999 taken)
++SLACK	equ	256		; bracketing overhead allowed (two bus reads, the
++				; exit mispredict, wait states and BCLK/2)
++
++failt	macro
++	move.w	#\1,d7
++	bra	fail_all
++	endm
++
++	org	0
++	dc.l	$3400
++	dc.l	start
++	rept	254
++	dc.l	unexp
++	endr
++
++	org	$400
++start:
++	move.l	#$0000A040,d0		; DTT1: supervisor data noncachable
++	movec	d0,dtt1			; (the bench registers)
++	move.l	#$80008000,d0		; both caches on
++	movec	d0,cacr
++	move.w	#$2700,sr
++
++; warm the instruction cache and the branch predictors on every timed loop
++	move.w	#0,(FLOOR).l
++	bsr	meas_dbf
++	bsr	meas_bne
++	bsr	meas_ntk
++
++;------------------------------------------------- 1 floor 0: the natural rate
++	move.w	#0,(FLOOR).l
++	bsr	meas_dbf
++	move.l	d2,d3			; d3 = cycles at floor 0
++	cmp.l	#(ITER-1)*6,d2		; well under 9 a pass (2-3 natural)
++	bhs	fail1
++
++;------------------------------------------------- 2 floor 9
++	move.w	#9,(FLOOR).l
++	bsr	meas_dbf
++	cmp.l	#(ITER-1)*9,d2
++	blo	fail2
++	cmp.l	#(ITER-1)*9+SLACK,d2
++	bhi	fail3
++
++;------------------------------------------------- 3 floor 4
++	move.w	#4,(FLOOR).l
++	bsr	meas_dbf
++	cmp.l	#(ITER-1)*4,d2
++	blo	fail4
++	cmp.l	#(ITER-1)*4+SLACK,d2
++	bhi	fail5
++
++;------------------------------------------------- 4 subq/bne: not a DBcc
++	move.w	#0,(FLOOR).l
++	bsr	meas_bne
++	move.l	d2,d4
++	move.w	#9,(FLOOR).l
++	bsr	meas_bne
++	sub.l	d4,d2			; floor 9 minus floor 0
++	bpl.s	.p4
++	neg.l	d2
++.p4:	cmp.l	#SLACK,d2
++	bhi	fail6
++
++;------------------------------------------------- 5 a never-taken dbf
++	move.w	#0,(FLOOR).l
++	bsr	meas_ntk
++	move.l	d2,d4
++	move.w	#9,(FLOOR).l
++	bsr	meas_ntk
++	sub.l	d4,d2
++	bpl.s	.p5
++	neg.l	d2
++.p5:	cmp.l	#SLACK,d2
++	bhi	fail7
++
++;------------------------------------------------- 6 the floor releases
++	move.w	#0,(FLOOR).l
++	bsr	meas_dbf
++	sub.l	d3,d2			; against test 1's count
++	bpl.s	.p6
++	neg.l	d2
++.p6:	cmp.l	#SLACK,d2
++	bhi	fail8
++
++	move.w	#$600D,(DONEREG).l
++	bra.s	*
++
++; d2 = clocks around ITER executions of an aligned "dbf d0,*"
++meas_dbf:
++	move.w	#ITER-1,d0
++	move.l	(CYCLES).l,d1
++	cnop	0,4
++.a:	dbf	d0,.a
++	move.l	(CYCLES).l,d2
++	sub.l	d1,d2
++	rts
++
++; d2 = clocks around ITER passes of a subq/bne loop
++meas_bne:
++	move.l	#ITER,d0
++	move.l	(CYCLES).l,d1
++	cnop	0,4
++.b:	subq.l	#1,d0
++	bne.s	.b
++	move.l	(CYCLES).l,d2
++	sub.l	d1,d2
++	rts
++
++; d2 = clocks around ITER passes of a bne loop holding a dbf that is never
++; taken (its counter is 0 on every pass)
++meas_ntk:
++	move.l	#ITER,d0
++	move.l	(CYCLES).l,d5
++	cnop	0,4
++.c:	moveq	#0,d1
++	dbf	d1,.c			; d1 = 0 -> -1: falls through every time
++	subq.l	#1,d0
++	bne.s	.c
++	move.l	(CYCLES).l,d2
++	sub.l	d5,d2
++	rts
++
++fail1:	failt	1
++fail2:	failt	2
++fail3:	failt	3
++fail4:	failt	4
++fail5:	failt	5
++fail6:	failt	6
++fail7:	failt	7
++fail8:	failt	8
++
++fail_all:
++	move.w	d7,(FAILREG).l
++	move.w	#$BAD,(DONEREG).l
++	bra.s	*
++
++unexp:
++	failt	99
+diff -ruN a/tb/asm/t_nx8k.s b/tb/asm/t_nx8k.s
+--- a/tb/asm/t_nx8k.s	1969-12-31 19:00:00.000000000 -0500
++++ b/tb/asm/t_nx8k.s	2026-10-19 01:27:17.017037761 -0400
+@@ -0,0 +1,216 @@
++; AP68040: the NeXT kernel's page-table shape, reproduced from a hardware dump
++; (2026-10-19): 8 KB pages (TC $C000), the kernel's own memory under a
++; supervisor-only copyback transparent translation (ITT0/DTT0), and a VA in
++; the 0x10000000 window mapped by a three-level table whose root and pointer
++; descriptors are type 10 (not 11, as every other test here writes them) and
++; whose page descriptor is resident, U, M, copyback, global ($...439).  The
++; tables are written with the data cache on (copyback) and never pushed, as
++; the kernel does.  On the board a supervisor write through such a mapping
++; faulted (ATC fault) on every retry although the tables were valid.
++;   1    the mapping valid before the access: a write and a read through it
++;        reach the physical page, no fault
++;   2    the page descriptor invalid at first: the access error handler
++;        makes it valid and PFLUSHANs; the retried write must succeed
++;        (exactly one fault)
++;   3    the same with PFLUSHA
++;   4    the same with a descriptor the handler had READ (a clean cached
++;        copy) before writing it
++;   5    the same for a pointer descriptor made valid by the handler
++FAILREG	equ	$F100
++DONEREG	equ	$F102
++
++ROOT	equ	$20000
++PTR	equ	$20200
++PAGE	equ	$20400		; 32 entries of 8 KB pages
++PTR2	equ	$20600		; for test 5
++PAGE2	equ	$20800
++PHYS	equ	$30000		; physical pages $30000, $32000, $34000, $36000
++VA	equ	$10004494	; root 8, pointer 0, page 2
++VA3	equ	$10006494	; page 3
++VA4	equ	$10008494	; page 4
++VA5	equ	$10044494	; root 8, pointer 1, page 2 (PTR2/PAGE2)
++VA6	equ	$1000a494	; page 5
++
++cnt_aerr	equ	$3600
++fix_addr	equ	$3604
++fix_val		equ	$3608
++flush_mode	equ	$360C		; 0 pflushan, 1 pflusha
++last_fa		equ	$3610
++last_ssw	equ	$3614
++
++failt	macro
++	move.w	#\1,d7
++	bra	fail_all
++	endm
++
++chkl	macro
++	cmp.l	#\2,\1
++	beq.s	.ok\@
++	failt	\3
++.ok\@:
++	endm
++
++	org	0
++	dc.l	$3400
++	dc.l	start
++	dc.l	h_aerr		; 2 access error
++	rept	253
++	dc.l	unexp
++	endr
++
++	org	$400
++start:
++	move.w	#$2700,sr
++	clr.l	(cnt_aerr).l
++	clr.l	(flush_mode).l
++	move.l	#$80008000,d0		; caches on: the tables are written copyback
++	movec	d0,cacr
++
++; the kernel's transparent translation for its own memory: ITT0 = DTT0 =
++; base 0, mask 0 (this 16 MB), E, S = supervisor only, CM = copyback
++	move.l	#$0000A020,d0
++	movec	d0,itt0
++	movec	d0,dtt0
++	moveq	#0,d0
++	movec	d0,itt1
++	movec	d0,dtt1
++
++; the tables, as the kernel writes them (cached stores, never pushed)
++	lea	(ROOT).l,a0
++	moveq	#0,d0
++	move.w	#127,d1
++.cr:	move.l	d0,(a0)+
++	dbf	d1,.cr
++	lea	(PTR).l,a0
++	move.w	#127,d1
++.cp:	move.l	d0,(a0)+
++	dbf	d1,.cp
++	lea	(PTR2).l,a0
++	move.w	#127,d1
++.cp2:	move.l	d0,(a0)+
++	dbf	d1,.cp2
++	lea	(PAGE).l,a0
++	move.w	#31,d1
++.cg:	move.l	d0,(a0)+
++	dbf	d1,.cg
++	lea	(PAGE2).l,a0
++	move.w	#31,d1
++.cg2:	move.l	d0,(a0)+
++	dbf	d1,.cg2
++	move.l	#PTR+$A,(ROOT+8*4).l		; root[8]: type 10, U
++	move.l	#PAGE+$A,(PTR+0).l		; ptr[0]:  type 10, U
++	move.l	#PHYS+$439,(PAGE+2*4).l		; page[2]: resident U M CM=copyback G
++	; page[3], page[4], page[5], ptr[1] stay invalid for tests 2-5
++
++; the physical pages carry a pattern to see what a read returns
++	move.l	#$11111111,(PHYS).l
++	move.l	#$22222222,(PHYS+$494).l
++	move.l	#$33333333,(PHYS+$2494).l
++	move.l	#$44444444,(PHYS+$4494).l
++	move.l	#$55555555,(PHYS+$6494).l
++
++; enable: SRP (and URP), TC = E + 8K pages, as the kernel does
++	move.l	#ROOT,d0
++	movec	d0,srp
++	movec	d0,urp
++	pflusha
++	move.l	#$C000,d0
++	movec	d0,tc
++
++;------------------------------------------------- 1 the valid mapping
++	move.l	(VA).l,d0
++	chkl	d0,$22222222,1			; read through the mapping
++	move.l	#$600D0001,(VA).l		; the write that looped on the board
++	move.l	(PHYS+$494).l,d0
++	chkl	d0,$600D0001,2			; reached the physical page
++	move.l	(cnt_aerr).l,d0
++	chkl	d0,0,3				; and no fault
++
++;------------------------------------------------- 2 fault, fix, PFLUSHAN, retry
++	move.l	#PAGE+3*4,(fix_addr).l
++	move.l	#PHYS+$2000+$439,(fix_val).l
++	move.l	#$600D0002,(VA3).l
++	move.l	(cnt_aerr).l,d0
++	chkl	d0,1,4				; exactly one fault
++	move.l	(PHYS+$2494).l,d0
++	chkl	d0,$600D0002,5			; the retried write landed
++	move.l	(VA3).l,d0
++	chkl	d0,$600D0002,6
++
++;------------------------------------------------- 3 the same with PFLUSHA
++	move.l	#1,(flush_mode).l
++	move.l	#PAGE+4*4,(fix_addr).l
++	move.l	#PHYS+$4000+$439,(fix_val).l
++	move.l	#$600D0003,(VA4).l
++	move.l	(cnt_aerr).l,d0
++	chkl	d0,2,7
++	move.l	(PHYS+$4494).l,d0
++	chkl	d0,$600D0003,8
++	clr.l	(flush_mode).l
++
++;------------------------------------------------- 4 a clean cached copy of the descriptor first
++	move.l	(PAGE+5*4).l,d0			; read it (invalid, 0): the line is now cached
++	chkl	d0,0,9
++	cpusha	dc				; and clean in the cache, current in memory
++	move.l	#PAGE+5*4,(fix_addr).l
++	move.l	#PHYS+$6000+$439,(fix_val).l
++	move.l	#$600D0004,(VA6).l
++	move.l	(cnt_aerr).l,d0
++	chkl	d0,3,10
++	move.l	(PHYS+$6494).l,d0
++	chkl	d0,$600D0004,11
++
++;------------------------------------------------- 5 a pointer descriptor made valid by the handler
++	move.l	#PHYS+$439,(PAGE2+2*4).l	; page2[2] valid already (maps VA5 to PHYS)
++	move.l	#PTR+1*4,(fix_addr).l		; ptr[1] -> PAGE2, written by the handler
++	move.l	#PAGE2+$A,(fix_val).l
++	move.l	#$600D0005,(VA5).l
++	move.l	(cnt_aerr).l,d0
++	chkl	d0,4,12
++	move.l	(PHYS+$494).l,d0
++	chkl	d0,$600D0005,13
++
++	bsr	nocache				; the bench registers: not through the copyback TTR
++	move.w	#$600D,(DONEREG).l
++	bra.s	*
++
++; DTT0 to supervisor noncachable, so the result writes reach the bench
++nocache:
++	move.l	#$0000A040,d0
++	movec	d0,dtt0
++	cpusha	dc
++	rts
++
++; access error: format 7 vector 2, an ATC fault; make the descriptor at
++; fix_addr valid (a cached store, as the kernel's), flush, restart
++h_aerr:
++	cmpi.w	#$7008,6(sp)
++	bne	hfail
++	movem.l	d0/a0,-(sp)
++	move.w	$14(sp),(last_ssw).l		; SSW (frame +$C, after movem +8)
++	move.l	$1C(sp),(last_fa).l		; FA  (frame +$14)
++	move.w	$14(sp),d0
++	and.w	#$0400,d0			; must be an ATC fault
++	beq	hfail
++	movea.l	(fix_addr).l,a0
++	move.l	(fix_val).l,(a0)
++	tst.l	(flush_mode).l
++	bne.s	.pa
++	pflushan
++	bra.s	.done
++.pa:	pflusha
++.done:	addq.l	#1,(cnt_aerr).l
++	move.l	(cnt_aerr).l,d0
++	cmp.l	#8,d0				; a loop: more faults than the tests take
++	bhi	hfail
++	movem.l	(sp)+,d0/a0
++	rte
++
++hfail:	failt	99
++unexp:	failt	98
++
++fail_all:
++	bsr	nocache
++	move.w	d7,(FAILREG).l
++	move.w	#$BAD,(DONEREG).l
++	bra.s	*
+diff -ruN a/tb/run_tests.sh b/tb/run_tests.sh
+--- a/tb/run_tests.sh	2026-10-18 23:02:29.000000000 -0400
++++ b/tb/run_tests.sh	2026-10-19 01:34:36.364241958 -0400
+@@ -6,7 +6,7 @@
+ # JOBS=<n> simulations run in parallel (default: half the CPUs).
+ set -e
+ cd "$(dirname "$0")"
+-PROGS=${*:-"smoke t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume t_fpu_frame_class t_fpu_frame_snan t_fpu_frame_cmd t_snoop t_btb t_stld t_pins t_snstress t_eredir t_cbsplit t_cmodes t_loops t_early t_irq7 t_iplglitch t_snirq t_xnest t_halt t_cache2 t_fpexc"}
++PROGS=${*:-"smoke t_dbccfloor t_nx8k t_integer t_exceptions t_mmu t_cache t_atcprobe t_bitfield_cache t_bitfield_mmu t_movem_restart t_moves_fc t_fpu t_fpu_frames t_fpu_resume t_fpu_frame_class t_fpu_frame_snan t_fpu_frame_cmd t_snoop t_btb t_stld t_pins t_snstress t_eredir t_cbsplit t_cmodes t_loops t_early t_irq7 t_iplglitch t_snirq t_xnest t_halt t_cache2 t_fpexc"}
+ WORK=${WORK:-$(cd .. && pwd)/obj}; export WORK
+ JOBS=${JOBS:-$(( $(nproc) / 2 ))}
+ ./build_asm.sh $PROGS
+diff -ruN a/tb/tb_ap68040.sv b/tb/tb_ap68040.sv
+--- a/tb/tb_ap68040.sv	2026-10-18 23:02:29.000000000 -0400
++++ b/tb/tb_ap68040.sv	2026-10-18 23:37:26.031448355 -0400
+@@ -10,6 +10,9 @@
+ //   $F100 word  failing test number                                        //
+ //   $F102 word  $600D = all passed, anything else = failed                 //
+ //   $F108 word  cycle stamp (prints cycles since the previous stamp)       //
++//   $F10C word  the core's dbcc_floor input (0: off), see t_dbccfloor     //
++//   $F2EC long  (read) the bench's clock count, for programs that time    //
++//               themselves (t_dbccfloor)                                   //
+ //   $F110 word  interrupt level for IPL (0 releases)                       //
+ //   $F120       writes must carry FC=1 (MOVES/DFC check)                   //
+ //   $F130 word  DMA-style poke: memory $3500 = data, $3502 = 0             //
+@@ -103,6 +106,7 @@
+ logic        ta_n, tea_n, tci_n, tbi_n, avec_n;
+ logic        br_n, bb_n_o, bb_oe, rsto_n;
+ logic  [2:0] ipl_lvl;
++logic  [3:0] dbf_floor = 4'd0;   // the core's dbcc_floor input ($F10C)
+ // (the bits in ipl_lagm a clock late: ipl_old is the level a clock ago)
+ logic  [2:0] ipl_lagm, ipl_lagm_def, ipl_old;
+ wire   [2:0] ipl_sk   = (ipl_lvl & ~ipl_lagm) | (ipl_old & ipl_lagm);
+@@ -167,7 +171,7 @@
+ `endif
+ ap68040 #(.FPU_PIPE(`AP_FPU_PIPE), .LOOP_PRED(`AP_LOOP_PRED), .EARLY_RES(`AP_EARLY_RES),
+           .SKID(`AP_SKID), .DC1_ATC(`AP_DC1_ATC)) dut (
+-	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n),
++	.clk(clk), .bclk_en(bclk_en), .rsti_n(rsti_n), .dbcc_floor(dbf_floor),
+ 	.a_o(a_o), .a_oe(a_oe),
+ 	.a_i(bus_a), .ts_n_i(am_drive ? am_ts_n : 1'b1), .rw_n_i(bus_rw_n), .siz_i(bus_siz),
+ 	.tt_i(bus_tt), .sc(am_drive ? am_sc : 2'd0),
+@@ -611,6 +615,8 @@
+ 		mem.mem[16'hF2E4 >> 2] <= mem.mem[16'hF2E4 >> 2] + 32'd1;
+ 	// the core's options, for the programs that check what they do
+ 	mem.mem[16'hF2E8 >> 2] <= {31'd0, 1'(`AP_LOOP_PRED)};
++	// the clock count, for programs that time themselves (noncachable read)
++	mem.mem[16'hF2EC >> 2] <= cycles;
+ end
+ int          cap;
+ 
+@@ -856,6 +862,7 @@
+ 					stamp_prev <= cycles;
+ 					insn_prev  <= insns;
+ 				end
++				16'hF10C: dbf_floor <= w[3:0];
+ 				16'hF110: ipl_lvl <= w[2:0];
+ 				16'hF130: begin
+ 					mem.mem[16'h3500 >> 2] <= {w, 16'h0000};

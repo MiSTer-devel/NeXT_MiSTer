@@ -28,19 +28,23 @@ ROM=../reference/previous/src/Rev_2.5_v66.BIN
 WORK=build
 mkdir -p "$WORK"
 
-VFLAGS="--binary --timing -j 4 -O3 -Wno-fatal"
+VFLAGS="--binary --timing -j 4 -O3 -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY"
 DIAG_FLAGS=""
 if [ "${EXCEPTION_DIAG:-0}" = 1 ]; then
 	DIAG_FLAGS="-DNEXT_EXCEPTION_DIAG=1"
 	VFLAGS="$VFLAGS $DIAG_FLAGS"
 fi
 
-CPUSRC="$CPU/ap040_tg68k_compat.v $CPU/ap040_core.v $CPU/ap040_bus16_adapter.v $CPU/ap040_bus32_adapter.v \
-        $CPU/ap040_bus_timeout.v $CPU/ap040_regfile.v $CPU/ap040_alu.v \
-        $CPU/ap040_muldiv.v $CPU/ap040_mmu.v $CPU/ap040_cache.v $CPU/ap040_fpu.v \
-        $CPU/ap040_walker_cdc.v"
+# the AP68040 (rtl/ap68040/rtl/ap68040.qip has the same list for Quartus);
+# the generated tables under $CPU/gen are `included
+CPUSRC="$CPU/ap68040_pkg.sv $CPU/gen/ap68040_upkg.sv $CPU/ap68040_alu.sv $CPU/ap68040_alu_slow.sv \
+        $CPU/ap68040_muldiv.sv $CPU/ap68040_biu.sv $CPU/ap68040_ram.sv $CPU/ap68040_atc.sv \
+        $CPU/ap68040_dmu.sv $CPU/ap68040_predec.sv $CPU/ap68040_fetch.sv $CPU/ap68040_decode.sv \
+        $CPU/ap68040_useq.sv $CPU/fpu/ap040_fpu.v $CPU/ap68040_fpif.sv $CPU/ap68040_backend.sv \
+        $CPU/ap68040_snoop.sv $CPU/ap68040.sv"
+CPUINC="-I$CPU -I$CPU/fpu"
 
-NEXTSRC="$RTL/next_system.sv $RTL/next_scr.sv $RTL/next_intc.sv \
+NEXTSRC="$RTL/next_system.sv $RTL/next_cpu040.sv $RTL/next_scr.sv $RTL/next_intc.sv \
          $RTL/next_timer.sv $RTL/next_video.sv $RTL/next_vram.sv \
          $RTL/next_rom.sv $RTL/next_bmap.sv $RTL/next_dma_stub.sv \
          $RTL/next_scc.sv $RTL/next_scsi.sv $RTL/next_cd_audio.sv $RTL/next_enet_dma.sv \
@@ -98,8 +102,8 @@ vbuild tb_next_printer   tb_next_printer.sv $RTL/next_printer.sv
 vbuild tb_next_kbd       tb_next_kbd.sv $RTL/next_kms_snd.sv
 vbuild tb_next_hardclock tb_next_hardclock.sv $RTL/next_timer.sv $RTL/next_intc.sv
 vbuild tb_next_video     tb_next_video.sv $RTL/next_video.sv $RTL/next_vram.sv $RTL/dpram.v
-vbuild tb_next_boot      -I"$CPU" tb_next_boot.sv $NEXTSRC $CPUSRC $HOSTSRC $HOSTINC
-vbuild tb_next_recording -I"$CPU" tb_next_recording.sv $NEXTSRC $CPUSRC
+vbuild tb_next_boot      $CPUINC tb_next_boot.sv $NEXTSRC $CPUSRC $HOSTSRC $HOSTINC
+vbuild tb_next_recording $CPUINC tb_next_recording.sv $NEXTSRC $CPUSRC
 
 # The emu top is only ever compiled by Quartus, so a duplicate
 # declaration or a mistyped port there costs a forty minute build to
@@ -109,6 +113,12 @@ echo "== checking the OSD image slots =="
 python3 check_osd.py || exit 1
 
 echo "== linting the emu top =="
+fail=0
+# NeXT.sv includes build_id.v, which only Quartus's pre-flow script
+# (sys/build_id.tcl) writes, in the same format as here.  A fresh checkout
+# has none, so the lint gets a stand-in from the build directory; -I.. is
+# searched first, so a real one from a compile still wins.
+printf '`define BUILD_DATE "%s"' "$(date +%y%m%d)" > "$WORK/build_id.v"
 # The boot bench instantiates next_system directly, so a narrowed port in the
 # emu top's instance is invisible to it (2026-09-25: sd_buff_addr[8:0] wrapped
 # every multi-block transfer on hardware while every bench passed).
@@ -116,9 +126,8 @@ if ! grep -q "\.sd_buff_addr(sd_buff_addr\[12:0\])" ../NeXT.sv; then
 	echo "*** NeXT.sv must connect sd_buff_addr[12:0] to next_system (multi-block transfers)"
 	fail=1
 fi
-fail=0
 verilator --lint-only -Wno-fatal $DIAG_FLAGS \
-	-I.. -I../sys --top-module emu ../NeXT.sv $NEXTSRC \
+	-I.. -I../sys -I"$WORK" --top-module emu ../NeXT.sv $NEXTSRC \
 	> "$WORK/vl_emu_lint.log" 2>&1 || true
 if grep -E "^%Error" "$WORK/vl_emu_lint.log" \
      | grep -vE "MODMISSING|Exiting due to" | grep -q .; then

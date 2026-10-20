@@ -9,10 +9,6 @@ Testbenches (Icarus Verilog -g2012 and ModelSim, see run_tests.sh):
   tb_ap040_bus16_gap.v  split-transfer integration: models the RAM/cache
                         controllers' held acknowledge and requires a sampled
                         IDLE boundary between accepted 16-bit subcycles
-  tb_ap040_cache_snoop.v cache/DMA collision coverage, retained-line fills,
-                        and write-through store hits: byte/word/long merges
-                        update only the matching resident way after memory
-                        acknowledge, while a fault leaves cached data intact
   tb_sdram_turbo.v     full t_fpu through cpu_wrapper, cpu_cache_new and
                         sdram_ctrl at the board's phase-locked 28/114 MHz
                         ratio, including periodic chipset DMA contention
@@ -49,6 +45,10 @@ Testbenches (Icarus Verilog -g2012 and ModelSim, see run_tests.sh):
                         (format $7) fault-fix-restart for write protection,
                         invalid data page, instruction fetch, and user access
                         to a supervisor page
+    asm/t_bitfield_mmu.s memory-bitfield access sizing at an 8K page boundary:
+                        user-mode WindowServer BFTST regression, spans 1-5,
+                        signed dynamic offsets, extraction/CCR and modified
+                        memory, plus genuine crossing faults and restart
     asm/t_cache.s       milestone G caches: CACR enables, I-cache staleness
                         with self-modifying code and CINV recovery, D-cache
                         staleness against DMA-style pokes and CINV recovery,
@@ -65,40 +65,6 @@ Testbenches (Icarus Verilog -g2012 and ModelSim, see run_tests.sh):
                         USP, privilege violation, autovectored interrupts,
                         IPL masking, STOP wake-up, NMI edge behavior, and the
                         M-bit master/interrupt stack throwaway frame path
-    asm/t_bitfield_mmu.s memory-bitfield access sizing at an 8K page boundary:
-                        user-mode WindowServer BFTST regression, spans 1-5,
-                        signed dynamic offsets, extraction/CCR and modified
-                        memory, plus genuine crossing faults and restart
-                        (Adam Polkosnik, 2026-09-13)
-    asm/t_bitfield_cache.s one bitfield sweep run uncached, cached, and cached
-                        with an identity mapping and TC enabled, the uncached
-                        pass being its own oracle (Adam Polkosnik, 2026-09-14)
-    asm/t_moves_fc.s    MOVES selects SFC/DFC space even when the transfer
-                        issues in the calling cycle: page 9 is mapped
-                        supervisor-only, so a user-space MOVES must fault and
-                        a supervisor-space one must not, cache-hot (Adam
-                        Polkosnik, 2026-09-14; passes here because the
-                        memory-issue arm never early-issues from S_MOVES_*)
-    asm/t_movem_restart.s format-7 CM/saved-EA continuation: MOVEM faults
-                        with indexed and PC-relative EAs, including one that
-                        overwrites its own memory-indirect pointer and one
-                        that loads its own index register, in every bus
-                        phase (Adam Polkosnik, 2026-09-15)
-    asm/t_atcprobe.s    failed table searches install valid nonresident ATC
-                        entries: invalid pages, PTEST invalid/bus-error
-                        fills, protection caching, separate I/D banks, 8K
-                        pages, PTEST replacement (Adam Polkosnik, 2026-09-15)
-    asm/t_fpu_frames.s  FSAVE/FRESTORE wire formats for the revision-$41
-                        NULL/IDLE/UNIMP/BUSY frames, pointer adjustments,
-                        round trips and invalid-frame rejection (Adam
-                        Polkosnik, 2026-09-15; the $40 variant needs -DREV40
-                        and a tb FPU_REVISION parameter this tree does not
-                        carry)
-    asm/t_fpu_resume.s  FPSP-prepared BUSY frames with CU_SAVEPC=$fe: the
-                        FRESTORE executes the frame's command on ETEMP and
-                        FPTEMP, not the live registers, with the extended
-                        exponent flags read per Motorola (Adam Polkosnik,
-                        2026-09-15)
 
   diff/               differential testing against qemu-system-m68k:
                         random integer programs (10k+ instructions across
@@ -171,13 +137,11 @@ Implementation status and remaining gaps (milestones B-H complete):
     original EA. RTE consumes CM/EA for indexed and PC-relative restart.
     WB3 validity stays clear because the restart model repeats the store.
     t_mmu.s and t_movem_restart.s cover fault/restart and frame handling
-  - caches are write-through, so CPUSH equals CINV and no copyback/push state
-    exists. Aligned cacheable store hits update only their matching resident
-    data-cache word after the external write acknowledges; complex and
-    cache-inhibited stores invalidate their touched sets. CINV/CPUSH invalidate
-    the whole selected cache regardless of scope (architecturally safe);
-    misaligned and line-crossing reads bypass the caches; the I-cache is not
-    snooped by CPU writes (real 68040 behavior: software must CINV)
+  - caches are write-through with invalidate-on-write, so CPUSH equals
+    CINV and no copyback/push state exists; CINV/CPUSH invalidate the
+    whole selected cache regardless of scope (architecturally safe);
+    misaligned and line-crossing reads bypass the caches; the I-cache is
+    not snooped by CPU writes (real 68040 behavior: software must CINV)
   - the Minimig build sets AP040_ENABLE_CACHE=0 in cpu_wrapper.v: the
     internal caches are compiled out (CINV/CPUSH complete immediately,
     which is a valid 68040 whose caches never fill) and cpu_cache_new in
@@ -436,7 +400,9 @@ Fixed (t_mmu 48-59 plus updated 19/38/39, each negative-control proven):
     writeback and RTEs will see the write repeated by the restart --
     the same behaviour WinUAE produces.
 
-Documented deviations (unchanged, deliberately):
+Historical deviations recorded in this audit (superseded in the current
+working tree: failed-search caching and MOVEM CM/EA are now implemented;
+WB3 validity above is now deliberately clear under the restart model):
   - Invalid translations are NOT cached in the ATC.  Real 040 silicon
     caches the invalid entry and requires the handler to PFLUSH; this
     implementation re-walks instead, which is strictly more forgiving
@@ -644,20 +610,3 @@ write.  These are instances of the v20 omitted-memory-transition defect
 described in `diff/README`, not evidence for an RTL unary-rounding or
 underflow change.  The failures remain visible; the harness does not xfail or
 mask them.
-
-Instruction branch-refill buffer (2026-09-02)
-----------------------------------------------
-A one-sector instruction refill buffer now keeps completed fetch words across
-ordinary control-flow redirects and seeds the prefetch queue when all four
-words beginning at the new PC are present.  The complete-window requirement
-keeps partial prefixes off the redirect path.  Exceptions and all other
-architectural prefetch flushes invalidate the sector; a branch redirect alone
-does not.
-
-The complete directed suite passes, including reset/double-fault, walker CDC,
-16-bit bus gaps and timeouts, cache/snoop, integer, exception, MMU, cache, and
-FPU tests.  Wombat's first 100 SingleStepTests CPU rows compare 1,696
-architectural field groups with zero real differences.  `bench_loop` improves
-from 326,674 to 289,956 clocks (11.24 percent), while the phase-0 result is
-289,178 clocks.  A timing-clean Cyclone V integration at placement seed 24
-also booted Mac OS 7.5.5 and completed every Speedometer 3.23 PR category.

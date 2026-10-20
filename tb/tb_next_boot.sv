@@ -32,9 +32,21 @@ import "DPI-C" function int  host_mount_cd(input string path);
 import "DPI-C" function int  host_mount_disk(input int slot, input longint bytes);
 
 reg clk = 0;
+reg clk_cpu = 0;
 reg reset = 1;
 
-always #5 clk = ~clk;   // 100 MHz
+// the bus (system) clock and the CPU's clock: two per bus clock, edge
+// aligned, as the PLL makes them (the simulation rate is immaterial; the
+// bench counts bus clocks as $time/10).  One process makes both edges in
+// the same time step and the same active region, so a flop of either
+// domain sees the other domain's pre-edge values, as in hardware; two
+// independent always #delay clocks would be ordered arbitrarily by the
+// simulator and the slow domain could see the fast domain's updated
+// flops (the "bus clock enable" check below would catch that).
+initial forever begin
+	#2.5 clk_cpu = 1; clk = ~clk;
+	#2.5 clk_cpu = 0;
+end
 
 // ram port
 wire        ram_req, ram_we;
@@ -62,48 +74,37 @@ localparam DEBUG_EXCEPTIONS = 0;
 wire dbg_exception_valid;
 wire [511:0] dbg_exception;
 
-// exactly the FPGA parameterization: virtual microsecond of 25 clocks,
-// DBcc period floor of 4 enabled clocks, no pacing (the physical
-// simulation clock rate is immaterial, the clock ratios are what the
-// ROM's calibration checks measure).  -DNEXT_TB_CLK_HZ=, -DNEXT_TB_DBCC_FLOOR=
-// and -DNEXT_TB_PACE_DEN= override the three for experiments (the old
-// configuration is FLOOR 0, DEN 2).
+// exactly the FPGA parameterization: virtual microsecond of 28 bus clocks,
+// DBcc period floor of 9 CPU clocks (the physical simulation clock rate
+// is immaterial, the clock ratios are what the ROM's calibration checks
+// measure).  -DNEXT_TB_CLK_HZ= and -DNEXT_TB_DBCC_FLOOR= override the two
+// for experiments.
 `ifdef NEXT_PROFILE
 // bench-side cycle accounting (tb/next_profile_monitor.sv), -DNEXT_PROFILE
 next_profile_monitor prof();
 `endif
 
 next_system #(
-	`ifdef NEXT_TB_CLK_HZ
+`ifdef NEXT_TB_CLK_HZ
 	.CLK_HZ(`NEXT_TB_CLK_HZ),
 `else
-	.CLK_HZ(25000000),
+	.CLK_HZ(28000000),
 `endif
 `ifdef NEXT_TB_DBCC_FLOOR
 	.DBCC_FLOOR(`NEXT_TB_DBCC_FLOOR),
 `else
-	.DBCC_FLOOR(4),
+	.DBCC_FLOOR(9),
 `endif
-	.CPU_PACE_NUM(1),
 `ifdef NEXT_TB_SND_IN
 	.SND_IN_EN(`NEXT_TB_SND_IN),
 `endif
-`ifdef NEXT_TB_PACE_DEN
-	.CPU_PACE_DEN(`NEXT_TB_PACE_DEN),
-`else
-	.CPU_PACE_DEN(1),
-`endif
 	.ROM_INIT_EN(1),
 	.ROM_INIT("build/rom.hex"),
-	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS),
-`ifdef NEXT_POST_STORES
-	.POST_STORES(`NEXT_POST_STORES)
-`else
-	.POST_STORES(0)
-`endif
+	.DEBUG_EXCEPTIONS(DEBUG_EXCEPTIONS)
 ) dut
 (
 	.clk(clk),
+	.clk_cpu(clk_cpu),
 	.clk_vid(clk),   // both domains on one clock in simulation
 	.reset(reset),
 		.ps2_key(ps2),
@@ -496,7 +497,30 @@ initial trace_post_delay = $test$plusargs("postdelaytrace");
 
 // POST sub-test tracing: entry PCs and the return-value check PCs of
 // the system test master at 0x469c (see ROMV66 listing), logging D0
-wire [31:0] dbg_d0 = dut.cpu.core.regfile.dbg_d0;
+// The CPU as the bench sees it (rtl/ap68040): an instruction retires when
+// its last uop commits in WB (cpu_retire, with its PC cpu_rpc; dbg_pc is
+// the PC of whatever uop is in WB), the SR, a shadow of the register file
+// kept from the back end's two write ports (D0-D7 0-7, A0-A6 8-14, USP
+// 15, ISP 16, MSP 17), and the exception entries (x_go with the vector).
+// All of it lives on the CPU's clock: a WB stage holds a uop for one CPU
+// clock, so anything keyed on a PC must be sampled there, not on clk.
+wire        cpu_retire = dut.cpu.be.wb_bound;
+wire [31:0] cpu_rpc    = dut.cpu.be.wb_u.pc;
+wire [15:0] cpu_sr     = dut.cpu.sr;
+reg  [31:0] cpu_reg [0:31];
+integer     cpu_reg_i;
+initial for (cpu_reg_i = 0; cpu_reg_i < 32; cpu_reg_i = cpu_reg_i + 1) cpu_reg[cpu_reg_i] = 0;
+always @(posedge clk_cpu) begin
+	if (dut.cpu.be.bwe[0]) cpu_reg[dut.cpu.be.bwa[0]] <= dut.cpu.be.bwd[0];
+	if (dut.cpu.be.bwe[1]) cpu_reg[dut.cpu.be.bwa[1]] <= dut.cpu.be.bwd[1];
+end
+wire [31:0] dbg_d0 = cpu_reg[0];
+wire [31:0] cpu_a7 = cpu_sr[13] ? (cpu_sr[12] ? cpu_reg[17] : cpu_reg[16]) : cpu_reg[15];
+// bclk_en must mark exactly the CPU clocks that end on a bus clock edge:
+// seen from a bus clock edge it is always high (bclk_bad counts the
+// edges where it is not)
+integer bclk_bad = 0;
+always @(posedge clk) if (!reset && !dut.bclk_en) bclk_bad = bclk_bad + 1;
 task post_trace;
 	input [31:0] pc;
 	begin
@@ -581,31 +605,28 @@ always @(posedge clk) begin
 		         dut.enet.rx_len, dut.enet.rx_pos, dut.enet.tx_next, dut.enet.rx_next);
 end
 
-// PC trace ring buffer
+// PC trace ring buffer: the last 64 retired instructions
 reg [31:0] pc_ring [0:63];
 integer pc_ring_n = 0;
-reg [31:0] pc_prev = 0;
-always @(posedge clk) begin
-	if (dbg_pc != pc_prev) begin
-		pc_prev <= dbg_pc;
-		pc_ring[pc_ring_n % 64] <= dbg_pc;
+always @(posedge clk_cpu) begin
+	if (!reset && cpu_retire) begin
+		pc_ring[pc_ring_n % 64] <= cpu_rpc;
 		pc_ring_n = pc_ring_n + 1;
-		post_trace(dbg_pc);
-		// TEMP loop timing probe: PCs seen inside the ROM's delay() body
+		post_trace(cpu_rpc);
 	end
 	// +loopdump: time every looped call of the ROM's delay(n) (entry
-	// $010024CC, rts $010024FC; n is the longword read off the stack on
-	// entry), to recalibrate CLK_HZ/CPU_PACE for a CPU whose cached DBF
-	// speed changed.  The delay() entry watchpoint above does not fire
-	// on every core (the front end need not present that PC), this does.
-	if ($test$plusargs("loopdump")) begin
-		if (dbg_pc == 32'h010024cc && loop_t0 == 0) begin loop_t0 = $time; loop_n = 0; loop_nw = 0; end
-		if (loop_t0 != 0 && mem_ready && !is_write && loop_nw < 1) begin
-			loop_n = cpu_din; loop_nw = loop_nw + 1;
+	// $010024CC, its dbf $010024F0, rts $010024FC): the iterations are
+	// D0 + 1 at the first dbf, the clocks run to the rts, so clocks per
+	// iteration is what the DBcc floor must hold at 9 (CPU clocks) for
+	// the ROM's calibration.
+	if ($test$plusargs("loopdump") && cpu_retire) begin
+		if (cpu_rpc == 32'h010024cc && loop_t0 == 0) begin loop_t0 = $time; loop_n = 0; loop_nw = 0; end
+		if (loop_t0 != 0 && cpu_rpc == 32'h010024f0 && loop_nw < 1) begin
+			loop_n = dbg_d0 + 1; loop_nw = loop_nw + 1;
 		end
-		if (dbg_pc == 32'h010024fc && loop_t0 != 0) begin
-			if (($time - loop_t0) / 10 > 40)   // n <= 3 returns before the loop
-				$display("[%0t] LOOP n=%0d clocks=%0d", $time, loop_n, ($time - loop_t0) / 10);
+		if (cpu_rpc == 32'h010024fc && loop_t0 != 0) begin
+			if (($time - loop_t0) / 5 > 40)   // n <= 3 returns before the loop
+				$display("[%0t] LOOP iterations=%0d cpu_clocks=%0d", $time, loop_n, ($time - loop_t0) / 5);
 			loop_t0 = 0;
 		end
 	end
@@ -712,12 +733,14 @@ initial begin
 	panic_trace = $test$plusargs("panictrace");
 	if ($value$plusargs("wildpc=%h", wildpc_target)) ;
 end
-wire wild_pc = dbg_pc == wildpc_target && dut.cpu.core.sr[13];
-always @(posedge clk) if (!reset && saw_kernel && wild_pc && !wildpc_seen) begin
+wire wild_pc = cpu_retire && cpu_rpc == wildpc_target && cpu_sr[13];
+always @(posedge clk_cpu) if (!reset && saw_kernel && wild_pc && !wildpc_seen) begin
 	wildpc_seen <= 1;
-	wildpc_val  <= dbg_pc;
-	$display("[%0t] WILDPC: supervisor PC reached panic target %08x", $time, dbg_pc);
+	wildpc_val  <= cpu_rpc;
+	$display("[%0t] WILDPC: supervisor PC reached panic target %08x  A2=%08x A3=%08x", $time, cpu_rpc, cpu_reg[10], cpu_reg[11]);
 	dump_panic_trace;
+	if (memring_en) dump_memring;
+	if (dump_en) dump_files;
 	if (wildpc_halt) halt_run <= 1;
 end
 
@@ -733,11 +756,12 @@ always @(posedge clk) if (!reset && guard_armed) begin : guard_watch
 			      (dut.dma_grant == 2'd2) ? 3'd4 :   // SND
 			                                3'd5;    // SCSI
 		end
-		else who = dut.walker_busy ? 3'd1 : 3'd0;    // MMU walker vs CPU
-		// keep a rolling history of CPU stores to RAM (the suspect master)
+		else who = 3'd0;                       // the CPU (table walks included)
+		// keep a rolling history of CPU stores to RAM (the suspect master);
+		// the 68040 bus carries physical addresses only
 		if (who == 3'd0) begin
 			cwr_pa[cwr_n % 64]   <= gaddr;
-			cwr_va[cwr_n % 64]   <= dut.cpu.mmu_addr_log;
+			cwr_va[cwr_n % 64]   <= gaddr;
 			cwr_data[cwr_n % 64] <= dut.ram_din;
 			cwr_pc[cwr_n % 64]   <= dbg_pc;
 			cwr_n = cwr_n + 1;
@@ -748,70 +772,306 @@ always @(posedge clk) if (!reset && guard_armed) begin : guard_watch
 				guard_data[guard_hits] <= dut.ram_din;
 				guard_pc[guard_hits]   <= dbg_pc;
 				guard_who[guard_hits]  <= who;
-				guard_va[guard_hits]   <= dut.cpu.mmu_addr_log;
-				guard_pa[guard_hits]   <= dut.cpu.mmu_addr_phys;
+				guard_va[guard_hits]   <= gaddr;
+				guard_pa[guard_hits]   <= gaddr;
 			end
-			$display("[%0t] GUARD: watched write addr=%08x data=%08x master=%0d pc=%08x va=%08x pa=%08x",
-			         $time, gaddr, dut.ram_din, who, dbg_pc,
-			         dut.cpu.mmu_addr_log, dut.cpu.mmu_addr_phys);
+			$display("[%0t] GUARD: watched write addr=%08x data=%08x master=%0d pc=%08x",
+			         $time, gaddr, dut.ram_din, who, dbg_pc);
 			guard_hits = guard_hits + 1;
 			if (guard_halt) halt_run <= 1;
 		end
 	end
 end
 
-// Include cache hits and bypassed reads: the bus-only history misses a stale
-// cached return address.  Record what the CPU consumed before the bad jump.
-reg [31:0] ptr_pc [0:63], ptr_va [0:63], ptr_pa [0:63], ptr_data [0:63];
-reg [15:0] ptr_ir [0:63];
-reg [7:0] ptr_state [0:63];
-reg [3:0] ptr_kind [0:63]; // write, instruction, size[1:0]
+// +memring: the core's last 4096 memory operations as the execute stage
+// sees them (PC, effective address, size, load value or store data),
+// armed at the kernel entry, dumped when the wild PC is reached (point
+// +wildpc at the kernel's panic() to catch a panic): every entry within
+// 64 bytes of the address in +memwatch=<hex> (default: A2 at the halt,
+// the kernel's vm_fault keeps its vm_page there), then the last 48.
+reg        memring_en = 0;
+reg [31:0] memwatch = 0;
+initial begin
+	memring_en = $test$plusargs("memring");
+	if (!$value$plusargs("memwatch=%h", memwatch)) memwatch = 0;
+end
+reg [31:0] mr_pc [0:4095], mr_ea [0:4095], mr_v [0:4095];
+reg  [3:0] mr_k  [0:4095];      // {store, rmw, msz[1:0]}
+longint    mr_t  [0:4095];
+integer    mr_n = 0;
+always @(posedge clk_cpu) if (!reset && memring_en && saw_kernel && !wildpc_seen &&
+                             dut.cpu.be.adv_ex && dut.cpu.be.ex_u.mem != 2'd0) begin
+	mr_pc[mr_n % 4096] <= dut.cpu.be.ex_u.pc;
+	mr_ea[mr_n % 4096] <= dut.cpu.be.ex_ea;
+	mr_v [mr_n % 4096] <= (dut.cpu.be.ex_u.mem == 2'd1) ? dut.cpu.be.ex_ld : dut.cpu.be.ex_st;
+	mr_k [mr_n % 4096] <= {dut.cpu.be.ex_u.mem != 2'd1, dut.cpu.be.ex_u.mem == 2'd3, dut.cpu.be.ex_u.msz};
+	mr_t [mr_n % 4096] <= $time / 5;
+	mr_n = mr_n + 1;
+end
+// +snoopdirty: every DMA-write snoop that finds the line DIRTY in the CPU's
+// data cache (the bridge snoops with SC 10, invalidate: the CPU's dirty
+// bytes of that line are discarded), with the DMA master and address
+integer snoop_dirty_n = 0, snoop_hit_n = 0, snoop_n = 0;
+reg     snoopdirty_en = 0;
+initial snoopdirty_en = $test$plusargs("snoopdirty");
+always @(posedge clk_cpu) if (!reset && dut.cpu.sn_look) begin
+	snoop_n = snoop_n + 1;
+	if (dut.cpu.sn_hit) snoop_hit_n = snoop_hit_n + 1;
+	if (dut.cpu.sn_hit && dut.cpu.sn_dirty && !dut.cpu.snoop.s_rd) begin
+		snoop_dirty_n = snoop_dirty_n + 1;
+		if (snoopdirty_en && snoop_dirty_n <= 2000)
+			$display("[%0t] SNOOP-DIRTY #%0d pa=%08x grant=%0d pc=%08x (snoops %0d, hits %0d)", $time, snoop_dirty_n,
+			         dut.cpu.sn_pa, dut.dma_grant, cpu_rpc, snoop_n, snoop_hit_n);
+	end
+end
+
+// +linewatch=<hex address>: from the kernel entry, everything that touches
+// that 16-byte line: the core's memory operations on it (execute stage,
+// virtual address; the kernel's own memory is mapped 1:1), the bus beats
+// and DMA writes to it, and every change in the data cache's four ways of
+// its set (tag, valid, dirty, the four long words)
+reg [31:0] lw_a = 0;
+reg        lw_en = 0;
+initial lw_en = $value$plusargs("linewatch=%h", lw_a);
+wire [5:0]  lw_set = lw_a[9:4];
+wire [21:0] lw_tag = lw_a[31:10];
+reg  [21:0] lw_ptag [0:3];
+reg   [1:0] lw_pvd  [0:3];
+reg [127:0] lw_pdat [0:3];
+integer lw_i;
+always @(posedge clk_cpu) if (!reset && lw_en && saw_kernel && !wildpc_seen) begin : linewatch
+	reg [21:0] t; reg [1:0] vd; reg [127:0] dt; reg [7:0] w;
+	if (dut.cpu.be.adv_ex && dut.cpu.be.ex_u.mem != 2'd0 && dut.cpu.be.ex_ea[31:4] == lw_a[31:4])
+		$display("[%0t] LW cpu pc=%08x %s sz=%0d ea=%08x v=%08x", $time, dut.cpu.be.ex_u.pc,
+		         dut.cpu.be.ex_u.mem == 2'd1 ? "LD" : dut.cpu.be.ex_u.mem == 2'd3 ? "RMW" : "ST",
+		         dut.cpu.be.ex_u.msz, dut.cpu.be.ex_ea,
+		         dut.cpu.be.ex_u.mem == 2'd1 ? dut.cpu.be.ex_ld : dut.cpu.be.ex_st);
+	w = dut.cpu.dmu.lsw[lw_set];
+	for (lw_i = 0; lw_i < 4; lw_i = lw_i + 1) begin
+		case (lw_i)
+			0: begin t = dut.cpu.dmu.g_way[0].tag.mem[lw_set];
+			   dt = {dut.cpu.dmu.g_way[0].dat.g_sl[0].sl.mem[lw_set], dut.cpu.dmu.g_way[0].dat.g_sl[1].sl.mem[lw_set],
+			         dut.cpu.dmu.g_way[0].dat.g_sl[2].sl.mem[lw_set], dut.cpu.dmu.g_way[0].dat.g_sl[3].sl.mem[lw_set]}; end
+			1: begin t = dut.cpu.dmu.g_way[1].tag.mem[lw_set];
+			   dt = {dut.cpu.dmu.g_way[1].dat.g_sl[0].sl.mem[lw_set], dut.cpu.dmu.g_way[1].dat.g_sl[1].sl.mem[lw_set],
+			         dut.cpu.dmu.g_way[1].dat.g_sl[2].sl.mem[lw_set], dut.cpu.dmu.g_way[1].dat.g_sl[3].sl.mem[lw_set]}; end
+			2: begin t = dut.cpu.dmu.g_way[2].tag.mem[lw_set];
+			   dt = {dut.cpu.dmu.g_way[2].dat.g_sl[0].sl.mem[lw_set], dut.cpu.dmu.g_way[2].dat.g_sl[1].sl.mem[lw_set],
+			         dut.cpu.dmu.g_way[2].dat.g_sl[2].sl.mem[lw_set], dut.cpu.dmu.g_way[2].dat.g_sl[3].sl.mem[lw_set]}; end
+			default: begin t = dut.cpu.dmu.g_way[3].tag.mem[lw_set];
+			   dt = {dut.cpu.dmu.g_way[3].dat.g_sl[0].sl.mem[lw_set], dut.cpu.dmu.g_way[3].dat.g_sl[1].sl.mem[lw_set],
+			         dut.cpu.dmu.g_way[3].dat.g_sl[2].sl.mem[lw_set], dut.cpu.dmu.g_way[3].dat.g_sl[3].sl.mem[lw_set]}; end
+		endcase
+		vd = {w[4 + lw_i], w[lw_i]};
+		if ((t == lw_tag || lw_ptag[lw_i] == lw_tag) &&
+		    (t != lw_ptag[lw_i] || vd != lw_pvd[lw_i] || (t == lw_tag && dt != lw_pdat[lw_i])))
+			$display("[%0t] LW way%0d tag=%06x%s v=%0d d=%0d data=%032x  (e_st=%0d pc=%08x)", $time, lw_i, t,
+			         t == lw_tag ? "(match)" : "(other)", vd[0], vd[1], dt, dut.cpu.dmu.e_st, cpu_rpc);
+		lw_ptag[lw_i] = t; lw_pvd[lw_i] = vd; lw_pdat[lw_i] = dt;
+	end
+end
+always @(posedge clk) if (!reset && lw_en && saw_kernel && !wildpc_seen) begin
+	if (mem_ready && cpu_addr[31:4] == lw_a[31:4])
+		$display("[%0t] LW bus %s %08x be=%b data=%08x tm=%0d", $time, is_write ? "WR" : "RD", cpu_addr, cpu_be,
+		         is_write ? cpu_dout : cpu_din, dut.cpubus.xtm);
+	if (dut.ram_req && dut.ram_we && dut.ram_ack && dut.state == 3'd3 &&
+	    {6'b000001, dut.ram_addr, 2'b00} >> 4 == lw_a >> 4)
+		$display("[%0t] LW DMA WR %08x be=%b data=%08x grant=%0d", $time, {6'b000001, dut.ram_addr, 2'b00},
+		         dut.ram_be, dut.ram_din, dut.dma_grant);
+end
+
+// +pwin=<start>:<end> (clk_cpu cycles, the memory ring's t): every clock
+// in that window, the DMU's DC1/DC2 state -- the lookup set the RAMs are
+// reading, DC1's address, tags and valid bits as compared, the hit vector,
+// the stale/steal/snoop/engine holds, DC2's record and the fast-path data
+// (to see where a load took its value from)
+longint pw_s = 0, pw_e = 0;
+reg     pw_en = 0;
+initial begin
+	string pw;
+	if ($value$plusargs("pwin=%s", pw)) begin
+		pw_en = 1;
+		$sscanf(pw, "%d:%d", pw_s, pw_e);
+	end
+end
+always @(posedge clk_cpu) if (pw_en && ($time / 5) >= pw_s && ($time / 5) <= pw_e) begin
+	$display("[%0t] PW c=%0d be: ag=%b dc1=%b/%0d dc2=%b/%0d/%08x ex=%b/%0d wb=%b kill=%b | ag=%b req=%b va=%08x | dc1 adv=%b v=%b a=%08x mem=%0d stale=%b tp=%b hold=%b atc=%b set=%02x tq=%06x/%06x/%06x/%06x lvd=%b mj=%b x.hit=%b way=%0d pa=%08x ok=%b walk=%b | sn=%0d req=%b steal=%b/%b stset=%02x dw=%b/%02x/%0d/%0d twb=%b/%02x e_st=%0d job=%b bus=%b%b%b | dc2 adv=%b rdy=%b v=%b a=%08x hit=%b way=%0d pa=%08x fast=%b new=%b dq2=%016x fd=%08x e_done=%b ld=%08x | ex adv=%b pc=%08x rpc=%08x",
+	         $time, $time / 5,
+	         dut.cpu.be.ag_v, dut.cpu.be.dc1_v, dut.cpu.be.dc1_u.mem, dut.cpu.be.dc2_v, dut.cpu.be.dc2_u.mem, dut.cpu.be.dc2_u.pc,
+	         dut.cpu.be.ex_v, dut.cpu.be.ex_u.mem, dut.cpu.be.wb_v, dut.cpu.be.kill_now,
+	         dut.cpu.dmu.adv_ag, dut.cpu.dmu.dm_req, dut.cpu.dmu.dm_va,
+	         dut.cpu.dmu.adv_dc1, dut.cpu.dmu.m1.v, dut.cpu.dmu.m1.a, dut.cpu.dmu.m1.mem,
+	         dut.cpu.dmu.m1_stale, dut.cpu.dmu.m1_tp, dut.cpu.dmu.dm_hold1, dut.cpu.dmu.atc_hit,
+	         dut.cpu.dmu.g_way[0].la_set_n,
+	         dut.cpu.dmu.tq_r[0], dut.cpu.dmu.tq_r[1], dut.cpu.dmu.tq_r[2], dut.cpu.dmu.tq_r[3],
+	         dut.cpu.dmu.lvd_q, dut.cpu.dmu.d1_mj,
+	         dut.cpu.dmu.x_dc1.hit, dut.cpu.dmu.x_dc1.way, dut.cpu.dmu.x_dc1.pa, dut.cpu.dmu.x_dc1.ok, dut.cpu.dmu.x_dc1.walk,
+	         dut.cpu.dmu.sn_ph, dut.cpu.dmu.sn_req, dut.cpu.dmu.steal, dut.cpu.dmu.steal_q, dut.cpu.dmu.st_set,
+	         dut.cpu.dmu.dw, dut.cpu.dmu.dw_set, dut.cpu.dmu.dw_way, dut.cpu.dmu.dw_src,
+	         dut.cpu.dmu.tw_b, dut.cpu.dmu.tset_b, dut.cpu.dmu.e_st, dut.cpu.dmu.e_job,
+	         dut.cpu.dmu.b_req, dut.cpu.dmu.b_gnt, dut.cpu.dmu.b_done,
+	         dut.cpu.dmu.adv_dc2, dut.cpu.dmu.dc2_rdy, dut.cpu.dmu.m2.r.v, dut.cpu.dmu.m2.r.a, dut.cpu.dmu.m2.x.hit, dut.cpu.dmu.m2.x.way,
+	         dut.cpu.dmu.m2.x.pa, dut.cpu.dmu.m2.fast, dut.cpu.dmu.dq_new, dut.cpu.dmu.dq2, dut.cpu.dmu.fast_data,
+	         dut.cpu.dmu.e_dc2_done, dut.cpu.dmu.ldata,
+	         dut.cpu.be.adv_ex, dut.cpu.be.ex_u.pc, cpu_rpc);
+end
+
+// the DMU mirrors the back end's DC1 and DC2: a memory uop the back end
+// advances out of either stage must have its record there, else the DMU
+// answers "ready" for an empty DC2 (dc2_rdy = !m2.r.v) with whatever is on
+// its fast-path data bus
+integer dmu_lost = 0;
+always @(posedge clk_cpu) if (!reset && saw_kernel && !wildpc_seen) begin
+	if (dut.cpu.be.adv_dc1 && dut.cpu.be.dc1_u.mem != 2'd0 && dut.cpu.be.dc1_u.exc == 8'd0 && !dut.cpu.dmu.m1.v) begin
+		dmu_lost = dmu_lost + 1;
+		if (dmu_lost <= 50) $display("[%0t] DMU-LOST dc1: pc=%08x mem=%0d (back end advances DC1, DMU m1.v=0, m1.a=%08x)",
+		                             $time, dut.cpu.be.dc1_u.pc, dut.cpu.be.dc1_u.mem, dut.cpu.dmu.m1.a);
+	end
+	if (dut.cpu.be.adv_dc2 && dut.cpu.be.dc2_u.mem != 2'd0 && dut.cpu.be.dc2_u.exc == 8'd0 && !dut.cpu.dmu.m2.r.v) begin
+		dmu_lost = dmu_lost + 1;
+		if (dmu_lost <= 50) $display("[%0t] DMU-LOST dc2: pc=%08x mem=%0d ea=%08x ldata=%08x (back end advances DC2, DMU m2.r.v=0)",
+		                             $time, dut.cpu.be.dc2_u.pc, dut.cpu.be.dc2_u.mem, dut.cpu.be.dc2_ea, dut.cpu.dmu.ldata);
+	end
+end
+
+// +dumpdir=<dir>: at the panic trap, write <dir>/ram.bin (the 64 MB of
+// guest RAM as the bench memory holds it, big endian, lines still dirty in
+// the CPU's data cache NOT included), <dir>/memring.txt (the whole memory
+// ring), <dir>/walks.txt (the core's last 4096 table-walk descriptor
+// evaluations: VA, level, descriptor address and value, cache hit, and how
+// each walk ended) and <dir>/excs.txt (the last 4096 exceptions).
+reg [8*256-1:0] dumpdir;
+reg            dump_en = 0;
+initial dump_en = $value$plusargs("dumpdir=%s", dumpdir);
+// table walks: E_TW_EVAL is DMU state 42, E_TW_DONE 46 (ap68040_dmu.sv est_t)
+reg [31:0] tw_va_r [0:4095], tw_da_r [0:4095], tw_d_r [0:4095];
+reg  [7:0] tw_k_r  [0:4095];    // {done, fail, berr, hit, s, wr, lvl[1:0]}
+longint    tw_t_r  [0:4095];
+integer    tw_n = 0;
+always @(posedge clk_cpu) if (!reset && dump_en && saw_kernel && !wildpc_seen) begin
+	if (dut.cpu.dmu.e_st == 6'd42 || dut.cpu.dmu.e_st == 6'd46) begin
+		tw_va_r[tw_n % 4096] <= dut.cpu.dmu.tw_va;
+		tw_da_r[tw_n % 4096] <= dut.cpu.dmu.tw_da;
+		tw_d_r [tw_n % 4096] <= dut.cpu.dmu.tw_d;
+		tw_k_r [tw_n % 4096] <= {dut.cpu.dmu.e_st == 6'd46, dut.cpu.dmu.tw_fail, dut.cpu.dmu.tw_berr,
+		                         dut.cpu.dmu.tw_hhq, dut.cpu.dmu.tw_s, dut.cpu.dmu.tw_wr, 2'(dut.cpu.dmu.tw_lvl)};
+		tw_t_r [tw_n % 4096] <= $time / 5;
+		tw_n = tw_n + 1;
+	end
+end
+// exceptions
+reg [31:0] xe_pc [0:4095], xe_addr [0:4095], xe_rpc [0:4095];
+reg [15:0] xe_ssw [0:4095], xe_sr [0:4095];
+reg  [7:0] xe_vec [0:4095];
+longint    xe_t [0:4095];
+integer    xe_n = 0;
+always @(posedge clk_cpu) if (!reset && dump_en && saw_kernel && !wildpc_seen && dut.cpu.be.x_go) begin
+	xe_vec [xe_n % 4096] <= dut.cpu.be.x_vec;
+	xe_pc  [xe_n % 4096] <= dut.cpu.be.x_pc;
+	xe_addr[xe_n % 4096] <= dut.cpu.be.x_addr;
+	xe_ssw [xe_n % 4096] <= dut.cpu.be.x_ssw;
+	xe_sr  [xe_n % 4096] <= cpu_sr;
+	xe_rpc [xe_n % 4096] <= cpu_rpc;
+	xe_t   [xe_n % 4096] <= $time / 5;
+	xe_n = xe_n + 1;
+end
+task dump_files;
+	integer fd, i, j;
+	reg [31:0] w;
+	begin
+		fd = $fopen({dumpdir, "/ram.bin"}, "wb");
+		for (i = 0; i < 16777216; i = i + 1) begin
+			w = ram_mem[i];
+			$fwrite(fd, "%c%c%c%c", w[31:24], w[23:16], w[15:8], w[7:0]);
+		end
+		$fclose(fd);
+		fd = $fopen({dumpdir, "/memring.txt"}, "w");
+		for (i = (mr_n > 4096 ? mr_n - 4096 : 0); i < mr_n; i = i + 1)
+			$fwrite(fd, "t=%0d pc=%08x %s%s sz=%0d ea=%08x v=%08x\n", mr_t[i % 4096], mr_pc[i % 4096],
+			        mr_k[i % 4096][3] ? "ST" : "LD", mr_k[i % 4096][2] ? "/RMW" : "", mr_k[i % 4096][1:0],
+			        mr_ea[i % 4096], mr_v[i % 4096]);
+		$fclose(fd);
+		fd = $fopen({dumpdir, "/walks.txt"}, "w");
+		for (i = (tw_n > 4096 ? tw_n - 4096 : 0); i < tw_n; i = i + 1)
+			if (tw_k_r[i % 4096][7])
+				$fwrite(fd, "t=%0d DONE va=%08x fail=%0d berr=%0d s=%0d wr=%0d\n", tw_t_r[i % 4096], tw_va_r[i % 4096],
+				        tw_k_r[i % 4096][6], tw_k_r[i % 4096][5], tw_k_r[i % 4096][3], tw_k_r[i % 4096][2]);
+			else
+				$fwrite(fd, "t=%0d EVAL va=%08x lvl=%0d da=%08x d=%08x hit=%0d s=%0d wr=%0d\n", tw_t_r[i % 4096],
+				        tw_va_r[i % 4096], tw_k_r[i % 4096][1:0], tw_da_r[i % 4096], tw_d_r[i % 4096],
+				        tw_k_r[i % 4096][4], tw_k_r[i % 4096][3], tw_k_r[i % 4096][2]);
+		$fclose(fd);
+		fd = $fopen({dumpdir, "/excs.txt"}, "w");
+		for (i = (xe_n > 4096 ? xe_n - 4096 : 0); i < xe_n; i = i + 1)
+			$fwrite(fd, "t=%0d vec=%0d pc=%08x xpc=%08x addr=%08x ssw=%04x sr=%04x\n", xe_t[i % 4096], xe_vec[i % 4096],
+			        xe_rpc[i % 4096], xe_pc[i % 4096], xe_addr[i % 4096], xe_ssw[i % 4096], xe_sr[i % 4096]);
+		$fclose(fd);
+		$display("[%0t] DUMP: ram.bin, memring.txt (%0d), walks.txt (%0d), excs.txt (%0d) in %0s", $time, mr_n, tw_n, xe_n, dumpdir);
+	end
+endtask
+
+task dump_memring;
+	integer i, base;
+	reg [31:0] w;
+	begin
+		w = memwatch ? memwatch : cpu_reg[10];
+		base = mr_n > 4096 ? mr_n - 4096 : 0;
+		$display("--- memory operations within 64 bytes of %08x (of the last %0d) ---", w, mr_n - base);
+		for (i = base; i < mr_n; i = i + 1)
+			if (mr_ea[i % 4096] >= w - 64 && mr_ea[i % 4096] < w + 64)
+				$display("  t=%0d pc=%08x %s%s sz=%0d ea=%08x (+%02x) v=%08x", mr_t[i % 4096], mr_pc[i % 4096],
+				         mr_k[i % 4096][3] ? "ST" : "LD", mr_k[i % 4096][2] ? "/RMW" : "", mr_k[i % 4096][1:0],
+				         mr_ea[i % 4096], mr_ea[i % 4096] - w, mr_v[i % 4096]);
+		$display("--- the last 48 memory operations ---");
+		for (i = (mr_n > 48 ? mr_n - 48 : 0); i < mr_n; i = i + 1)
+			$display("  t=%0d pc=%08x %s%s sz=%0d ea=%08x v=%08x", mr_t[i % 4096], mr_pc[i % 4096],
+			         mr_k[i % 4096][3] ? "ST" : "LD", mr_k[i % 4096][2] ? "/RMW" : "", mr_k[i % 4096][1:0],
+			         mr_ea[i % 4096], mr_v[i % 4096]);
+	end
+endtask
+
+// +panictrace: the last 64 retired instructions before the bad jump, with
+// the SR and the active stack pointer at each (the bus monitor above has
+// the bus beats; cache hits leave no bus trace)
+reg [31:0] ptr_pc [0:63], ptr_a7 [0:63];
+reg [15:0] ptr_sr [0:63];
 integer ptr_n = 0;
-always @(posedge clk) if (!reset && panic_trace && saw_kernel && !wildpc_seen &&
-                         dut.clkena && dut.cpu.mem_req && dut.cpu.mem_ack) begin
-	ptr_pc[ptr_n % 64] <= dut.cpu.core.pc_i;
-	ptr_ir[ptr_n % 64] <= dut.cpu.core.ir;
-	ptr_state[ptr_n % 64] <= dut.cpu.core.state;
-	ptr_va[ptr_n % 64] <= dut.cpu.mem_addr;
-	ptr_pa[ptr_n % 64] <= dut.cpu.mmu_addr_phys;
-	ptr_data[ptr_n % 64] <= dut.cpu.mem_write ? dut.cpu.mem_wdata : dut.cpu.mem_rdata;
-	ptr_kind[ptr_n % 64] <= {dut.cpu.mem_write, dut.cpu.mem_instr, dut.cpu.mem_size};
+always @(posedge clk_cpu) if (!reset && panic_trace && saw_kernel && !wildpc_seen && cpu_retire) begin
+	ptr_pc[ptr_n % 64] <= cpu_rpc;
+	ptr_sr[ptr_n % 64] <= cpu_sr;
+	ptr_a7[ptr_n % 64] <= cpu_a7;
 	ptr_n <= ptr_n + 1;
 end
 
-// +exctrace: log exception entries once the kernel runs (vector, the
-// instruction PC, the exception's own PC/address arguments, SR) and, on a
-// processor halt (double fault), the core's state, the words around the
-// halting PC in physical RAM and the +panictrace completions.
+// +exctrace: log exception entries once the kernel runs (the vector, the
+// PC of the instruction, the exception's own PC and address arguments,
+// SR, the active A7) and, on a processor halt (double fault), the core's
+// state, the words around the halting PC in physical RAM and the
+// +panictrace retirements.
 reg exctrace = 0;
 initial exctrace = $test$plusargs("exctrace");
-reg exc_prev = 0, halted_prev = 0;
+reg halted_prev = 0;
 integer exc_n = 0, ex_i;
-always @(posedge clk) if (!reset) begin
-	exc_prev <= dut.cpu.core.in_exc;
-	if (exctrace && saw_kernel && dut.cpu.core.in_exc && !exc_prev && exc_n < 400) begin
-		$display("[%0t] EXC: vec=%0d pc_i=%08x spc=%08x addr=%08x sr=%04x aer_fa=%08x sp=%08x",
-		         $time, dut.cpu.core.exc_vec, dut.cpu.core.pc_i, dut.cpu.core.exc_spc,
-		         dut.cpu.core.exc_addr, dut.cpu.core.sr, dut.cpu.core.aer_fa, dut.cpu.core.dbg_a7);
+always @(posedge clk_cpu) if (!reset) begin
+	if (exctrace && saw_kernel && dut.cpu.be.x_go && exc_n < 400) begin
+		$display("[%0t] EXC: vec=%0d pc=%08x xpc=%08x addr=%08x sr=%04x sp=%08x",
+		         $time, dut.cpu.be.x_vec, cpu_rpc, dut.cpu.be.x_pc,
+		         dut.cpu.be.x_addr, cpu_sr, cpu_a7);
 		exc_n = exc_n + 1;
 	end
 	halted_prev <= dbg_halted;
 	if (exctrace && dbg_halted && !halted_prev) begin
-		$display("[%0t] HALT: double fault. pc_i=%08x pc=%08x ir=%04x state=%0d in_exc=%b exc_vec=%0d exc_spc=%08x exc_addr=%08x aer_fa=%08x sr=%04x sp=%08x vbr=%08x",
-		         $time, dut.cpu.core.pc_i, dut.cpu.core.pc, dut.cpu.core.ir, dut.cpu.core.state,
-		         dut.cpu.core.in_exc, dut.cpu.core.exc_vec, dut.cpu.core.exc_spc, dut.cpu.core.exc_addr,
-		         dut.cpu.core.aer_fa, dut.cpu.core.sr, dut.cpu.core.dbg_a7, dut.cpu.core.vbr);
-		$display("  mmu: tc=%08x srp=%08x urp=%08x  cpu: mem_addr=%08x phys=%08x mem_req=%b mem_write=%b fc=%0d",
-		         dut.cpu.mmu.tc, dut.cpu.mmu.srp, dut.cpu.mmu.urp,
-		         dut.cpu.mem_addr, dut.cpu.mmu_addr_phys, dut.cpu.mem_req, dut.cpu.mem_write, dut.cpu.mem_fc);
-		$display("  RAM around pc_i (physical = pc - 0x04000000 assumed):");
+		$display("[%0t] HALT: double fault. pc=%08x sr=%04x sp=%08x vbr=%08x last exception vec=%0d xpc=%08x addr=%08x",
+		         $time, cpu_rpc, cpu_sr, cpu_a7, dut.cpu.vbr,
+		         dut.cpu.be.x_vec, dut.cpu.be.x_pc, dut.cpu.be.x_addr);
+		$display("  RAM around pc (physical = pc - 0x04000000 assumed):");
 		for (ex_i = -8; ex_i < 8; ex_i = ex_i + 1)
-			$display("    %08x: %08x", dut.cpu.core.pc_i + ex_i*4,
-			         ram_mem[((dut.cpu.core.pc_i - 32'h04000000) >> 2) + ex_i]);
+			$display("    %08x: %08x", cpu_rpc + ex_i*4,
+			         ram_mem[((cpu_rpc - 32'h04000000) >> 2) + ex_i]);
 		$display("  RAM around sp:");
 		for (ex_i = -4; ex_i < 12; ex_i = ex_i + 1)
-			$display("    %08x: %08x", dut.cpu.core.dbg_a7 + ex_i*4,
-			         ram_mem[((dut.cpu.core.dbg_a7 - 32'h04000000) >> 2) + ex_i]);
+			$display("    %08x: %08x", cpu_a7 + ex_i*4,
+			         ram_mem[((cpu_a7 - 32'h04000000) >> 2) + ex_i]);
 		// NS3.3 vm_page_lookup: the bucket table pointer and hash mask live at
 		// $040c4338/$040c433c; an empty bucket is a self-pointer, never 0
 		begin : buckets
@@ -834,16 +1094,11 @@ end
 task dump_panic_trace;
 	integer i, base;
 	begin
-		$display("CPU: pc_i=%08x ir=%04x state=%0d sr=%04x sp=%08x rte_pc=%08x",
-		         dut.cpu.core.pc_i, dut.cpu.core.ir, dut.cpu.core.state,
-		         dut.cpu.core.sr, dut.cpu.core.dbg_a7, dut.cpu.core.rte_pc);
+		$display("CPU: pc=%08x sr=%04x sp=%08x halted=%b", cpu_rpc, cpu_sr, cpu_a7, dbg_halted);
 		base = ptr_n > 64 ? ptr_n - 64 : 0;
-		$display("--- last %0d CPU completions (enable with +panictrace) ---", ptr_n - base);
+		$display("--- last %0d retired instructions (enable with +panictrace) ---", ptr_n - base);
 		for (i = base; i < ptr_n; i = i + 1)
-			$display("pc=%08x ir=%04x state=%0d %s instr=%b size=%0d va=%08x pa=%08x data=%08x",
-			         ptr_pc[i % 64], ptr_ir[i % 64], ptr_state[i % 64],
-			         ptr_kind[i % 64][3] ? "WR" : "RD", ptr_kind[i % 64][2],
-			         ptr_kind[i % 64][1:0], ptr_va[i % 64], ptr_pa[i % 64], ptr_data[i % 64]);
+			$display("pc=%08x sr=%04x sp=%08x", ptr_pc[i % 64], ptr_sr[i % 64], ptr_a7[i % 64]);
 	end
 endtask
 
@@ -920,7 +1175,7 @@ end
 
 // The disk bootloader also executes at 0x04xxxxxx (e.g. 0x04381930).
 // Only the kernel's actual entry point establishes a completed kernel load.
-always @(posedge clk) if (!reset && (bootsd || bootcd) && dbg_pc == kernel_entry && !saw_kernel) begin
+always @(posedge clk_cpu) if (!reset && (bootsd || bootcd) && cpu_retire && cpu_rpc == kernel_entry && !saw_kernel) begin
 	$display("[%0t] BOOT: kernel entry %08x", $time, kernel_entry);
 	saw_kernel <= 1;
 	if (stop_at_kernel) halt_run <= 1;
@@ -1262,84 +1517,16 @@ always @(posedge clk) begin
 	end
 end
 
-// +walktrace: every MMU table-walker transaction, and every access
-// error the walker reports.  With a real disk image this is what turns
-// a kernel "MMU invalid descriptor" panic into the exact descriptor
-// address and value that produced it.
+// +walktrace: every table-walk beat of the CPU (the 68040 reads and
+// updates its descriptors on the bus, transfer modifier 3 or 4; the
+// bridge holds the modifier of the transfer in progress).  An invalid
+// descriptor is an access error that +exctrace shows as vector 2.
 reg wtrace = 0;
 initial wtrace = $test$plusargs("walktrace");
-
-// a small ring of the most recent walker transactions, so when a walk
-// faults we can print the whole descriptor chain that led there
-reg [95:0] wring [0:31];      // {we, addr[31:0], data[31:0]} loosely packed
-integer    wrp = 0;
-reg        w_ack_d = 0;
-
-localparam W_FLT_ST = 4'd9;
-reg [3:0]  wst_d = 0;
-integer    faults_seen = 0;
-
-task dump_walk_ring;
-	integer k, idx;
-	begin
-		$display("  --- last walker transactions ---");
-		for (k = 31; k >= 0; k = k - 1) begin
-			idx = (wrp - k + 64) % 32;
-			if (wring[idx] !== 96'bx)
-				$display("    %s %08x %s %08x",
-				         wring[idx][64] ? "wr" : "rd",
-				         wring[idx][63:32],
-				         wring[idx][64] ? "=" : "->",
-				         wring[idx][31:0]);
-		end
-	end
-endtask
-
-always @(posedge clk) if (!reset) begin
-	// record every completed walker transaction
-	if (dut.walker_req && dut.walker_ack) begin
-		wring[wrp % 32] <= {31'd0, dut.walker_we, dut.walker_addr,
-		                    dut.walker_we ? dut.walker_wdat : dut.walker_data};
-		wrp <= wrp + 1;
-		if (wtrace &&
-		    (dut.walker_addr[31:24] == 8'h04 || dut.walker_addr[31:24] == 8'h05 ||
-		     dut.walker_addr[31:24] == 8'h06 || dut.walker_addr[31:24] == 8'h07))
-			// only near the tables the kernel actually uses
-			;
-	end
-
-	// the MMU walker just latched an invalid descriptor: report the
-	// faulting VA, the descriptor chain, and freeze a screen
-	wst_d <= dut.cpu.mmu.wst;
-	if (dut.cpu.mmu.wst == W_FLT_ST && wst_d != W_FLT_ST && !dut.cpu.mmu.w_pt) begin : mmufault
-		reg [31:0] da;
-		reg [31:0] memword;
-		faults_seen = faults_seen + 1;
-		da = dut.cpu.mmu.w_desc_addr;
-		// what the tb RAM actually holds at the faulting descriptor
-		// address (walker reads via next_system's [25:2] word index)
-		memword = ram_mem[da[25:2]];
-		$display("[%0t] MMU FAULT #%0d: VA=%08x super=%b instr=%b",
-		         $time, faults_seen, dut.cpu.mmu.w_la, dut.cpu.mmu.w_super,
-		         dut.cpu.mmu.f_bank);
-		$display("    faulting descriptor: value=%08x read-from=%08x  mem[@]=%08x  %s",
-		         dut.cpu.mmu.w_desc, da, memword,
-		         (dut.cpu.mmu.w_desc === memword) ? "(walker read matches memory)"
-		                                          : "(MISMATCH: walker read != memory)");
-		$display("    srp=%08x urp=%08x tc=%08x",
-		         dut.cpu.mmu.srp, dut.cpu.mmu.urp, dut.cpu.mmu.tc);
-		if (dut.cpu.mmu.w_la == wildpc_target && dut.cpu.mmu.w_super && dut.cpu.mmu.f_bank) begin
-			dump_walk_ring;
-			dump_panic_trace;
-			$display("[%0t] BOOT: the panic fault reproduced", $time);
-			errors = errors + 1;
-			fb_dump;
-			halt_run <= 1;
-		end
-	end
-	if (dut.walker_req && dut.walker_berr)
-		$display("[%0t] WALK BERR %08x", $time, dut.walker_addr);
-end
+always @(posedge clk) if (!reset && wtrace && mem_ready &&
+                         (dut.cpubus.xtm == 3'd3 || dut.cpubus.xtm == 3'd4))
+	$display("[%0t] WALK %s %08x %s %08x pc=%08x", $time, is_write ? "wr" : "rd", cpu_addr,
+	         is_write ? "=" : "->", is_write ? cpu_dout : cpu_din, dbg_pc);
 
 // ESP activity trace: selection commands and DMA writes to memory
 reg saw_esp_sel = 0;
@@ -1642,7 +1829,7 @@ initial begin
 	check(seen_vec_lo,  "reset SP fetched from ROM address 0");
 	check(seen_vec_pc,  "reset PC fetched from ROM address 4");
 	check(seen_entry,   "PC reached reset vector target 0x0100001E");
-	check(dut.cpu.tick_in === 1'b1, "CPU interrupt sampling tick is connected");
+	check(bclk_bad == 0,  "bus clock enable marks every bus clock edge");
 	check(seen_scr1,    "ROM read SCR1");
 	check(scr1_ok,      "SCR1 returned machine id 0x00012052");
 	check(seen_scr2_wr, "ROM wrote SCR2");

@@ -1,55 +1,71 @@
 # AP68040 in this repository
 
-This directory is the AP68040 68040 CPU, vendored into MacQuadra800_MiSTer
-on 2026-09-17. It used to be a git submodule (`alanswx/AP68040`); the CPU is
-where most of this core's work happens now, so the files live here and are
-edited and committed like the rest of the RTL.
+This directory is the AP68040 `faster` core, vendored from
+`apolkosnik/AP68040` branch `main` at **b388dfc** (2026-10-18, "Merge pull
+request #8 from apolkosnik/faster") on 2026-10-18.  It is the pipelined
+SystemVerilog core (`rtl/ap68040*.sv`, the FPU in `rtl/fpu/`) that
+presents the real MC68040 external bus; the NeXT side talks to that bus
+through `rtl/next/next_cpu040.sv`, documented in `docs/CPU_NEXT_PORT.md`.
 
-## Where the tree came from
+## What was taken
 
-| what | commit |
+| upstream | here |
 |---|---|
-| Adam Polkosnik's original core (`apolkosnik/AP68040`) | `0e76761` (2026-08-28), the common base of every fork |
-| Alan Steremberg's performance stack (`alanswx/AP68040`, checkpoint 15) | `167c5e8` (2026-09-15) |
-| our carrier hoisting R1..R4 (`docs/cpu-area-consolidation.md`) | `8778213` (2026-09-15), **the imported tree** |
+| `rtl/`, including the generated `rtl/gen/*.svh` (tools/ucode.py output) | `rtl/` |
+| `tb/` (the 33-program regression, cputest replay, benchmarks) | `tb/` |
+| `tools/`, `syn/`, `doc/`, `README.md`, `LICENSE` | same |
+| `rtl_old/`, `tb_old/` (the previous sequential core, kept upstream as a reference) | not taken: that lineage is this repository's history before this drop (`git log -- rtl/ap68040` up to cb30c12) |
 
-`8778213` is what shipped in `releases/MacQuadra800_20260915.rbf` and later.
-The two further hoists R5/R6 (`c789ffe`, `923c544` on the old submodule's
-`wombat-area-diet` branch) were deliberately not imported: they are 1,300
-ALMs smaller but miss the 33 MHz CPU clock, and are to be re-engineered
-later.
+## Local changes to the core
 
-The full pre-import history is still on this machine in
-`.git/modules/rtl/ap68040` (browse it with
-`git --git-dir=.git/modules/rtl/ap68040 log`) and on GitHub under
-`alanswx/AP68040` and `apolkosnik/AP68040`.
+Listed in `docs/CPU_NEXT_PORT.md` ("CPU-side changes") and kept small so
+that a newer drop can replace this directory and the list be re-applied:
 
-## Taking upstream patches
+1. `rtl/ap68040.sv`, `rtl/ap68040_backend.sv`: the `dbcc_floor[3:0]` input
+   (a DBcc period floor for hosts calibrated on a real 68040's DBcc
+   loops); `tb/tb_ap68040.sv` register `$F10C` and clock count `$F2EC`;
+   `tb/asm/t_dbccfloor.s` in `tb/run_tests.sh`.
+2. `rtl/ap68040_ram.sv`, `ap68040_sdp_be`: a module per 32-bit slice with
+   every byte's write spelled out and the read in the same always block
+   (Intel's template to the letter), so Quartus 17.0 infers one M10K per
+   slice instead of one per byte (and does not fall back to flip-flops,
+   which it does for a `for` loop over the bytes with variable enables).
 
-Neither upstream tree merges: Adam's and Alan's sequencer and cache work
-rebuilt the same mechanisms independently (Adam's own post-mortem is the
-commit message of his `40_w_Alans_patches` branch, b117757). Patches are
-ported by hand or applied one at a time:
+3. `rtl/ap68040_dmu.sv`: the table walk samples its data-cache tag
+   compare one wait state later (`E_TW_DESCW2`), after the tag RAM's
+   registered port B address has taken the descriptor's set; before, the
+   compare looked at the previously addressed set and a false hit or miss
+   corrupted the walk (the NeXT kernel's page-fault loop on hardware,
+   2026-10-19).  `tb/asm/t_nx8k.s` reproduces it.
+4. `rtl/ap68040_dmu.sv`: the DC2 job's kill mark (`e_kill`) is cleared
+   when the job is scheduled in `E_IDLE`, not in `E_S_START`: the engine
+   is frozen while the snooper holds the cache but the kill block is
+   not, so a kill landing on a frozen `E_S_START` was erased when its
+   body ran, the dead job completed, and the next uop into DC2 took its
+   data (OPENSTEP panics under disk DMA on the NeXT, 2026-10-19).
+   `tb/asm/t_snkill.s`, the bench's `$F2F0` coincidence counter and
+   traffic bit 13 (a random hold before each snooped transfer), and a
+   self-check at `E_S_DONE`.
 
-```bash
-git -C ../AP68040 show <commit> -- rtl/ap040_core.v | git apply -p1 --directory=rtl/ap68040 --3way
-```
+All four are candidates for upstream; the third and fourth are bug
+fixes, pushed on 2026-10-19 as
+https://github.com/apolkosnik/AP68040/pull/9 (branch `walker-tag-compare`,
+merged) and https://github.com/apolkosnik/AP68040/pull/10 (branch
+`dead-job-kill`).
 
-`docs/cpu-upstream-2026-09.md` records which of Adam's 2026-09 commits were
-taken, which were not, and why.
+## History
 
-## Local build substitutions
-
-`rtl/primitives/dpram.v` here is the simulation stub. Quartus and the
-Verilator full-machine sim resolve `dpram` to the project's
-`rtl/dpram.v` (an altsyncram wrapper) instead; the Icarus self-test suite
-uses the stub.
+Until 2026-10-18 this directory held the sequential `ap040_*.v` core as
+vendored in MacQuadra800_MiSTer (imported tree `8778213`, Alan
+Steremberg's performance stack over Adam Polkosnik's base), with the NeXT
+port's 32-bit beat adapter (`ap040_bus32_adapter.v`).  The old
+`UPSTREAM.md` and `docs/CPU_NEXT_PORT.patch` describe that tree; both are
+in git history.
 
 ## Tests
 
 ```bash
-cd rtl/ap68040/tb && sh run_tests.sh      # iverilog + vasm, see doc/tests-README
+cd rtl/ap68040/tb && JOBS=12 WORK=/path/outside/tmpfs bash run_tests.sh   # Verilator 5, vasmm68k_mot
 ```
 
-From Windows run it through WSL with `scripts/cpu_gates_wsl.sh <this dir> <label>`,
-which also runs the profiled `bench_loop` and the corpus-100 silicon gate.
+The default object directory is `rtl/ap68040/obj/` (ignored by git).

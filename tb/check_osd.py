@@ -53,11 +53,14 @@ if not m:
     fail("cannot find the hps_io VDNUM parameter")
 vdnum = int(m.group(1))
 
-# the menu's own slot entries, "S<n>,<extensions>,<label>;"
-entries = re.findall(r'"S(\d),([^,]*),([^;"]*);"', src)
+# the menu's own slot entries, "S<n>,<extensions>,<label>;" - or
+# "SC<n>,...": Main remembers that mount in config/<core>.s<n> and
+# re-mounts it at core start (menu.cpp reads an 'S', then an optional
+# 'C', then the slot digit).
+entries = re.findall(r'"S(C?)(\d),([^,]*),([^;"]*);"', src)
 if not entries:
     fail("no S entries found in CONF_STR")
-slots = [(int(n), label) for n, _, label in entries]
+slots = [(int(n), label) for _, n, _, label in entries]
 
 # The host reads the extension list in three character groups, padding
 # the whole string out with spaces to reach a multiple of three.  A two
@@ -68,7 +71,7 @@ slots = [(int(n), label) for n, _, label in entries]
 # the drive looks empty for a reason nothing on the machine can show.
 NATIVE = [("floppy", "FD "), ("optical", "OD ")]
 
-for n, ext, label in entries:
+for _, n, ext, label in entries:
     if len(ext) % 3:
         fail(f'S{n} ("{label.strip()}") lists extensions "{ext}", which is '
              f"not a whole number of three character groups; the host pads "
@@ -103,9 +106,13 @@ dupes = {n for n in nums if nums.count(n) > 1}
 if dupes:
     fail(f"slot number(s) {sorted(dupes)} used by more than one device")
 
-missing = sorted(set(range(vdnum)) - set(nums))
-if missing:
-    fail(f"VDNUM={vdnum} but slot(s) {missing} have no menu entry")
+# A slot inside VDNUM with no menu entry is a numbering gap, kept so the
+# slots after it keep their numbers: saved configs (config/<core>.s<n>),
+# MGL files and Main's NEXT_CDROM_SLOT all carry the number.  Such a slot
+# is inert only if no device is built from it - the routing check below
+# refuses a routed slot that no entry labels - so a gap is reported in
+# the summary, not refused.
+gaps = sorted(set(range(vdnum)) - set(nums))
 
 # The SCSI engine names six targets with a three-bit unit number.  A scalar
 # declaration here aliases target 2 to slot 0 and target 3 to slot 1 while
@@ -175,4 +182,6 @@ for wire, kind, words in DEVICES:
 
 print(f"== OSD slots: {vdnum} within the host's {MAX_SLOTS}, "
       f"{', '.join('S%d' % n for n in sorted(nums))} each routed to the "
-      f"device its label names ==")
+      f"device its label names"
+      + (f", slot(s) {gaps} unpopulated and unrouted" if gaps else "")
+      + " ==")

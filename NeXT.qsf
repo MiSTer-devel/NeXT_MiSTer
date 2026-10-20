@@ -235,7 +235,6 @@ set_global_assignment -name FAMILY "Cyclone V"
 set_global_assignment -name CDF_FILE jtag.cdf
 set_global_assignment -name QIP_FILE sys/sys.qip
 set_global_assignment -name QIP_FILE rtl/pll.qip
-set_global_assignment -name QIP_FILE rtl/ap68040/rtl/ap040.qip
 set_global_assignment -name VERILOG_FILE rtl/next/dpram.v
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_system.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/next/next_scr.sv

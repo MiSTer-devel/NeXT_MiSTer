@@ -2,17 +2,18 @@
 // Only the ROM program and RAM are test fixtures. No device state is forced.
 `timescale 1ns/1ps
 module tb_next_recording;
-reg clk=0,reset=1;
-always #5 clk=~clk;
+reg clk=0,clk_cpu=0,reset=1;
+// the CPU's clock is two per bus clock, edge aligned; one process makes
+// both edges in the same time step (see tb_next_boot.sv)
+initial forever begin #2.5 clk_cpu=1; clk=~clk; #2.5 clk_cpu=0; end
 wire req,we,halted;
 wire [3:0] be;
 wire [23:0] addr;
 wire [31:0] wd,pc;
 reg [31:0] rd=0;
 reg ack=0;
-next_system #(.CLK_HZ(1000000),.CLK_REAL_HZ(1000000),
- .CPU_PACE_NUM(2),.CPU_PACE_DEN(2),.ROM_INIT_EN(0)) dut(
- .clk(clk),.clk_vid(clk),.reset(reset),.ps2_key(11'd0),.ps2_mouse(25'd0),
+next_system #(.CLK_HZ(1000000),.CLK_REAL_HZ(1000000),.ROM_INIT_EN(0)) dut(
+ .clk(clk),.clk_cpu(clk_cpu),.clk_vid(clk),.reset(reset),.ps2_key(11'd0),.ps2_mouse(25'd0),
  .boot_sel(3'd0),
  .ts_host(33'd0),.enet_connected(1'b0),
  .oimg_mounted(2'd0),.oimg_readonly(1'b0),.oimg_size(64'd0),.osd_ack(1'b0),

@@ -6,9 +6,16 @@
 //  byte then data byte(s) MSB first, data sampled by the chip on the
 //  falling edge of RTCLK.
 //
-//  Checks against the nvram_default[] content from Previous rtcnvram.c:
+//  Checks against the nvram_default[] content from Previous rtcnvram.c,
+//  except byte 14 (POST options), which is the ROM's own factory default
+//  0x11 rather than Previous's 0x4B - so every checksum below differs
+//  from Previous's by 0x3A00 (0x4B00 - 0x1100, one's complement):
 //    - NVRAM byte 0 reads 0x94, byte 1 reads 0x0F
-//    - checksum bytes 30/31 carry the one's-complement sum
+//    - checksum bytes 30/31 carry the one's-complement sum: 16-bit words
+//      0-29 added with end-around carry, complemented.  The default image
+//      (94 0F 40 .. 11 at byte 14) sums to E50F, so the empty command
+//      checks as 1AF0, "sd" as A78B, "fd" B48B, "en" B581, "od" AB8B,
+//      and "sd(N,0,0)" as FDFA - N
 //    - a user/configuration reset applies the selected boot policy while
 //      a CPU RESET leaves the battery-backed NVRAM alone
 //    - Auto is resolved from the mounted HDD/floppy state at that reset
@@ -262,7 +269,7 @@ task check_cd_command;
 		      boot_cmd[8] == ")" && boot_cmd[9] == 0 &&
 		      boot_cmd[10] == 0 && boot_cmd[11] == 0,
 		      "CD-ROM command is sd(N,0,0) with a cleared suffix");
-		check(b30 == 8'hC3 && b31 == checksum_lo,
+		check(b30 == 8'hFD && b31 == checksum_lo,
 		      "CD-ROM command checksum matches its scan-order unit");
 	end
 endtask
@@ -305,7 +312,7 @@ initial begin
 	rtc_recv_byte(b31);
 	rtc_stop;
 	$display("nvram[30]=%02x nvram[31]=%02x", b30, b31);
-	check(b30 == 8'hE0 && b31 == 8'hEF, "NVRAM checksum bytes are 0xE0 0xEF");
+	check(b30 == 8'h1A && b31 == 8'hF0, "NVRAM checksum bytes are 0x1A 0xF0");
 
 	// write NVRAM byte 5 and read it back
 	rtc_send_byte(8'h85);          // write, address 5
@@ -343,7 +350,7 @@ initial begin
 
 	// Applying a policy must derive its checksum from the live NVRAM, not
 	// a fixed per-command constant.  Byte 5 contributes as the low byte of
-	// a checksum word: 6D8B - 005A = 6D31 for the "sd" command.
+	// a checksum word: A78B - 005A = A731 for the "sd" command.
 	boot_sel = 3'd1;
 	repeat (10) @(posedge clk);
 	read_boot_state;
@@ -352,7 +359,7 @@ initial begin
 	user_reset;
 	read_boot_state;
 	check_short_command("s", "d", "user reset applies the Disk command");
-	check(b30 == 8'h6D && b31 == 8'h31,
+	check(b30 == 8'hA7 && b31 == 8'h31,
 	      "boot checksum includes a preserved guest NVRAM byte");
 	read_nvram_byte(5'd5, wb);
 	check(wb == 8'h5A, "user reset preserves unrelated NVRAM bytes");
@@ -362,7 +369,7 @@ initial begin
 	write_nvram_byte(5'd5, 8'h00);
 	user_reset;
 	read_boot_state;
-	check(b30 == 8'h6D && b31 == 8'h8B,
+	check(b30 == 8'hA7 && b31 == 8'h8B,
 	      "an unchanged policy is reapplied and its checksum recomputed");
 
 	// Simulate a guest replacing the boot command and leaving a stale
@@ -379,14 +386,14 @@ initial begin
 	read_boot_state;
 	check_short_command("s", "d",
 	                    "user reset restores the selected command and clears its suffix");
-	check(b30 == 8'h6D && b31 == 8'h8B,
+	check(b30 == 8'hA7 && b31 == 8'h8B,
 	      "user reset restores the selected command checksum");
 
 	// Auto is sampled only on a user reset.  Hot media changes and a CPU
 	// RESET do not silently replace the guest's battery-backed command.
 	boot_variant(3'd0, 3'b000, 1'b0);
 	check_short_command(8'h00, 8'h00, "Auto without media: empty boot command");
-	check(b30 == 8'hE0 && b31 == 8'hEF, "Auto without media: checksum");
+	check(b30 == 8'h1A && b31 == 8'hF0, "Auto without media: checksum");
 	sd_lower_mounted = 3'b001;
 	repeat (10) @(posedge clk);
 	cpu_reset;
@@ -396,7 +403,7 @@ initial begin
 	user_reset;
 	read_boot_state;
 	check_short_command("s", "d", "user reset resolves Auto to a mounted HDD");
-	check(b30 == 8'h6D && b31 == 8'h8B, "Auto with HDD: checksum");
+	check(b30 == 8'hA7 && b31 == 8'h8B, "Auto with HDD: checksum");
 
 	sd_lower_mounted = 3'b000;
 	floppy_mounted = 1;
@@ -406,7 +413,7 @@ initial begin
 	user_reset;
 	read_boot_state;
 	check_short_command("f", "d", "user reset resolves Auto to a mounted floppy");
-	check(b30 == 8'h7A && b31 == 8'h8B, "Auto with only a floppy: checksum");
+	check(b30 == 8'hB4 && b31 == 8'h8B, "Auto with only a floppy: checksum");
 
 	// A hot OSD change is policy, not an immediate NVRAM write.
 	boot_sel = 3'd3;
@@ -416,25 +423,25 @@ initial begin
 	user_reset;
 	read_boot_state;
 	check_short_command("e", "n", "user reset applies the Network command");
-	check(b30 == 8'h7B && b31 == 8'h81, "Network: checksum");
+	check(b30 == 8'hB5 && b31 == 8'h81, "Network: checksum");
 
 	boot_variant(3'd4, 3'b111, 1'b1); // ROM Default ignores mounted media
 	check_short_command(8'h00, 8'h00, "ROM Default: empty boot command");
-	check(b30 == 8'hE0 && b31 == 8'hEF, "ROM Default: checksum");
+	check(b30 == 8'h1A && b31 == 8'hF0, "ROM Default: checksum");
 
 	boot_variant(3'd1, 3'b000, 1'b0); // Disk forced without an image
 	check_short_command("s", "d", "Disk: boot command sd");
-	check(b30 == 8'h6D && b31 == 8'h8B, "Disk: checksum");
+	check(b30 == 8'hA7 && b31 == 8'h8B, "Disk: checksum");
 
 	boot_variant(3'd2, 3'b000, 1'b0); // Floppy forced without an image
 	check_short_command("f", "d", "Floppy: boot command fd");
-	check(b30 == 8'h7A && b31 == 8'h8B, "Floppy: checksum");
+	check(b30 == 8'hB4 && b31 == 8'h8B, "Floppy: checksum");
 
 	// Optical.  nvram_init() in the reference spells it od, alongside
 	// sd, fd and en.
 	boot_variant(3'd5, 3'b000, 1'b0);
 	check_short_command("o", "d", "Optical: boot command od");
-	check(b30 == 8'h71 && b31 == 8'h8B, "Optical: checksum");
+	check(b30 == 8'hAB && b31 == 8'h8B, "Optical: checksum");
 
 	// CD-ROM is a qualified SCSI probe command.  Its unit is the count of
 	// mounted HDD targets below target 3.  Cover every representable count,

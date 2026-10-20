@@ -5,7 +5,8 @@ NeXT core for MiSTer: a NeXTcube 68040 in FPGA.
 Based on the [Previous](https://github.com/probonopd/previous) emulator
 as the hardware reference (submodule at `reference/previous`), the
 [AP68040](https://github.com/apolkosnik/AP68040) MC68040-compatible CPU
-core (submodule at `rtl/AP68040`), and the
+core (the pipelined `faster` core, vendored at `rtl/ap68040`, on its
+own 55 MHz clock; `docs/CPU_NEXT_PORT.md`), and the
 [MiSTer core template](https://github.com/MiSTer-devel/Template_MiSTer).
 
 Status: working.  The real Rev 2.5 v66 boot ROM executes on the
@@ -101,7 +102,7 @@ cd tb && ./run_tests.sh post       # additionally runs the full
                                    # power-on system test (about 5 min)
 ```
 
-Runs the real RTL only - the real AP68040 submodule sources, the real
+Runs the real RTL only - the real AP68040 core sources, the real
 next_* modules, and the real boot ROM image from the Previous
 submodule.  The `post` mode boots the ROM through its complete
 power-on system test to the "System test passed" path.  See the test

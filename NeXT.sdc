@@ -3,12 +3,39 @@ derive_clock_uncertainty
 
 # core specific constraints
 
-# clk_sys (28 MHz, outclk_0) and clk_vid (100 MHz, outclk_1) exchange data
-# only through the dual-clock VRAM scan port and a 2FF synchronizer on the
-# vertical blank level, so they are timed as asynchronous groups.
+# clk_sys (27.5 MHz, outclk_0) and clk_cpu (55 MHz, outclk_2) are the
+# 68040's bus clock and processor clock: the CPU (rtl/ap68040) changes its
+# bus outputs and samples its bus inputs only on the processor clock edges
+# that end a bus clock (bclk_en, made in rtl/next/next_cpu040.sv so that
+# those are the clk_sys edges), and everything of the CPU's that the
+# clk_sys side reads is such a flip-flop.  Every path between the two
+# domains therefore has a whole bus clock period, 36.4 ns, not the 18.2 ns
+# the default single-cycle analysis to the mid-bus-clock edge assumes.
+# The one exception is the bclk_en generator itself: sys_tog -> tog_q must
+# be captured on the very next processor clock edge.  clk_vid (100 MHz,
+# outclk_1) exchanges data with clk_sys only through the dual-clock VRAM
+# scan port and a 2FF synchronizer on the vertical blank level, so it is
+# an asynchronous group.
 set_clock_groups -asynchronous \
-	-group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}] \
+	-group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk \
+	                    emu|pll|pll_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}] \
 	-group [get_clocks {emu|pll|pll_inst|altera_pll_i|general[1].gpll~PLL_OUTPUT_COUNTER|divclk}]
+
+set_multicycle_path -setup -end 2 \
+	-from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}] \
+	-to   [get_clocks {emu|pll|pll_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}]
+set_multicycle_path -hold -end 1 \
+	-from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}] \
+	-to   [get_clocks {emu|pll|pll_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}]
+set_multicycle_path -setup -start 2 \
+	-from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}] \
+	-to   [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]
+set_multicycle_path -hold -start 1 \
+	-from [get_clocks {emu|pll|pll_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}] \
+	-to   [get_clocks {emu|pll|pll_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]
+# the bclk_en generator: single cycle
+set_multicycle_path -setup -end 1 -to [get_registers {*|cpubus|tog_q}]
+set_multicycle_path -hold  -end 0 -to [get_registers {*|cpubus|tog_q}]
 
 # LTC2308 interface: core uses SCK_DIV=2 (7 MHz), long CONVST (2 us),
 # and two clk_sys cycles from CONVST falling to the first SDO capture.
